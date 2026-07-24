@@ -1,0 +1,8 @@
+# секреты и артефакты прогона
+.env
+.cache/
+*.db
+watchlist.json
+scan_all.log
+__pycache__/
+*.pyc

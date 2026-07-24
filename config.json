@@ -1,0 +1,142 @@
+{
+  "_comment": "Пороги MVP Stage 0-2. Все значения — дефолты [оценка], тюнятся на бэктесте.",
+
+  "universe": {
+    "_track_b_note": "Выключен (аудит L5): без coin_id у Track B нет зоны и liveness, confidence<гейт — не алертится и не paper-ится, только жжёт квоту GoPlus. Включить обратно, когда появится OHLCV-зона для свежих листингов.",
+    "track_a_pages": 4,
+    "track_a_per_page": 250,
+    "track_b_enabled": false,
+    "chains_priority": ["ethereum", "solana", "bsc", "base", "arbitrum", "polygon"]
+  },
+
+  "stage1_filters": {
+    "min_volume_24h_usd": 50000,
+    "min_liquidity_usd": 30000,
+    "track_b_max_age_days": 60,
+    "spring_min_drawdown_from_ath_pct": 70,
+    "spring_hard_filter": false,
+    "exclude_stablecoins": true,
+    "exclude_wrapped_lst": true
+  },
+
+  "stage2_antirug": {
+    "max_buy_tax": 0.10,
+    "max_sell_tax": 0.10,
+    "max_top10_holders_pct": 70,
+    "min_lp_locked_pct": 50,
+    "require_open_source": true,
+    "fail_on_mintable": false,
+    "use_honeypot_is": true
+  },
+
+  "stage3_fundamentals": {
+    "enabled": true,
+    "fdv_mc_high": 3.0,
+    "mc_tvl_overvalued_mult": 2.0,
+    "mc_tvl_undervalued_mult": 0.5,
+    "min_category_peers": 5,
+    "min_tvl_usd": 1000000
+  },
+
+  "stage4_zone": {
+    "enabled": true,
+    "price_history_days": 180,
+    "recent_days": 30,
+    "sma_days": 50,
+    "vol_contraction_ratio": 0.7,
+    "downtrend_drop_pct": 15,
+    "spring_min_drawdown_pct": 70,
+    "spring_max_range_pos": 0.5,
+    "_days_since_low_note": "Гейт ОПРОВЕРГНУТ walk-forward (detector_study 13.07.2026): форвард ухудшается монотонно с ростом порога — долгая плоская база чаще зомби, свежий лоу при сжатии = живая капитуляция. 0 = выключен; индикатор остаётся информационным.",
+    "spring_min_days_since_low": 0,
+    "vol_dryup_ratio": 0.6,
+    "peak_max_drawdown_pct": 25,
+    "peak_min_above_sma_pct": 20,
+    "peak_min_range_pos": 0.8,
+    "rf_hard_gate": false
+  },
+
+  "stage3b_liveness": {
+    "_comment": "Живость проекта (survivorship-фильтр 'легит но труп'). Пороги [оценка].",
+    "enabled": true,
+    "commits_active": 20,
+    "commits_alive": 3,
+    "exchanges_broad": 10,
+    "exchanges_min": 3,
+    "wash_ratio_max": 50
+  },
+
+  "stage5_score": {
+    "enabled": true,
+    "weights": {
+      "zone": 0.28,
+      "valuation": 0.18,
+      "safety": 0.18,
+      "liveness": 0.16,
+      "tradability": 0.10,
+      "onchain": 0.10
+    }
+  },
+
+  "stage6_telegram": {
+    "enabled": true,
+    "min_score": 70,
+    "min_confidence": 0.6,
+    "only_zones": ["ПРУЖИНА/ДНО"],
+    "max_alerts": 10,
+    "daily_digest": true,
+    "digest_max_positions": 20,
+    "alert_mute_days": 3
+  },
+
+  "stage7_positions": {
+    "_comment": "Профиль hodl: откуп у дна -> холд -> распределение в бычьей фазе. Горизонт 1-2 года ок. paper_auto: сканер сам открывает виртуальные позиции по топ-пружинам — фоновая статистика выходного контура; в риск-бюджет не входят.",
+    "max_position_pct_of_capital": 10,
+    "capital_usdt": 0,
+    "worst_case_loss_pct": 60,
+    "paper_auto": true,
+    "paper_stake_usdt": 100,
+    "paper_min_score": 70,
+    "paper_min_confidence": 0.6,
+    "paper_max_open": 15,
+    "paper_reopen_cooldown_days": 30
+  },
+
+  "stage8_exit": {
+    "_comment": "ОТКАЛИБРОВАНО history_calibration 16.07.2026 (Binance 2017-2026, 105 монет, 692 эпизода, ВЕРХНЯЯ граница из-за survivorship). Инвалидация 5%->25%: 59-70% пружин прокалывают базу перед ростом (shakeout), буфер 25% даёт win 31->50%, 2022 -6.5->-1.9%; 'без инвалидации' лучше на бумаге (+914%) но отвергнуто - survivorship скрывает делистинги. Лестница +100/+300 подтверждена: P(+100)=52-68%, P(+300)=23-31% по полным циклам. Трейлинг 30 после arm 60: p50 отката от HWM после +100% = 74% - без трейлинга отдаёшь почти всё.",
+    "enabled": true,
+    "invalidation_below_base_low_pct": 25,
+    "invalidation_confirm_days": 2,
+    "trailing_arm_after_gain_pct": 60,
+    "trailing_from_hwm_pct": 30,
+    "ladder": [[1.0, 0.25], [3.0, 0.25]],
+    "peak_min_above_sma_pct": 30,
+    "peak_min_range_pos": 0.9,
+    "vol_expansion_ratio": 1.6,
+    "peak_zone_cooldown_days": 30
+  },
+
+  "http": {
+    "cache_dir": ".cache",
+    "cache_ttl_seconds": 3600,
+    "timeout_seconds": 25,
+    "rate_limits_per_min": {
+      "api.coingecko.com": 10,
+      "api.geckoterminal.com": 25,
+      "api.dexscreener.com": 200,
+      "api.gopluslabs.io": 50,
+      "api.honeypot.is": 50
+    }
+  },
+
+  "api_keys": {
+    "_note": "Пусто = используем free/demo. Переопределяется env: COINGECKO_DEMO_KEY, GOPLUS_KEY.",
+    "coingecko_demo": "",
+    "goplus": ""
+  },
+
+  "output": {
+    "db_path": "scanner.db",
+    "watchlist_json": "watchlist.json"
+  }
+}
