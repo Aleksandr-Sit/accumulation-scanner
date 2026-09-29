@@ -13,6 +13,9 @@
      просадка от HWM больше порога = сигнал фиксации остатка.
   4. ЗОНА РАСПРЕДЕЛЕНИЯ (информационный): бычий разгон — цена высоко над SMA,
      верх диапазона, (опц.) расширение объёма. Не приказ, а «пора смотреть».
+  5. ПЕРЕГРЕВ РЫНКА (информационный): индекс перегрева альт-рынка ≥ market_hot_alert.
+     Опционально сужает трейлинг (market_hot_tighten или paper-близнец variant=B):
+     market_regime_study — медиана лучше, но режет хвост маний, поэтому A/B на paper.
 
 Сигнал — алерт для ручного решения, НЕ ордер. Идемпотентность — по журналу
 position_events (типы уже сработавших событий передаются в triggered).
@@ -24,13 +27,15 @@ from ..config import Config
 
 def evaluate_exit(position: dict, last_price: float, hwm: float,
                   indicators: dict | None, triggered: set[str],
-                  cfg: Config, recent_closes: list[float] | None = None) -> list[dict]:
+                  cfg: Config, recent_closes: list[float] | None = None,
+                  market: dict | None = None) -> list[dict]:
     """Возвращает список новых сигналов [{type, action, note, urgency}].
 
     position: dict c entry_price, base_low (может быть None).
     triggered: типы событий, уже записанных в журнал (не дублируем алерты).
     recent_closes: хвост дневных закрытий (для подтверждения инвалидации N дней).
         None -> проверка по одному last_price (обратная совместимость).
+    market: {"hot_score": 0..1 | None, "lit": [флаги]} — перегрев рынка (None = нет данных).
     """
     e = cfg["stage8_exit"]
     entry = position["entry_price"]
@@ -41,6 +46,9 @@ def evaluate_exit(position: dict, last_price: float, hwm: float,
 
     gain = last_price / entry - 1
     hwm_gain = hwm / entry - 1 if hwm > 0 else 0.0
+    hot = (market or {}).get("hot_score")
+    hot_on = isinstance(hot, (int, float)) and hot >= e.get("market_hot_alert", 1.01)
+    tighten = hot_on and (e.get("market_hot_tighten", False) or position.get("variant") == "B")
 
     # 1) Инвалидация тезиса — важнее всего, дальше можно не смотреть.
     #    Подтверждение N закрытий подряд ниже пола отсекает однодневный shakeout
@@ -77,14 +85,18 @@ def evaluate_exit(position: dict, last_price: float, hwm: float,
 
     # 3) Взводимый трейлинг: только после существенной прибыли.
     armed = hwm_gain >= e["trailing_arm_after_gain_pct"] / 100.0
+    trail_pct = e["trailing_from_hwm_pct"]
+    if tighten:
+        trail_pct = min(trail_pct, e.get("market_hot_trailing_pct", trail_pct))
     if armed and hwm > 0 and "trailing" not in triggered:
         dd_from_hwm = 1 - last_price / hwm
-        if dd_from_hwm >= e["trailing_from_hwm_pct"] / 100.0:
+        if dd_from_hwm >= trail_pct / 100.0:
+            why = f", трейл сужен до {trail_pct:g}% — рынок перегрет" if tighten else ""
             signals.append({
                 "type": "trailing", "urgency": "high",
                 "action": "ЗАФИКСИРОВАТЬ ОСТАТОК",
                 "note": (f"откат −{dd_from_hwm * 100:.0f}% от максимума {hwm:.6g} "
-                         f"(пик был {hwm_gain * 100:+.0f}% от входа)"),
+                         f"(пик был {hwm_gain * 100:+.0f}% от входа{why})"),
             })
 
     # 4) Зона распределения — информационный (повторяется не чаще раза, см. журнал).
@@ -92,17 +104,34 @@ def evaluate_exit(position: dict, last_price: float, hwm: float,
         above = indicators.get("pct_above_sma")
         rangep = indicators.get("range_pos")
         vol_exp = indicators.get("vol_trend")  # >1 = расширение объёма (None = нет данных)
+        funding = indicators.get("funding_rate")  # эйфория лонгов = перегрев у вершины
+        euphoria = (isinstance(funding, (int, float))
+                    and funding >= e.get("funding_euphoria", 0.0005))
         hot = (isinstance(above, (int, float)) and above >= e["peak_min_above_sma_pct"]
                and isinstance(rangep, (int, float)) and rangep >= e["peak_min_range_pos"])
-        if hot and gain > 0:
+        if (hot or euphoria) and gain > 0:
             note = f"разгон: +{above:.0f}% над SMA, верх диапазона ({rangep:.2f})"
             if isinstance(vol_exp, (int, float)) and vol_exp >= e.get("vol_expansion_ratio", 1.6):
                 note += f", объём ×{vol_exp:.1f} к базе"
+            if euphoria:
+                note += f", фандинг +{funding*100:.3f}%/8h (эйфория лонгов — распределение)"
             signals.append({
                 "type": "peak_zone", "urgency": "low",
                 "action": "ЗОНА РАСПРЕДЕЛЕНИЯ — рассмотреть фиксацию",
                 "note": note,
             })
+
+    # 5) Перегрев рынка альтов — информационный, переармируется после cooldown.
+    if hot_on and gain > 0 and "market_hot" not in triggered:
+        from ..regime import FLAG_LABELS
+        lit = ", ".join(FLAG_LABELS.get(k, k) for k in (market or {}).get("lit") or [])
+        signals.append({
+            "type": "market_hot", "urgency": "medium",
+            "action": "РЫНОК ПЕРЕГРЕТ — рассмотреть фиксацию",
+            "note": (f"индекс перегрева {hot*100:.0f}% ({lit}); исторически после такого "
+                     f"рынок альтов чаще отдаёт, чем растёт"
+                     + (f" · трейл сужен до {trail_pct:g}%" if tighten else "")),
+        })
 
     return signals
 

@@ -14,9 +14,14 @@ from .positions import PositionStore
 from .sources import coingecko, newtokens
 from .sources.goplus import fetch_goplus, fetch_honeypot_is
 from .sources import defillama
-from .sources.bybit import fetch_spot_basecoins
+from .sources.bybit import fetch_spot_basecoins, fetch_daily_closes
+from .sources.funding import fetch_funding_map
 from . import regime
-from .stages import antirug, exit as exit_stage, fundamentals, liveness, zone, score
+from .stages import (antirug, entry_quality, exit as exit_stage, fundamentals,
+                    liveness, onchain, zone, score)
+from .sources import dune
+from .sources import coin_extras
+from .stages import coin_context
 from .stages.access import rf_gate
 from .stages.filters import apply_filters
 
@@ -110,6 +115,12 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
     run_id = store.new_run(_cfg_version(cfg))
 
     t0 = time.time()
+    # Контекст рынка альтов (market_daily): до ингеста, чтобы бэкфилл при первом
+    # запуске не делил rate-limit с CoinGecko. Сбой источника -> {} (скан идёт дальше).
+    from .sources import market
+    mctx = market.load_context(cfg, http, store)
+    mhot = mctx.get("hot") or {}
+
     ingested = stage0_ingest(cfg, http, track)
     if limit:
         ingested = ingested[:limit]
@@ -141,11 +152,17 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
         recent = cfg["stage4_zone"]["recent_days"]
         sma = cfg["stage4_zone"]["sma_days"]
         bybit_spot = fetch_spot_basecoins(http)
+        funding = fetch_funding_map(http)     # 1 вызов на все перпы (сигнал дна/вершины)
+        onchain_map = dune.fetch_onchain(cfg)  # {} если Dune-ключ/query не заданы
+        extras = coin_extras.load(cfg, http)   # выручка/OI/делистинги/Coinbase: 4 вызова
         hard = cfg.get("stage4_zone.rf_hard_gate", False)
 
-        # Режим BTC — 1 вызов на прогон. Контекст, не блокер (см. regime.py).
-        btc_chart = coingecko.fetch_market_chart(http, "bitcoin", days, demo)
-        btc_regime = regime.classify_regime(btc_chart["prices"], recent, sma)
+        # Режим BTC из Bybit klines (1000 дней) — надёжнее CoinGecko (без 429),
+        # окно шире = drawdown от ATH цикла. Fallback на CoinGecko при пустом ответе.
+        btc_prices = fetch_daily_closes(http, "BTCUSDT", 1000)
+        if not btc_prices:
+            btc_prices = coingecko.fetch_market_chart(http, "bitcoin", 365, demo)["prices"]
+        btc_regime = regime.classify_regime(btc_prices, recent, sma)
 
         live_on = cfg.get("stage3b_liveness.enabled", True)
         kept: list[Candidate] = []
@@ -159,17 +176,33 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
                 liveness.assess_liveness(c, detail, cfg)
             c.zone, c.zone_signals = zone.classify_zone(
                 c.indicators or None, c.drawdown_from_ath_pct, cfg)
+            if extras:
+                coin_context.annotate(c, extras, cfg, chart["prices"], chart.get("mcaps"))
 
             # Относительная сила к BTC + разметка контекста режима.
             rs = regime.rs_vs_btc(c.indicators.get("trend_recent_pct"),
                                   btc_regime.get("trend_recent_pct"))
             if rs is not None:
                 c.indicators["rs_vs_btc_pct"] = rs
+            c.market_dd = btc_regime.get("drawdown")
+            c.alt_market_dd = mctx.get("alt_dd")
+            c.market_hot_score = mhot.get("score")
+            c.market_hot_lit = list(mhot.get("lit") or [])
+            c.funding_rate = funding.get(c.symbol.upper())
+            # On-chain накопление (Dune): по symbol или адресу; наполняет блок onchain.
+            oc = onchain_map.get(c.symbol.upper()) or onchain_map.get((c.address or "").lower())
+            if oc:
+                c.net_flow_usd_7d = oc.get("net_flow_usd_7d")
+                c.holders_change_pct_7d = oc.get("holders_change_pct_7d")
+                c.onchain_score, oc_notes = onchain.assess_onchain(
+                    c.net_flow_usd_7d, c.holders_change_pct_7d, cfg, c.volume_24h)
+                c.zone_signals += oc_notes
+            # Множитель качества пружины (feature_study): BTC-dd, база, объём, dd-cap, фандинг.
+            if c.zone == "ПРУЖИНА/ДНО":
+                c.spring_quality, q_notes = entry_quality.spring_quality(c, cfg)
+                c.zone_signals += q_notes
             if btc_regime["regime"] == "BULL" and c.zone == "ПРУЖИНА/ДНО":
                 c.flags.append("dd_in_bull_market")
-                c.zone_signals.append(
-                    "⚠ глубокое дно при бычьем BTC — чаще слабость к рынку, чем недооценка "
-                    "(эмпирика ladder_study); нужно подтверждение: объём/RS")
 
             c.rf_access, c.rf_venue = rf_gate(c.symbol, c.chain, c.address, bybit_spot)
             if c.rf_venue == "DEX only":
@@ -222,6 +255,8 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
         "stage3_enriched": n_fund,
         "stage4_zoned": n_zone,
         "btc_regime": f"{btc_regime['regime']} ({btc_regime.get('trend_recent_pct')}% за период)",
+        "market": regime.context_line(mctx, btc_regime.get("drawdown")) or "нет данных",
+        "market_ctx": {**mctx, "btc_dd": btc_regime.get("drawdown")} if mctx else {},
         "paper_opened": n_paper,
         "top_score": round(max((c.score for c in watchlist), default=0.0), 1),
     }
@@ -236,6 +271,7 @@ def _open_paper_positions(cfg: Config, watchlist: list[Candidate]) -> int:
     stake = p.get("paper_stake_usdt", 100)
     max_open = p.get("paper_max_open", 15)
     reopen_cd = p.get("paper_reopen_cooldown_days", 30)
+    ab = p.get("paper_ab", False)
 
     pstore = PositionStore(cfg["output"]["db_path"])
     opened = 0
@@ -259,6 +295,12 @@ def _open_paper_positions(cfg: Config, watchlist: list[Candidate]) -> int:
                                f"dd={c.drawdown_from_ath_pct}")
         pstore.record_event(pid, "paper_open", c.price_usd,
                             "; ".join(c.zone_signals[:3]))
+        if ab:
+            # Близнец B: тот же вход, но трейл сужается при перегреве рынка (A/B выхода).
+            pstore.add(c.symbol, c.price_usd, stake / c.price_usd,
+                       coin_id=c.coin_id, chain=c.chain, address=c.address,
+                       venue=c.rf_venue, paper=True, variant="B", twin_of=pid,
+                       notes=f"ab-twin of #{pid}")
         opened += 1
     pstore.close_db()
     return opened
@@ -279,9 +321,22 @@ def run_watch(cfg: Config) -> dict:
     e = cfg["stage8_exit"]
     ladder = e["ladder"]
     peak_cooldown = e.get("peak_zone_cooldown_days", 30) * 86400
+    hot_cooldown = e.get("market_hot_cooldown_days", 30) * 86400
+    open_pos = pstore.open_positions()
+    funding = fetch_funding_map(http) if open_pos else {}
+    market_in: dict | None = None
+    mctx: dict = {}
+    if open_pos:
+        from .sources import market
+        mstore = Store(cfg["output"]["db_path"])
+        mctx = market.load_context(cfg, http, mstore)
+        mstore.close()
+        hot = mctx.get("hot") or {}
+        market_in = {"hot_score": hot.get("score"), "lit": hot.get("lit") or []}
+    onchain_map = dune.fetch_onchain(cfg) if open_pos else {}  # cached-результаты, дёшево
 
     rows: list[dict] = []
-    for pos in pstore.open_positions():
+    for pos in open_pos:
         if not pos["coin_id"]:
             rows.append({"position": pos, "pnl": None, "held_days": None,
                          "signals": [], "error": "нет coin_id — цену не достать (задай при pos add)"})
@@ -311,17 +366,20 @@ def run_watch(cfg: Config) -> dict:
                 pos["base_low"] = bl
 
         indicators = zone.compute_indicators(prices, z["recent_days"], z["sma_days"],
-                                             chart["volumes"])
+                                             chart["volumes"]) or {}
+        indicators["funding_rate"] = funding.get(pos["symbol"].upper())
         triggered = pstore.event_types(pos["id"])
         # peak_zone — переармируется после cooldown (окно распределения может
         # повториться на горизонте 1–2 года), в отличие от once-ever у остальных.
-        if "peak_zone" in triggered:
-            lastp = pstore.last_event_ts(pos["id"], "peak_zone")
-            if lastp and (now - lastp) > peak_cooldown:
-                triggered = triggered - {"peak_zone"}
+        for etype, cd in (("peak_zone", peak_cooldown), ("market_hot", hot_cooldown)):
+            if etype in triggered:
+                lastp = pstore.last_event_ts(pos["id"], etype)
+                if lastp and (now - lastp) > cd:
+                    triggered = triggered - {etype}
 
         signals = exit_stage.evaluate_exit(pos, last_close, hwm, indicators,
-                                           triggered, cfg, recent_closes=prices)
+                                           triggered, cfg, recent_closes=prices,
+                                           market=market_in)
         executed: list[str] = []
         for s in signals:
             pstore.record_event(pos["id"], s["type"], last_close, s["note"])
@@ -343,6 +401,7 @@ def run_watch(cfg: Config) -> dict:
         pnl = exit_stage.position_pnl(cur, last_close)
         pstore.snapshot(pos["id"], last_close, pnl["pnl_pct"], hwm)
 
+        oc = onchain_map.get(pos["symbol"].upper()) or onchain_map.get((pos.get("address") or "").lower())
         rows.append({
             "position": cur, "last_price": last_close, "hwm": hwm,
             "pnl": pnl,
@@ -351,11 +410,14 @@ def run_watch(cfg: Config) -> dict:
             "signals": signals, "executed": executed,
             "spark_prices": since_entry if since_entry else prices[-30:],
             "triggered": triggered,
+            "net_flow_usd_7d": (oc or {}).get("net_flow_usd_7d"),
         })
 
     pstore.close_db()
     ok_rows = [r for r in rows if r.get("pnl")]
-    return {"rows": rows, "summary": exit_stage.summarize_watch(ok_rows)}
+    summary = exit_stage.summarize_watch(ok_rows)
+    summary["market"] = regime.context_line(mctx) if mctx else ""
+    return {"rows": rows, "summary": summary}
 
 
 def _write_watchlist(cfg: Config, watchlist: list[Candidate]) -> None:
@@ -377,6 +439,15 @@ def _write_watchlist(cfg: Config, watchlist: list[Candidate]) -> None:
             "spring": c.spring_prefilter,
             "zone": c.zone, "zone_signals": c.zone_signals,
             "indicators": c.indicators,
+            "market_dd": c.market_dd, "spring_quality": c.spring_quality,
+            "alt_market_dd": c.alt_market_dd, "market_hot_score": c.market_hot_score,
+            "market_hot_lit": c.market_hot_lit,
+            "funding_rate": c.funding_rate,
+            "supply_growth": c.supply_growth, "revenue_30d": c.revenue_30d,
+            "p_f": c.p_f, "oi_mcap": c.oi_mcap, "delist": c.delist, "us_tag": c.us_tag,
+            "onchain_score": c.onchain_score,
+            "net_flow_usd_7d": c.net_flow_usd_7d,
+            "holders_change_pct_7d": c.holders_change_pct_7d,
             "rf_venue": c.rf_venue, "rf_access": c.rf_access,
             "category": c.category, "tvl": c.tvl,
             "mc_tvl": c.mc_tvl, "fdv_mc": c.fdv_mc,

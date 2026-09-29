@@ -24,3 +24,20 @@ def fetch_spot_basecoins(http: HttpClient) -> set[str]:
             if base:
                 out.add(base)
     return out
+
+
+def fetch_daily_closes(http: HttpClient, symbol: str = "BTCUSDT",
+                       limit: int = 1000) -> list[float]:
+    """Дневные закрытия (oldest→newest) с Bybit spot. Надёжнее CoinGecko (лимиты
+    выше, без 429) — для BTC-drawdown, сильнейшего предиктора качества пружины."""
+    data = http.get_json(f"{_BASE}/v5/market/kline",
+                         params={"category": "spot", "symbol": symbol,
+                                 "interval": "D", "limit": limit})
+    rows = (data or {}).get("result", {}).get("list", []) if isinstance(data, dict) else []
+    out: list[float] = []
+    for r in reversed(rows):     # Bybit отдаёт newest-first
+        try:
+            out.append(float(r[4]))
+        except (ValueError, IndexError, TypeError):
+            continue
+    return out

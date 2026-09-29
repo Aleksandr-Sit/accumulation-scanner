@@ -6,6 +6,7 @@
   python run.py pos list                    # открытые позиции
   python run.py pos close ARB --price 1.2   # закрыть (P&L в журнал)
   python run.py watch [--notify]            # ре-скан позиций -> exit-сигналы
+  python run.py market [--backfill]         # история рынка альтов + индекс перегрева
   python run.py selftest                    # офлайн-проверка логики на фикстурах
 """
 from __future__ import annotations
@@ -25,7 +26,8 @@ def cmd_scan(args) -> int:
     summary = run_scan(cfg, track=args.track, limit=args.limit)
     print("\n=== ИТОГ ПРОГОНА ===")
     for k, v in summary.items():
-        print(f"  {k:22}: {v}")
+        if not isinstance(v, dict):
+            print(f"  {k:22}: {v}")
     print(f"\nWatchlist → {cfg['output']['watchlist_json']}")
     print(f"База      → {cfg['output']['db_path']}")
 
@@ -42,7 +44,18 @@ def cmd_scan(args) -> int:
                            manual_review=r.get("manual_review", False),
                            flags=r.get("flags", []),
                            liveness_score=r.get("liveness_score"),
-                           dev_commits_4w=r.get("dev_commits_4w")) for r in rows]
+                           dev_commits_4w=r.get("dev_commits_4w"),
+                           market_dd=r.get("market_dd"),
+                           spring_quality=r.get("spring_quality"),
+                           funding_rate=r.get("funding_rate"),
+                           onchain_score=r.get("onchain_score"),
+                           net_flow_usd_7d=r.get("net_flow_usd_7d"),
+                           alt_market_dd=r.get("alt_market_dd"),
+                           market_hot_score=r.get("market_hot_score"),
+                           market_hot_lit=r.get("market_hot_lit") or [],
+                           supply_growth=r.get("supply_growth"), p_f=r.get("p_f"),
+                           oi_mcap=r.get("oi_mcap"), delist=r.get("delist") or "",
+                           us_tag=r.get("us_tag") or "") for r in rows]
         # mute: не повторять алерт по монете N дней, если балл не вырос заметно
         from scanner.db import Store
         st = Store(cfg["output"]["db_path"])
@@ -53,7 +66,15 @@ def cmd_scan(args) -> int:
         muted = len(cands) - len(fresh)
         if muted:
             print(f"[telegram] mute: {muted} повторных кандидатов пропущено")
-        if telegram.notify(fresh, cfg):
+        # Рыночный контекст в шапку: из прогона (market_daily). Таблица пуста/сбой —
+        # фолбэк на срез CoinGecko /global + market_dd из watchlist.
+        mctx = summary.get("market_ctx") or {}
+        if not mctx:
+            from scanner.pipeline import _make_http
+            from scanner.sources.coingecko import fetch_global
+            mctx = fetch_global(_make_http(cfg), cfg.get("api_keys.coingecko_demo", ""))
+            mctx["market_dd"] = rows[0].get("market_dd") if rows else None
+        if telegram.notify(fresh, cfg, mctx):
             min_s = cfg.get("stage6_telegram.min_score", 70)
             for c in fresh:
                 if c.score >= min_s:
@@ -164,7 +185,8 @@ def cmd_pos(args) -> int:
             import time as _t
             days = int((_t.time() - p["entry_ts"]) / 86400)
             bl = f"{p['base_low']:.6g}" if p["base_low"] else "—"
-            tag = "📝paper" if p.get("is_paper") else "💰real "
+            tag = ("📝paper" + ("·B" if p.get("variant") == "B" else "  ")
+                   if p.get("is_paper") else "💰real   ")
             rz = p.get("realized_usdt") or 0.0
             rzs = f" realized={rz:+.2f}" if abs(rz) > 1e-9 else ""
             print(f"#{p['id']:<3} {p['symbol']:<8} {tag} {p['status']:<7} qty={p['qty']:<12g} "
@@ -209,7 +231,10 @@ def cmd_watch(args) -> int:
         print("Открытых позиций нет — нечего отслеживать (run.py pos add ...).")
         return 0
     print(f"=== WATCH: {summary['positions']} позиций, "
-          f"{summary['signals']} новых сигналов ===\n")
+          f"{summary['signals']} новых сигналов ===")
+    if summary.get("market"):
+        print(f"  рынок: {summary['market']}")
+    print()
     for r in rows:
         p = r["position"]
         if r.get("error"):
@@ -217,6 +242,8 @@ def cmd_watch(args) -> int:
             continue
         pnl = r["pnl"]
         tag = "📝" if p.get("is_paper") else "💰"
+        if p.get("variant") == "B":
+            tag += "B"
         rz = r.get("realized_usdt") or 0.0
         rzs = f", realized {rz:+.2f}" if abs(rz) > 1e-9 else ""
         print(f"  {tag} {p['symbol']:<8} {pnl['pnl_pct']:+7.1f}%  "
@@ -232,6 +259,9 @@ def cmd_watch(args) -> int:
         from scanner.notify import telegram
         token = cfg.get("api_keys.telegram_token", "")
         chat = cfg.get("api_keys.telegram_chat_id", "")
+        # Близнецы B (A/B выхода) — тихий эксперимент: в алерты и дайджест не идут,
+        # итог сравнения — в недельном report.
+        rows = [r for r in rows if r["position"].get("variant") != "B"]
         text = telegram.format_exit_alert(rows, cfg)
         if text:
             ok = telegram.send_message(token, chat, text)
@@ -256,8 +286,9 @@ def cmd_report(args) -> int:
 
     now = _t.time()
     week_ago = now - 7 * 86400
-    events = pstore.events_since(week_ago)
-    opens = pstore.open_positions()
+    # Близнецы B (A/B выхода) не входят в основные счётчики — только в блок сравнения.
+    events = [e for e in pstore.events_since(week_ago) if e.get("variant") != "B"]
+    opens = [p for p in pstore.open_positions() if p.get("variant") != "B"]
     snaps = pstore.last_snapshots()
 
     def _pnl(pos_list):
@@ -272,7 +303,7 @@ def cmd_report(args) -> int:
     real_open = [p for p in opens if not p.get("is_paper")]
 
     # Realized по закрытым paper-позициям (paper-executor фиксирует по сигналам).
-    all_pos = pstore.all_positions()
+    all_pos = [p for p in pstore.all_positions() if p.get("variant") != "B"]
     paper_realized = round(sum(p.get("realized_usdt") or 0.0
                                for p in all_pos if p.get("is_paper")), 2)
     real_realized = round(sum(p.get("realized_usdt") or 0.0
@@ -285,7 +316,25 @@ def cmd_report(args) -> int:
     week_no = int((now - first_ts) // (7 * 86400)) + 1 if first_ts else 0
     milestone = (week_no >= args.milestone_weeks
                  and not pstore.system_flag("milestone_4w"))
-    all_events = pstore.events_since(0) if milestone else events
+    all_events = ([e for e in pstore.events_since(0) if e.get("variant") != "B"]
+                  if milestone else events)
+
+    # A/B выхода: полный P&L пар A↔B net-of-fees (realized + unrealized по последнему
+    # снапшоту, как при продаже) — иначе закрытый B платил бы комиссию, а открытый A нет.
+    from scanner.stages.exit import position_pnl
+
+    def _total(p):
+        s = snaps.get(p["id"])
+        unreal = (position_pnl(p, s["price"])["pnl_usdt"]
+                  if s and p["status"] == "open" and p["qty"] > 0 else 0.0)
+        return (p.get("realized_usdt") or 0.0) + unreal
+    pairs = pstore.ab_pairs()
+    diffs = [_total(b) - _total(a) for a, b in pairs]
+    ab = {"pairs": len(pairs),
+          "a_usdt": round(sum(_total(a) for a, _ in pairs), 2),
+          "b_usdt": round(sum(_total(b) for _, b in pairs), 2),
+          "diverged": sum(1 for d in diffs if abs(d) > 0.01),
+          "b_better": sum(1 for d in diffs if d > 0.01)}
 
     stats = {
         "week_no": week_no,
@@ -307,6 +356,7 @@ def cmd_report(args) -> int:
         "cum_invalidations": sum(1 for e in all_events if e["type"] == "invalidation"),
         "cum_ladder_hits": sum(1 for e in all_events if e["type"].startswith("ladder_")),
         "cum_trailings": sum(1 for e in all_events if e["type"] == "trailing"),
+        "ab": ab,
     }
     if milestone:
         pstore.set_system_flag("milestone_4w", f"week={week_no}")
@@ -318,6 +368,39 @@ def cmd_report(args) -> int:
         ok = telegram.send_message(cfg.get("api_keys.telegram_token", ""),
                                    cfg.get("api_keys.telegram_chat_id", ""), text)
         print(f"[telegram] недельная сводка: {'ok' if ok else 'fail'}")
+    return 0
+
+
+def cmd_market(args) -> int:
+    """Обновить market_daily (или полный бэкфилл) и показать контекст рынка."""
+    import time as _t
+    cfg = load_config(args.config)
+    from scanner.db import Store
+    from scanner.pipeline import _make_http
+    from scanner.sources import market
+    from scanner import regime
+    store = Store(cfg["output"]["db_path"])
+    t0 = _t.time()
+    info = market.update_market_daily(cfg, _make_http(cfg), store,
+                                      force=True, backfill=args.backfill)
+    st = store.market_stats()
+    ctx = regime.market_context(store.market_rows(), cfg)
+    store.close()
+    print(f"[market] {info['mode']}: записано дней {info['updated']} за {_t.time()-t0:.0f} с; "
+          f"в таблице {st['days_alt']} дней с альт-рынком")
+    if not ctx:
+        print("Контекст не посчитан — нет данных по альт-рынку.")
+        return 1
+    day = _t.strftime("%Y-%m-%d", _t.gmtime(ctx["day"]))
+    print(f"\n=== РЫНОК на {day} ===\n  {regime.context_line(ctx)}\n")
+    hot = ctx["hot"]
+    flags = cfg.get("market_regime.hot_flags", {}) or {}
+    for name, spec in flags.items():
+        v = ctx.get(name)
+        mark = "🔥" if name in hot["lit"] else ("·~" if name in hot["near"] else " ·")
+        vs = f"{v:.3f}" if isinstance(v, (int, float)) else "нет данных"
+        print(f"  {mark} {regime.FLAG_LABELS.get(name, name):<18} {vs:>10}  "
+              f"(порог {spec[0]} {spec[1]}, близко {spec[2] if len(spec) > 2 else '—'})")
     return 0
 
 
@@ -363,6 +446,11 @@ def main() -> int:
                     help="на какой неделе выдать итоговую сводку (одноразово)")
     pr.add_argument("--config", default=None)
     pr.set_defaults(func=cmd_report)
+
+    pm = sub.add_parser("market", help="обновить историю рынка и показать контекст/перегрев")
+    pm.add_argument("--backfill", action="store_true", help="полный бэкфилл с backfill_start (~3 мин)")
+    pm.add_argument("--config", default=None)
+    pm.set_defaults(func=cmd_market)
 
     pt = sub.add_parser("selftest", help="офлайн-проверка на фикстурах")
     pt.set_defaults(func=cmd_selftest)

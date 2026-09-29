@@ -69,6 +69,22 @@ CREATE TABLE IF NOT EXISTS alert_log (
     score  REAL
 );
 CREATE INDEX IF NOT EXISTS idx_alert_sym ON alert_log(symbol, ts);
+CREATE TABLE IF NOT EXISTS market_daily (
+    day           INTEGER PRIMARY KEY,   -- unix-секунды 00:00 UTC
+    total_mcap    REAL,                  -- вся капа (CMC; при сбое — CoinGecko × поправка)
+    btc_dominance REAL,                  -- BTC.D, %
+    cg_total_mcap REAL,                  -- CoinGecko /global — для поправки CMC↔CG
+    cg_btc_dominance REAL,
+    stables_usd   REAL,                  -- предложение стейблов: max(DeFiLlama, USDT+USDC CoinMetrics)
+    mvrv_btc      REAL,
+    mvrv_eth      REAL,
+    fng           REAL,                  -- Fear & Greed
+    funding_btc   REAL,                  -- средний фандинг BTCUSDT Bybit за день, доля/8ч
+    oi_btc        REAL,                  -- open interest BTCUSDT Bybit, BTC
+    breadth200    REAL,                  -- % альтов (топ Bybit spot) выше своей SMA200
+    total_source  TEXT,                  -- cmc | coingecko
+    updated_ts    REAL
+);
 """
 
 # Колонки, добавленные после первого релиза (для миграции старых БД).
@@ -160,6 +176,44 @@ class Store:
             " volume_24h, holder_count, dev_commits_4w, n_exchanges, liveness_score, score)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
         self.conn.commit()
+
+    # --- рыночный контекст (market_regime) ---
+    MARKET_COLS = ("total_mcap", "btc_dominance", "cg_total_mcap", "cg_btc_dominance",
+                   "stables_usd", "mvrv_btc", "mvrv_eth", "fng", "funding_btc", "oi_btc",
+                   "breadth200", "total_source")
+
+    def upsert_market(self, rows: dict[int, dict]) -> int:
+        """{day: {col: value}} -> market_daily. None НЕ затирает уже записанное
+        (каждый источник обновляет только свои поля). Возвращает число дней."""
+        n = 0
+        now = time.time()
+        for day, vals in rows.items():
+            cols = [c for c in self.MARKET_COLS if vals.get(c) is not None]
+            if not cols:
+                continue
+            placeholders = ",".join("?" for _ in cols)
+            updates = ",".join(f"{c}=excluded.{c}" for c in cols)
+            self.conn.execute(
+                f"INSERT INTO market_daily(day,{','.join(cols)},updated_ts) "
+                f"VALUES (?,{placeholders},?) "
+                f"ON CONFLICT(day) DO UPDATE SET {updates}, updated_ts=excluded.updated_ts",
+                (int(day), *[vals[c] for c in cols], now))
+            n += 1
+        self.conn.commit()
+        return n
+
+    def market_rows(self, since_day: int = 0) -> list[dict]:
+        cur = self.conn.execute(
+            "SELECT * FROM market_daily WHERE day>=? ORDER BY day", (since_day,))
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, r)) for r in cur.fetchall()]
+
+    def market_stats(self) -> dict:
+        """{days_alt, last_day, last_update} — для решения «нужен ли бэкфилл/обновление»."""
+        r = self.conn.execute(
+            "SELECT COUNT(*), MAX(day), MAX(updated_ts) FROM market_daily "
+            "WHERE total_mcap IS NOT NULL AND stables_usd IS NOT NULL").fetchone()
+        return {"days_alt": r[0] or 0, "last_day": r[1], "last_update": r[2]}
 
     def close(self) -> None:
         self.conn.close()

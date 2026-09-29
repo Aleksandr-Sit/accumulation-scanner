@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS positions (
     closed_ts   REAL,
     realized_usdt REAL DEFAULT 0,
     notes       TEXT DEFAULT '',
-    is_paper    INTEGER DEFAULT 0
+    is_paper    INTEGER DEFAULT 0,
+    variant     TEXT DEFAULT 'A',
+    twin_of     INTEGER
 );
 CREATE TABLE IF NOT EXISTS position_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,20 +77,28 @@ class PositionStore:
             self.conn.execute("UPDATE positions SET initial_qty=qty WHERE initial_qty IS NULL")
         if "realized_usdt" not in cols:
             self.conn.execute("ALTER TABLE positions ADD COLUMN realized_usdt REAL DEFAULT 0")
+        # A/B выхода на paper: B — близнец A с сужением трейла при перегреве рынка.
+        if "variant" not in cols:
+            self.conn.execute("ALTER TABLE positions ADD COLUMN variant TEXT DEFAULT 'A'")
+        if "twin_of" not in cols:
+            self.conn.execute("ALTER TABLE positions ADD COLUMN twin_of INTEGER")
 
     # --- CRUD ---
     def add(self, symbol: str, entry_price: float, qty: float,
             coin_id: str = "", chain: str = "", address: str = "",
             venue: str = "", base_low: float | None = None,
             entry_ts: float | None = None, notes: str = "",
-            paper: bool = False) -> int:
+            paper: bool = False, variant: str = "A",
+            twin_of: int | None = None) -> int:
         ts = entry_ts if entry_ts is not None else time.time()
         cur = self.conn.execute(
             """INSERT INTO positions(symbol, coin_id, chain, address, venue,
-                   entry_price, qty, initial_qty, entry_ts, base_low, hwm, notes, is_paper)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   entry_price, qty, initial_qty, entry_ts, base_low, hwm, notes, is_paper,
+                   variant, twin_of)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (symbol.upper(), coin_id, chain, address, venue,
-             entry_price, qty, qty, ts, base_low, entry_price, notes, int(paper)))
+             entry_price, qty, qty, ts, base_low, entry_price, notes, int(paper),
+             variant, twin_of))
         self.conn.commit()
         return int(cur.lastrowid)
 
@@ -101,8 +111,10 @@ class PositionStore:
         return cur.fetchone() is not None
 
     def count_open_paper(self) -> int:
+        """Открытые paper-позиции без близнецов B (лимит paper_max_open — по монетам)."""
         cur = self.conn.execute(
-            "SELECT COUNT(*) FROM positions WHERE status='open' AND is_paper=1")
+            "SELECT COUNT(*) FROM positions WHERE status='open' AND is_paper=1 "
+            "AND COALESCE(variant,'A')!='B'")
         return int(cur.fetchone()[0])
 
     def open_positions(self) -> list[dict[str, Any]]:
@@ -122,7 +134,7 @@ class PositionStore:
         else:
             cur = self.conn.execute(
                 "SELECT * FROM positions WHERE symbol=? AND status='open' "
-                "ORDER BY is_paper ASC, id ASC", (ref.upper(),))
+                "ORDER BY is_paper ASC, COALESCE(variant,'A') ASC, id ASC", (ref.upper(),))
         row = cur.fetchone()
         return _row_to_dict(cur, row) if row else None
 
@@ -143,7 +155,8 @@ class PositionStore:
 
     def events_since(self, ts: float) -> list[dict[str, Any]]:
         cur = self.conn.execute(
-            "SELECT e.*, p.symbol, p.is_paper FROM position_events e "
+            "SELECT e.*, p.symbol, p.is_paper, COALESCE(p.variant,'A') AS variant "
+            "FROM position_events e "
             "JOIN positions p ON p.id=e.position_id WHERE e.ts>=? ORDER BY e.ts", (ts,))
         return [_row_to_dict(cur, r) for r in cur.fetchall()]
 
@@ -247,6 +260,18 @@ class PositionStore:
         cur = self.conn.execute(
             "SELECT * FROM position_events WHERE position_id=? ORDER BY ts", (position_id,))
         return [_row_to_dict(cur, r) for r in cur.fetchall()]
+
+    def ab_pairs(self) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """Пары (A, B) paper-близнецов для сравнения выхода: B.twin_of = A.id."""
+        cur = self.conn.execute(
+            "SELECT * FROM positions WHERE is_paper=1 AND variant='B' AND twin_of IS NOT NULL "
+            "ORDER BY id")
+        pairs = []
+        for b in [_row_to_dict(cur, r) for r in cur.fetchall()]:
+            a = self.get(b["twin_of"])
+            if a:
+                pairs.append((a, b))
+        return pairs
 
     def close_db(self) -> None:
         self.conn.close()

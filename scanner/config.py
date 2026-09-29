@@ -52,6 +52,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
         keys["coingecko_demo"] = os.environ["COINGECKO_DEMO_KEY"]
     if os.getenv("GOPLUS_KEY"):
         keys["goplus"] = os.environ["GOPLUS_KEY"]
+    if os.getenv("DUNE_API_KEY"):
+        keys["dune"] = os.environ["DUNE_API_KEY"]
     keys["telegram_token"] = os.getenv("TELEGRAM_BOT_TOKEN", "")
     keys["telegram_chat_id"] = os.getenv("TELEGRAM_CHAT_ID", "")
 

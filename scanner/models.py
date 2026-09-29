@@ -49,6 +49,25 @@ class Candidate:
     zone: str = ""                         # ПРУЖИНА/ДНО | СЕРЕДИНА | ПИК | ПАДАЮЩИЙ_НОЖ | ?
     zone_signals: list[str] = field(default_factory=list)
     indicators: dict = field(default_factory=dict)       # vol-contraction, trend, range-pos…
+    market_dd: float | None = None         # просадка BTC от ATH (0..1) — контекст рынка
+    alt_market_dd: float | None = None     # просадка альт-рынка без стейблов от ATH (0..1)
+    market_hot_score: float | None = None  # индекс перегрева рынка: доля горящих флагов (0..1)
+    market_hot_lit: list[str] = field(default_factory=list)  # какие флаги перегрева горят
+    spring_quality: float | None = None    # множитель качества пружины (feature_study)
+    funding_rate: float | None = None      # фандинг перпа Bybit (доля/8h): <0 капитуляция, >0 эйфория
+
+    # --- монетный контекст (Stage 4d, информационный — в скор не входит) ---
+    supply_growth: float | None = None     # рост предложения за окно истории (mcap/price)
+    revenue_30d: float | None = None       # выручка протокола за 30д, $ (DeFiLlama)
+    p_f: float | None = None               # капа / годовая выручка
+    oi_mcap: float | None = None           # OI перпа Bybit / капа (плечо на монете)
+    delist: str = ""                       # spot | perp | st — риск делистинга Bybit
+    us_tag: str = ""                       # etf | coinbase — регулируемый доступ из США
+
+    # --- on-chain накопление (Dune, опц.) ---
+    net_flow_usd_7d: float | None = None    # нетто-поток на биржи 7д (<0 = отток = накопление)
+    holders_change_pct_7d: float | None = None  # изменение числа холдеров 7д (%)
+    onchain_score: float | None = None      # под-балл 0–10 (None = нет данных Dune)
     rf_venue: str = ""                     # Bybit spot | DEX only | нет
     rf_access: bool = True                 # доступен ли гражданину РФ легально
 

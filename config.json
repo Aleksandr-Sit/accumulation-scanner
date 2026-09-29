@@ -66,6 +66,66 @@
     "wash_ratio_max": 50
   },
 
+  "coin_context": {
+    "_comment": "Монетный контекст (sources/coin_extras.py, stages/coin_context.py) — ИНФОРМАЦИОННЫЙ, в скор не входит: признаки не провалидированы на истории. Пороги [оценка]. us_etf — монеты со спотовым ETF в США (SOL, LTC, HBAR — 28.10.2025; XRP — 13.11.2025; LINK — 02.12.2025; DOGE); BTC/ETH не альты. Обновлять руками.",
+    "enabled": true,
+    "supply_growth_warn": 0.25,
+    "pf_cheap": 15,
+    "oi_mcap_warn": 0.2,
+    "delist_days": 90,
+    "us_etf": ["SOL", "LTC", "HBAR", "XRP", "LINK", "DOGE"]
+  },
+  "stage4b_quality": {
+    "_comment": "Множитель качества пружины (feature_study 17.07.2026, 945 эпизодов). Сильнейший фактор — просадка BTC: у ATH P(+100)=22%, −55%+ =74%. Пороги [оценка].",
+    "btc_dd_full": 0.5,
+    "btc_dd_min_mult": 0.6,
+    "btc_dd_max_mult": 1.15,
+    "base_len_strong": 50,
+    "base_len_weak": 20,
+    "base_len_bonus": 1.1,
+    "base_len_penalty": 0.92,
+    "dryup_band": [0.5, 0.8],
+    "dryup_dead": 0.3,
+    "dryup_rising": 1.2,
+    "dryup_bonus": 1.05,
+    "dryup_penalty": 0.9,
+    "dd_extreme_pct": 94,
+    "dd_extreme_penalty": 0.85,
+    "funding_capitulation": -0.0003,
+    "funding_euphoria": 0.0005,
+    "funding_bonus": 1.08,
+    "funding_penalty": 0.92,
+    "_market_note": "market_regime_study 29.09.2026: просадка альт-рынка без стейблов (alt) устойчивее BTC-dd в обоих циклах; btc — прежнее поведение; mix — среднее. Нет данных по альт-рынку -> откат на BTC-dd. Перегрев рынка на входе: 0 флагов P(+100) 59–77%, ≥1 флаг 27–52%. Валидация прод-функцией (backtest/market_regime_study.py, 788 пружин): BTC-dd в 2020-22 ранжировал наоборот (спред верх−низ −14пп), alt+штрафы — +16/+42пп; верхняя треть P 67% vs нижняя 25% при warm=hot=0.75 (сигнал в «0 vs ≥1 флаг», не в числе флагов). Штрафы in-sample [оценка].",
+    "market_dd_source": "alt",
+    "alt_dd_from": 0.35,
+    "alt_dd_full": 0.65,
+    "hot_warm_penalty": 0.75,
+    "hot_threshold": 0.25,
+    "hot_penalty": 0.75,
+    "mult_floor": 0.4,
+    "mult_cap": 1.25
+  },
+
+  "market_regime": {
+    "_comment": "Контекст рынка альтов (backtest/market_regime_study.py). Таблица market_daily: бэкфилл с 2017 автоматически при первом прогоне, дальше обновление не чаще раза в update_min_interval_hours. Флаги перегрева [оператор, порог, «близко»] подобраны in-sample по 8 вершинам альт-рынка 2018–2025 — [оценка]. hot_score = доля горящих флагов среди доступных.",
+    "enabled": true,
+    "backfill_start": "2017-01-01",
+    "update_min_interval_hours": 6,
+    "update_lookback_days": 10,
+    "breadth_top_n": 150,
+    "hot_min_available": 4,
+    "hot_flags": {
+      "alt_vs_sma200": [">=", 0.40, 0.30],
+      "mvrv_btc": [">=", 2.2, 1.9],
+      "mvrv_eth": [">=", 1.3, 1.15],
+      "fng30": [">=", 70, 62],
+      "breadth200": [">=", 85, 75],
+      "fund30": [">=", 0.02, 0.012],
+      "oi_rel365": [">=", 1.3, 1.15],
+      "altbtc_chg90": [">=", 0.15, 0.10]
+    }
+  },
+
   "stage5_score": {
     "enabled": true,
     "weights": {
@@ -99,7 +159,9 @@
     "paper_min_score": 70,
     "paper_min_confidence": 0.6,
     "paper_max_open": 15,
-    "paper_reopen_cooldown_days": 30
+    "paper_reopen_cooldown_days": 30,
+    "_paper_ab_note": "A/B выхода: к каждой авто-paper позиции открывается близнец variant=B, у которого при перегреве рынка трейлинг сужается (stage8_exit.market_hot_trailing_pct). report сравнивает книги A и B.",
+    "paper_ab": true
   },
 
   "stage8_exit": {
@@ -109,11 +171,18 @@
     "invalidation_confirm_days": 2,
     "trailing_arm_after_gain_pct": 60,
     "trailing_from_hwm_pct": 30,
-    "ladder": [[1.0, 0.25], [3.0, 0.25]],
+    "_ladder_note": "Смещена на +50/+150 (feature_study 17.07.2026): на раннерах медиана net +36% vs +26% у +100/+300, win 69 vs 67% — банкует прибыль на монетах, дошедших до +50-150%, но не до +300%. Средний ниже (режет редкую 10× ракету), но mean искажён survivorship — медиане верим больше.",
+    "ladder": [[0.5, 0.33], [1.5, 0.33]],
     "peak_min_above_sma_pct": 30,
     "peak_min_range_pos": 0.9,
     "vol_expansion_ratio": 1.6,
-    "peak_zone_cooldown_days": 30
+    "funding_euphoria": 0.0005,
+    "peak_zone_cooldown_days": 30,
+    "_market_hot_note": "market_regime_study: сузить трейл до 10–15% при перегреве рынка (≥3/8 флагов) -> медиана net −10%→+4…6%, win 47→55%, НО mean +85%→+17% (режет ракеты маний). Перепроверка прод-функцией evaluate_exit (backtest/market_regime_study.py, 1175 пружин, трейл 15% при ≥0.375): медиана не меняется (−4.3%), B лучше в 214 из 286 затронутых, но mean +80%→+20% (2020-22: +318%→+13%). Поэтому по умолчанию только алерт; сужение проверяется на paper-книге B (stage7_positions.paper_ab).",
+    "market_hot_alert": 0.375,
+    "market_hot_tighten": false,
+    "market_hot_trailing_pct": 15,
+    "market_hot_cooldown_days": 30
   },
 
   "http": {
@@ -129,10 +198,21 @@
     }
   },
 
+  "onchain": {
+    "_comment": "On-chain накопление через Dune (опц.). dune_query_id — id твоего Dune-запроса, отдающего таблицу: symbol|token_address, net_flow_usd_7d (<0=отток=накопление), holders_change_pct_7d. Ключ — DUNE_API_KEY в .env. Пусто = блок onchain выключен (как раньше). Пороги [оценка]. 8178559 = ERC20 нетто-поток на биржи 7д (Ethereum).",
+    "dune_query_id": "8178559",
+    "flow_big_ratio": 0.10,
+    "flow_small_ratio": 0.03,
+    "flow_sanity_cap": 0.5,
+    "flow_big_usd": 1000000,
+    "holders_big_pct": 5
+  },
+
   "api_keys": {
-    "_note": "Пусто = используем free/demo. Переопределяется env: COINGECKO_DEMO_KEY, GOPLUS_KEY.",
+    "_note": "Пусто = используем free/demo. Переопределяется env: COINGECKO_DEMO_KEY, GOPLUS_KEY, DUNE_API_KEY.",
     "coingecko_demo": "",
-    "goplus": ""
+    "goplus": "",
+    "dune": ""
   },
 
   "output": {

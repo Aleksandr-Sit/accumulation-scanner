@@ -299,6 +299,186 @@ def test_liveness(cfg, failures: list[str]) -> None:
     _check("нет lp_holders -> None (не пенализируем)", antirug.lp_locked_pct({}) is None, failures)
 
 
+def test_onchain(cfg, failures: list[str]) -> None:
+    print("Stage 4c — on-chain накопление (Dune):")
+    from scanner.stages.onchain import assess_onchain
+    from scanner.sources.dune import build_onchain_map
+
+    # Накопление: сильный отток (−20% нед.оборота при vol=1M) + рост холдеров.
+    s, notes = assess_onchain(-1_400_000, 8.0, cfg, volume_24h=1_000_000)
+    _check("отток+рост холдеров -> балл высокий (>8)", s is not None and s > 8, failures)
+    _check("заметка про отток + долю оборота", any("отток" in n and "оборота" in n for n in notes), failures)
+    # Распределение: сильный приток (+20% оборота) + исход холдеров -> низкий.
+    s2, _ = assess_onchain(1_400_000, -8.0, cfg, volume_24h=1_000_000)
+    _check("приток+исход -> балл низкий (<3)", s2 is not None and s2 < 3, failures)
+    # Нормировка: тот же $ поток, но огромный объём -> сигнал слабый (крупнокап
+    # не штрафуется абсолютом). LINK-кейс: $302M при vol $400M/д = ~11% оборота.
+    s_big, _ = assess_onchain(1_400_000, None, cfg, volume_24h=100_000_000)
+    _check("нормировка: малая доля оборота -> балл ~нейтрален (>4)", s_big > 4, failures)
+    # Нет объёма -> fallback на абсолютный порог.
+    s_abs, _ = assess_onchain(-3_000_000, None, cfg, volume_24h=None)
+    _check("без объёма -> абсолютный порог работает (>6)", s_abs > 6, failures)
+    # Санити-кап: аномальный поток (BNB-кейс +108% оборота) -> игнор -> None без холдеров.
+    s_anom, n_anom = assess_onchain(5_130_000_000, None, cfg, volume_24h=680_000_000)
+    _check("аномальный поток (>50% оборота) -> None (не врём)", s_anom is None, failures)
+    _check("аномалия помечена в заметке", any("аномален" in n for n in n_anom), failures)
+    # но если при аномальном потоке есть холдеры -> оцениваем по холдерам.
+    s_anh, _ = assess_onchain(5_130_000_000, 7.0, cfg, volume_24h=680_000_000)
+    _check("аномальный поток + холдеры -> балл по холдерам (>5)", s_anh is not None and s_anh > 5, failures)
+    # Нет данных -> None (режет confidence, не врёт).
+    s3, _ = assess_onchain(None, None, cfg)
+    _check("нет данных Dune -> None", s3 is None, failures)
+
+    # build_onchain_map: индексирует по symbol и адресу.
+    rows = [{"symbol": "arb", "token_address": "0xABC", "net_flow_usd_7d": -5e5,
+             "holders_change_pct_7d": 3.0}]
+    m = build_onchain_map(rows)
+    _check("map по symbol (UPPER)", "ARB" in m and m["ARB"]["net_flow_usd_7d"] == -5e5, failures)
+    _check("map по адресу (lower)", "0xabc" in m, failures)
+
+    # Блок onchain в скоре теперь читает onchain_score (не всегда None).
+    from scanner.stages.score import compute_score
+    c = Candidate(source="t", track="A", symbol="OC", zone="ПРУЖИНА/ДНО",
+                  rf_venue="Bybit spot", volume_24h=5e7, mc_tvl=0.3, fdv_mc=1.2,
+                  liveness_score=8.0)
+    c.onchain_score = 9.0
+    _, conf, brk = compute_score(c, cfg)
+    _check("onchain-блок наполнен -> confidence 1.0", conf == 1.0, failures)
+    _check("onchain sub в breakdown = 9.0", brk["onchain"]["sub"] == 9.0, failures)
+
+
+def test_entry_quality(cfg, failures: list[str]) -> None:
+    print("Stage 4b — качество пружины (feature_study):")
+    from scanner.stages.entry_quality import spring_quality
+    from scanner.stages.score import _sub_zone
+
+    # Сильная: рынок на дне (BTC −60%), длинная база, объём в полосе.
+    good = Candidate(source="t", track="A", symbol="G", zone="ПРУЖИНА/ДНО",
+                     drawdown_from_ath_pct=85.0, market_dd=0.60,
+                     indicators={"base_len_days": 60, "vol_trend": 0.65})
+    mg, ng = spring_quality(good, cfg)
+    good.spring_quality = mg
+    _check("сильная пружина: множитель > 1.05", mg > 1.05, failures)
+    _check("сильная: заметка про рынок на дне", any("рынок на дне" in n for n in ng), failures)
+    _check("сильная: sub_zone поднят выше базовых 9", _sub_zone(good) > 9.0, failures)
+
+    # Слабая: BTC у ATH, короткая база, мёртвый объём, обнуление.
+    bad = Candidate(source="t", track="A", symbol="B", zone="ПРУЖИНА/ДНО",
+                    drawdown_from_ath_pct=96.0, market_dd=0.05,
+                    indicators={"base_len_days": 12, "vol_trend": 0.2})
+    mb, nb = spring_quality(bad, cfg)
+    bad.spring_quality = mb
+    _check("слабая пружина: множитель < 0.8", mb < 0.8, failures)
+    _check("слабая: sub_zone занижен (< 8)", _sub_zone(bad) < 8.0, failures)
+    _check("сильная ранжируется выше слабой по зоне", _sub_zone(good) > _sub_zone(bad), failures)
+
+    # Нет market_dd/indicators -> нейтрально (множитель ~1, не штрафуем вслепую).
+    neutral = Candidate(source="t", track="A", symbol="N", zone="ПРУЖИНА/ДНО")
+    mn, _ = spring_quality(neutral, cfg)
+    _check("нет данных -> множитель 1.0 (нейтрально)", mn == 1.0, failures)
+
+    # Фандинг: капитуляция шортов (отрицательный) = бонус.
+    fc = Candidate(source="t", track="A", symbol="F", zone="ПРУЖИНА/ДНО",
+                   funding_rate=-0.001)
+    mf, nf = spring_quality(fc, cfg)
+    _check("отрицательный фандинг -> бонус (>1)", mf > 1.0, failures)
+    _check("фандинг: заметка про капитуляцию", any("капитуляц" in n for n in nf), failures)
+    # эйфория лонгов на пружине = штраф
+    fe = Candidate(source="t", track="A", symbol="FE", zone="ПРУЖИНА/ДНО",
+                   funding_rate=0.001)
+    me, _ = spring_quality(fe, cfg)
+    _check("положительный фандинг на пружине -> штраф (<1)", me < 1.0, failures)
+
+
+def test_market_regime(cfg, failures: list[str]) -> None:
+    print("Контекст рынка альтов (market_daily -> признаки -> перегрев):")
+    from scanner import regime
+    from scanner.stages.entry_quality import spring_quality
+    D = regime.DAY
+    # 400 дней: альт-рынок (total − BTC − стейблы) растёт до пика и падает на 40%.
+    rows = []
+    for i in range(400):
+        alt = 1000 + 5 * i if i < 300 else 2500 * (1 - 0.004 * (i - 299))
+        btc = 1000.0
+        rows.append({"day": i * D, "total_mcap": alt + btc + 200, "btc_dominance": btc / (alt + btc + 200) * 100,
+                     "stables_usd": 200, "fng": 40, "mvrv_btc": 1.5, "mvrv_eth": 0.9,
+                     "breadth200": 80, "funding_btc": 0.00005})
+    S = regime.market_series(rows)
+    _check("alt_ex = total − BTC − стейблы", abs(S["alt_ex"][0] - 1000) < 1e-6, failures)
+    ctx = regime.market_context(rows, cfg)
+    _check("alt_dd на последний день ≈ 0.40", abs(ctx.get("alt_dd", 0) - 0.40) < 0.01, failures)
+    hot = ctx["hot"]
+    _check("холодный рынок: 0 горящих флагов", hot["n_lit"] == 0 and hot["score"] == 0, failures)
+    _check("ширина 80% попала в «близко»", "breadth200" in hot["near"], failures)
+    f = {"alt_vs_sma200": 0.5, "mvrv_btc": 2.5, "fng30": 50, "breadth200": 60}
+    h = regime.hot_flags(f, cfg)
+    _check("перегрев: 2 из 4 доступных = 0.5", h["score"] == 0.5 and h["n_lit"] == 2, failures)
+    _check("мало доступных флагов -> score None", regime.hot_flags({"fng30": 80}, cfg)["score"] is None, failures)
+    line = regime.context_line({**ctx, "btc_dd": 0.33})
+    _check("строка контекста: альты, BTC, перегрев, F&G",
+           "альты −40%" in line and "BTC −33%" in line and "перегрев 0/" in line
+           and "близко: ширина рынка" in line and "F&G 40" in line, failures)
+    _check("пустой контекст -> пустая строка", regime.context_line({}) == "", failures)
+
+    # spring_quality: альт-рынок на дне > у хаёв; BTC — фолбэк при отсутствии alt.
+    def sq(**kw):
+        return spring_quality(Candidate(source="t", track="A", symbol="Q", zone="ПРУЖИНА/ДНО", **kw), cfg)
+    bottom, nb = sq(alt_market_dd=0.70, market_dd=0.10)
+    top, nt = sq(alt_market_dd=0.20, market_dd=0.60)
+    _check("источник alt: альты −70% > альты −20% (BTC игнорируется)", bottom > 1.1 > 0.7 > top, failures)
+    _check("заметка про альт-рынок на дне", any("альт-рынок на дне" in n for n in nb), failures)
+    fb, _ = sq(market_dd=0.60)
+    _check("нет alt_dd -> фолбэк на BTC-dd", fb > 1.1, failures)
+    cold, _ = sq(alt_market_dd=0.5)
+    warm, nw = sq(alt_market_dd=0.5, market_hot_score=0.125, market_hot_lit=["fng30"])
+    hotm, nh = sq(alt_market_dd=0.5, market_hot_score=0.375,
+                  market_hot_lit=["fng30", "mvrv_btc", "breadth200"])
+    _check("перегрев режет множитель: холодный > тёплый ≥ горячий", cold > warm >= hotm, failures)
+    _check("заметки: теплеет / перегрет", any("теплеет" in n for n in nw)
+           and any("перегрет" in n and "MVRV BTC" in n for n in nh), failures)
+
+
+def test_coin_context(cfg, failures: list[str]) -> None:
+    print("Stage 4d — монетный контекст (информационный):")
+    from scanner.stages.coin_context import annotate, supply_growth
+    from scanner.sources.coin_extras import parse_delist_title
+    from scanner.notify.telegram import coin_line
+    _check("предложение: mcap/price 100→130 = +30%",
+           supply_growth([1.0, 2.0], [100.0, 260.0]) == 0.3, failures)
+    _check("предложение: мало точек -> None", supply_growth([1.0], [100.0]) is None, failures)
+    _check("делистинг: список тикеров", parse_delist_title("Delisting of L3,VIC") == (["L3", "VIC"], False),
+           failures)
+    _check("делистинг: только перп", parse_delist_title("Delisting of ICXUSDT Perpetual Contract")
+           == (["ICX"], True), failures)
+    _check("делистинг: без тикеров в заголовке",
+           parse_delist_title("Bybit to Delist 4 Token(s) on Sep 24, 2026")[0] == [], failures)
+    extras = {"revenue": {"by_gecko": {}, "by_symbol": {"UNI": 10e6}},
+              "oi": {"UNI": 30e6, "ZZZ": 50e6}, "delist": {"ZZZ": "spot"},
+              "coinbase": {"UNI", "ZZZ"}}
+    u = Candidate(source="t", track="A", symbol="UNI", coin_id="uniswap", market_cap=1.2e9)
+    annotate(u, extras, cfg, [1.0, 1.0], [1.0e9, 1.1e9])
+    _check("P/F = капа / (выручка30д·12) = 10", u.p_f == 10.0, failures)
+    _check("P/F ≤ pf_cheap -> заметка «дёшево»", any("дёшево" in n for n in u.zone_signals), failures)
+    _check("эмиссия +10% без флага, US-тег coinbase",
+           u.supply_growth == 0.1 and "supply_inflation" not in u.flags and u.us_tag == "coinbase", failures)
+    z = Candidate(source="t", track="A", symbol="ZZZ", market_cap=100e6)
+    annotate(z, extras, cfg, [1.0, 1.0], [100e6, 140e6])
+    _check("делистинг спота -> флаг + заметка", z.delist == "spot" and "delist_spot" in z.flags, failures)
+    _check("OI 50% капы -> high_leverage", "high_leverage" in z.flags, failures)
+    _check("эмиссия +40% -> supply_inflation", "supply_inflation" in z.flags, failures)
+    line = coin_line(z)
+    _check("строка монеты: делистинг, эмиссия, OI", "делистинг" in line and "эмиссия +40%" in line
+           and "OI 50%" in line, failures)
+    sol = Candidate(source="t", track="A", symbol="SOL")
+    annotate(sol, {"coinbase": {"SOL"}}, cfg)
+    _check("SOL в списке ETF -> us_tag etf", sol.us_tag == "etf", failures)
+    from scanner.stages.score import compute_score
+    a, b = Candidate(source="t", track="A", symbol="A1", zone="ПРУЖИНА/ДНО"),         Candidate(source="t", track="A", symbol="A1", zone="ПРУЖИНА/ДНО")
+    b.flags += ["supply_inflation", "high_leverage", "delist_spot"]
+    _check("монетные флаги не меняют скор (информационно)",
+           compute_score(a, cfg)[0] == compute_score(b, cfg)[0], failures)
+
+
 def test_score(cfg, failures: list[str]) -> None:
     print("Stage 5 — композитный скор:")
 
@@ -355,6 +535,19 @@ def test_telegram_format(cfg, failures: list[str]) -> None:
                       score=90.0, confidence=0.3)]
     _check("низкий confidence отсечён гейтом", format_alert(thin, cfg) is None, failures)
 
+    # Рыночный контекст в шапке (BTC.D + просадка BTC).
+    from scanner.notify.telegram import format_market_ctx
+    mc = format_market_ctx({"market_dd": 0.49, "btc_dominance_pct": 58.0,
+                            "total2_mcap_usd": 1.2e12})
+    _check("контекст: BTC drawdown + зона (0.49=средняя)", "BTC −49%" in mc and "средняя зона" in mc, failures)
+    _check("контекст: BTC.D + альты", "BTC.D 58%" in mc and "альты $1200B" in mc, failures)
+    msg = format_alert(cands, cfg, {"market_dd": 0.49, "btc_dominance_pct": 58.0})
+    _check("шапка контекста в алерте", "🌍" in (msg or ""), failures)
+    mc2 = format_market_ctx({"alt_dd": 0.42, "btc_dd": 0.33, "fng": 45, "btc_d": 58.4,
+                             "hot": {"n_lit": 0, "avail": 8, "lit": [], "near": ["fng30"]}})
+    _check("новый контекст: альты · BTC · перегрев 0/8 (близко) · BTC.D",
+           mc2 == "альты −42% · BTC −33% · перегрев 0/8 (близко: F&G) · F&G 45 · BTC.D 58%", failures)
+
 
 def test_exit(cfg, failures: list[str]) -> None:
     print("Stage 8 — выходной контур (hodl-профиль):")
@@ -408,6 +601,38 @@ def test_exit(cfg, failures: list[str]) -> None:
     sigs = exit_stage.evaluate_exit(pos, 1.8, 1.8, ind, set(), cfg)
     _check("разгон -> peak_zone", any(s["type"] == "peak_zone" for s in sigs), failures)
 
+    # Эйфория фандинга даёт peak_zone даже без ценового разгона.
+    ind_f = {"pct_above_sma": 5.0, "range_pos": 0.5, "funding_rate": 0.001}
+    sigs = exit_stage.evaluate_exit(pos, 1.4, 1.4, ind_f, set(), cfg)
+    pz = next((s for s in sigs if s["type"] == "peak_zone"), None)
+    _check("эйфория фандинга -> peak_zone", pz is not None, failures)
+    _check("peak_zone: заметка про фандинг", pz and "фандинг" in pz["note"], failures)
+
+    # 5) Перегрев рынка: алерт в плюсе; сужение трейла только у близнеца B (A/B paper).
+    hot = {"hot_score": 0.5, "lit": ["mvrv_btc", "fng30", "breadth200", "fund30"]}
+    cold = {"hot_score": 0.0, "lit": []}
+    sigs = exit_stage.evaluate_exit(pos, 1.5, 1.5, None, set(), cfg, market=hot)
+    mh = next((s for s in sigs if s["type"] == "market_hot"), None)
+    _check("перегрев рынка + прибыль -> market_hot", mh is not None, failures)
+    _check("market_hot: флаги в заметке", mh and "MVRV BTC" in mh["note"], failures)
+    _check("холодный рынок -> market_hot молчит",
+           not any(s["type"] == "market_hot" for s in
+                   exit_stage.evaluate_exit(pos, 1.5, 1.5, None, set(), cfg, market=cold)), failures)
+    _check("market_hot уже в журнале -> не дублируется",
+           not any(s["type"] == "market_hot" for s in
+                   exit_stage.evaluate_exit(pos, 1.5, 1.5, None, {"market_hot"}, cfg, market=hot)), failures)
+    # пик +100% (взведён), откат −20%: A (трейл 30%) молчит, B (15% при перегреве) выходит.
+    pos_b = {**pos, "variant": "B"}
+    ta = exit_stage.evaluate_exit(pos, 1.6, 2.0, None, {"ladder_0"}, cfg, market=hot)
+    tb = exit_stage.evaluate_exit(pos_b, 1.6, 2.0, None, {"ladder_0"}, cfg, market=hot)
+    tbc = exit_stage.evaluate_exit(pos_b, 1.6, 2.0, None, {"ladder_0"}, cfg, market=cold)
+    _check("A: откат −20% при перегреве — трейл 30% молчит",
+           not any(s["type"] == "trailing" for s in ta), failures)
+    _check("B: откат −20% при перегреве — сужённый трейл сработал",
+           any(s["type"] == "trailing" and "сужен" in s["note"] for s in tb), failures)
+    _check("B на холодном рынке ведёт себя как A",
+           not any(s["type"] == "trailing" for s in tbc), failures)
+
     # P&L net-of-fees.
     pnl = exit_stage.position_pnl({"entry_price": 1.0, "qty": 1000.0}, 2.0)
     _check("P&L ~ +99.7% (комиссии учтены)", 99.0 < pnl["pnl_pct"] < 100.0, failures)
@@ -436,6 +661,16 @@ def test_positions_store(cfg, failures: list[str]) -> None:
     _check("закрыта -> не в открытых", ps.find_open("ARB") is None, failures)
     _check("manual_close в журнале", "manual_close" in ps.event_types(pid), failures)
     _check("realized суммируется (part+close)", ps.get(pid)["realized_usdt"] > 400, failures)
+
+    # A/B близнецы: B не считается в лимите paper, пара находится, pos close берёт A.
+    pa = ps.add("TWN", 1.0, 100, coin_id="twn", paper=True)
+    pb = ps.add("TWN", 1.0, 100, coin_id="twn", paper=True, variant="B", twin_of=pa)
+    _check("близнец B не в лимите paper (count=1)", ps.count_open_paper() == 1, failures)
+    prs = ps.ab_pairs()
+    _check("ab_pairs: пара A↔B", len(prs) == 1 and prs[0][0]["id"] == pa and prs[0][1]["id"] == pb,
+           failures)
+    _check("find_open по тикеру -> A раньше B", ps.find_open("TWN")["id"] == pa, failures)
+    ps.close(pa, 1.0); ps.close(pb, 1.0)
 
     # Cooldown re-open: закрытая paper-монета не переоткрывается N дней.
     cp = ps.add("CD", 1.0, 100, coin_id="cd-coin", paper=True)
@@ -509,7 +744,7 @@ def test_exit_alert_format(cfg, failures: list[str]) -> None:
     dig = format_digest(drows, cfg)
     _check("дайджест: обе позиции", "ARB" in (dig or "") and "GRAM" in (dig or ""), failures)
     _check("дайджест: маркировка 💰/📝", "💰" in (dig or "") and "📝" in (dig or ""), failures)
-    _check("дайджест: ближайший уровень лестницы", "+100%" in (dig or ""), failures)
+    _check("дайджест: ближайший уровень лестницы", "+50%" in (dig or ""), failures)
     _check("дайджест: суммы real/paper", "Σ" in (dig or ""), failures)
     _check("дайджест: пусто -> None", format_digest([], cfg) is None, failures)
 
@@ -522,6 +757,14 @@ def test_exit_alert_format(cfg, failures: list[str]) -> None:
     _check("недельная сводка: счётчик недели", "неделя 2" in wk, failures)
     _check("недельная сводка: напоминание + отсчёт", "До итоговой сводки: 2 нед" in wk, failures)
     _check("недельная сводка: цифры", "инвалидаций 1" in wk and "+12.50" in wk, failures)
+    _check("нет A/B пар -> строки сравнения нет", "🅰🅱" not in wk, failures)
+    wab = format_weekly({"week_no": 2, "milestone": False, "milestone_weeks": 4,
+                         "opened": 0, "open_now": 2, "invalidations": 0, "ladder_hits": 0,
+                         "trailings": 0, "paper_pnl_usdt": 0.0, "real_open": 0,
+                         "ab": {"pairs": 3, "a_usdt": 40.0, "b_usdt": 55.5,
+                                "diverged": 1, "b_better": 1}}, cfg)
+    _check("A/B: строка сравнения A vs B", "🅰🅱" in wab and "+40.00" in wab
+           and "+55.50" in wab and "3 парах" in wab, failures)
 
     # Итоговая 4-недельная: кумулятив + call-to-decide про капитал.
     ms = format_weekly({"week_no": 4, "milestone": True, "milestone_weeks": 4,
@@ -556,6 +799,14 @@ def main() -> int:
     test_rf_gate(cfg, failures)
     print()
     test_liveness(cfg, failures)
+    print()
+    test_entry_quality(cfg, failures)
+    print()
+    test_market_regime(cfg, failures)
+    print()
+    test_coin_context(cfg, failures)
+    print()
+    test_onchain(cfg, failures)
     print()
     test_score(cfg, failures)
     print()

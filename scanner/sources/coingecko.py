@@ -70,9 +70,10 @@ def fetch_market_chart(http: HttpClient, coin_id: str, days: int,
     """Дневной ряд за `days` дней (oldest→newest): {ts, prices, volumes}.
 
     ts — unix-секунды. volumes — total_volumes из того же ответа (бесплатный
-    сигнал накопления/распределения, 0 дополнительных вызовов API).
+    сигнал накопления/распределения, 0 дополнительных вызовов API). mcaps —
+    market_caps оттуда же: предложение = mcap / price (прокси разлоков/эмиссии).
     """
-    empty = {"ts": [], "prices": [], "volumes": []}
+    empty = {"ts": [], "prices": [], "volumes": [], "mcaps": []}
     if not coin_id:
         return empty
     data = http.get_json(
@@ -82,15 +83,39 @@ def fetch_market_chart(http: HttpClient, coin_id: str, days: int,
     )
     if not isinstance(data, dict):
         return empty
-    ts, prices, volumes = [], [], []
+    ts, prices, volumes, mcaps = [], [], [], []
     raw_v = {int(v[0]) : v[1] for v in data.get("total_volumes", [])
+             if isinstance(v, list) and len(v) == 2}
+    raw_m = {int(v[0]): v[1] for v in data.get("market_caps", [])
              if isinstance(v, list) and len(v) == 2}
     for p in data.get("prices", []):
         if isinstance(p, list) and len(p) == 2 and p[1] is not None:
             ts.append(int(p[0]) / 1000.0)
             prices.append(p[1])
             volumes.append(raw_v.get(int(p[0])))
-    return {"ts": ts, "prices": prices, "volumes": volumes}
+            mcaps.append(raw_m.get(int(p[0])))
+    return {"ts": ts, "prices": prices, "volumes": volumes, "mcaps": mcaps}
+
+
+def fetch_global(http: HttpClient, demo_key: str = "") -> dict:
+    """/global — доминация BTC и суммарный капитал (текущий срез, истории нет на free).
+
+    Возвращает {btc_dominance_pct, total_mcap_usd, total2_mcap_usd}. TOTAL2 = альты
+    (total − BTC). Высокая BTC.D = альты капитулировали (контекст для откупа у дна).
+    Информационный контекст, НЕ скоринговый (на free нельзя провалидировать историей).
+    """
+    data = http.get_json(f"{_BASE}/global", headers=_headers(demo_key))
+    d = (data or {}).get("data") if isinstance(data, dict) else None
+    if not isinstance(d, dict):
+        return {}
+    mcp = d.get("market_cap_percentage") or {}
+    total = (d.get("total_market_cap") or {}).get("usd")
+    btc_d = mcp.get("btc")
+    total2 = None
+    if isinstance(total, (int, float)) and isinstance(btc_d, (int, float)):
+        total2 = total * (1 - btc_d / 100.0)
+    return {"btc_dominance_pct": round(btc_d, 1) if isinstance(btc_d, (int, float)) else None,
+            "total_mcap_usd": total, "total2_mcap_usd": total2}
 
 
 def closed_daily(chart: dict) -> dict:
@@ -103,8 +128,7 @@ def closed_daily(chart: dict) -> dict:
     """
     ts = chart.get("ts") or []
     if ts and int(round(ts[-1])) % 86400 > 60:
-        return {"ts": ts[:-1], "prices": chart["prices"][:-1],
-                "volumes": chart["volumes"][:-1]}
+        return {k: v[:-1] for k, v in chart.items() if isinstance(v, list)}
     return chart
 
 

@@ -32,7 +32,15 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 10.0) -> float:
 
 
 def _sub_zone(c) -> float | None:
-    return _ZONE_SCORE.get(c.zone)          # "?"/"" -> None (нет данных)
+    base = _ZONE_SCORE.get(c.zone)          # "?"/"" -> None (нет данных)
+    if base is None:
+        return None
+    # Пружина взвешивается качеством (feature_study): контекст рынка (BTC-dd),
+    # длина базы, полоса объёма, риск обнуления. Множитель ~[0.4,1.25].
+    q = getattr(c, "spring_quality", None)
+    if c.zone == "ПРУЖИНА/ДНО" and isinstance(q, (int, float)):
+        return _clamp(base * q)
+    return base
 
 
 def _sub_valuation(c) -> float | None:
@@ -78,14 +86,17 @@ def _sub_liveness(c) -> float | None:
     return c.liveness_score          # 0–10 или None (нет detail-данных)
 
 
-# on-chain smart-money/MVRV — платно, на free всегда отсутствует (снижает confidence).
+def _sub_onchain(c) -> float | None:
+    return getattr(c, "onchain_score", None)   # 0–10 из Dune или None (не настроен)
+
+
 _SUBS = {
     "zone": _sub_zone,
     "valuation": _sub_valuation,
     "safety": _sub_safety,
     "liveness": _sub_liveness,
     "tradability": _sub_tradability,
-    "onchain": lambda c: None,
+    "onchain": _sub_onchain,
 }
 
 

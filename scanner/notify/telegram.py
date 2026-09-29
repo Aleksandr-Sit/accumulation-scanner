@@ -56,7 +56,65 @@ def send_message(token: str, chat_id: str, text: str) -> bool:
 _ZONE_EMOJI = {"ПРУЖИНА/ДНО": "🟢", "СЕРЕДИНА": "🟡", "ПИК": "🔴", "ПАДАЮЩИЙ_НОЖ": "🔻"}
 
 
-def format_alert(watchlist: list, cfg) -> str | None:
+def _market_zone_label(mdd: float) -> str:
+    """Ярлык зоны рынка по бакетам feature_study: >0.55 дно(74%), 0.30-0.55
+    средняя(40%), <0.15 хаи(22%)."""
+    if mdd >= 0.55:
+        return "рынок на дне"
+    if mdd <= 0.15:
+        return "BTC у хаёв"
+    return "средняя зона"
+
+
+def format_market_ctx(ctx: dict) -> str:
+    """Строка рыночного контекста для шапки алерта.
+
+    Новый формат (summary["market_ctx"] из market_daily): «альты −42% · BTC −33% ·
+    перегрев 0/8 (близко: …) · F&G · BTC.D». Старый (только /global + market_dd) —
+    фолбэк, если таблица рынка пуста.
+    """
+    from ..regime import context_line
+    if "alt_dd" in ctx or "hot" in ctx:
+        return context_line(ctx)
+    parts = []
+    mdd = ctx.get("market_dd")
+    if isinstance(mdd, (int, float)):
+        lbl = _market_zone_label(mdd)
+        parts.append(f"BTC −{mdd*100:.0f}% ({lbl})")
+    bd = ctx.get("btc_dominance_pct")
+    if isinstance(bd, (int, float)):
+        parts.append(f"BTC.D {bd:.0f}%")
+    t2 = ctx.get("total2_mcap_usd")
+    if isinstance(t2, (int, float)):
+        parts.append(f"альты ${t2/1e9:.0f}B")
+    return " · ".join(parts)
+
+
+def coin_line(c) -> str:
+    """Монетный контекст одной строкой (информационный): делистинг, US, P/F, эмиссия, плечо."""
+    out = []
+    dl = getattr(c, "delist", "")
+    if dl:
+        out.append({"spot": "🚫делистинг Bybit", "perp": "⚠перп снимают",
+                    "st": "⚠ST на Bybit"}.get(dl, dl))
+    us = getattr(c, "us_tag", "")
+    if us == "etf":
+        out.append("🇺🇸ETF")
+    elif us == "coinbase":
+        out.append("Coinbase")
+    pf = getattr(c, "p_f", None)
+    if isinstance(pf, (int, float)):
+        out.append(f"P/F {pf:g}")
+    g = getattr(c, "supply_growth", None)
+    if isinstance(g, (int, float)) and abs(g) >= 0.05:
+        out.append(f"{'⚠' if g >= 0.25 else ''}эмиссия {g*100:+.0f}%")
+    oi = getattr(c, "oi_mcap", None)
+    if isinstance(oi, (int, float)) and oi >= 0.2:
+        out.append(f"⚠OI {oi*100:.0f}% капы")
+    return " · ".join(out)
+
+
+def format_alert(watchlist: list, cfg, market_ctx: dict | None = None) -> str | None:
     """Формирует HTML-сообщение из топ кандидатов по фильтрам stage6_telegram."""
     t = cfg["stage6_telegram"]
     zones = set(t.get("only_zones") or [])
@@ -71,8 +129,12 @@ def format_alert(watchlist: list, cfg) -> str | None:
         return None
     picks = picks[:max_alerts]
 
-    lines = [f"<b>🛰 Accumulation scan</b> — {date.today().isoformat()}",
-             f"Кандидаты зоны дна (score ≥ {min_score}):", ""]
+    lines = [f"<b>🛰 Accumulation scan</b> — {date.today().isoformat()}"]
+    if market_ctx:
+        mc = format_market_ctx(market_ctx)
+        if mc:
+            lines.append(f"🌍 {mc}")
+    lines += [f"Кандидаты зоны дна (score ≥ {min_score}):", ""]
     for i, c in enumerate(picks, 1):
         emoji = _ZONE_EMOJI.get(c.zone, "•")
         sym = html.escape(c.symbol or c.name or "?")
@@ -90,10 +152,37 @@ def format_alert(watchlist: list, cfg) -> str | None:
             live.append("⚠LP разблок")
         if "wash_suspect" in c.flags:
             live.append("⚠объём накручен")
+        nf = getattr(c, "net_flow_usd_7d", None)
+        if isinstance(nf, (int, float)) and abs(nf) >= 1e5:
+            vol = c.volume_24h or 0
+            ratio = f" ({nf/(vol*7)*100:+.0f}% оборота)" if vol > 0 else ""
+            live.append(f"{'отток' if nf < 0 else 'приток'} бирж ${abs(nf)/1e6:.1f}M/7д{ratio}")
         lines.append(f"{i}. {emoji} <b>{sym}</b>  <b>{c.score}</b> (conf {c.confidence})")
         lines.append(f"    {' · '.join(parts)}{mr}")
         if live:
             lines.append(f"    {' · '.join(live)}")
+        coin = coin_line(c)
+        if coin:
+            lines.append(f"    {coin}")
+        # качество пружины + контекст рынка (feature_study)
+        q = getattr(c, "spring_quality", None)
+        mdd = getattr(c, "market_dd", None)
+        if q is not None or isinstance(mdd, (int, float)):
+            ctx = []
+            if q is not None:
+                ctx.append(f"качество ×{q:.2f}")
+            add = getattr(c, "alt_market_dd", None)
+            if isinstance(add, (int, float)):
+                ctx.append(f"альты −{add*100:.0f}%")
+            if isinstance(mdd, (int, float)):
+                ctx.append(f"BTC −{mdd*100:.0f}% ({_market_zone_label(mdd)})")
+            hs = getattr(c, "market_hot_score", None)
+            if isinstance(hs, (int, float)) and hs > 0:
+                ctx.append(f"🔥 перегрев {len(getattr(c, 'market_hot_lit', []) or [])} фл.")
+            fr = getattr(c, "funding_rate", None)
+            if isinstance(fr, (int, float)) and abs(fr) >= 0.0003:
+                ctx.append(f"фандинг {fr*100:+.3f}%/8h")
+            lines.append(f"    {' · '.join(ctx)}")
     lines.append("")
     lines.append("<i>Балл — приоритизация, не сигнал входа. on-chain/сентимент не учтены (free).</i>")
     return "\n".join(lines)
@@ -155,6 +244,8 @@ def format_digest(rows: list[dict], cfg) -> str | None:
         bl = p.get("base_low")
         if isinstance(bl, (int, float)) and bl > 0:
             dists.append(f"инвалидация {_dist_pct(bl * (1 - inv_pct), price)}")
+        else:
+            dists.append("⚠ без стопа (base_low не задан)")
         for i, (level, frac) in enumerate(e["ladder"]):
             if f"ladder_{i}" not in (r.get("triggered") or set()):
                 dists.append(f"фикс {frac*100:.0f}% на +{level*100:.0f}%: "
@@ -162,6 +253,11 @@ def format_digest(rows: list[dict], cfg) -> str | None:
                 break  # показываем только ближайший недостигнутый уровень
         if dists:
             lines.append(f"   {' · '.join(dists)}")
+        nf = r.get("net_flow_usd_7d")
+        if isinstance(nf, (int, float)) and abs(nf) >= 5e5:
+            arrow = "📥 приток на биржи" if nf > 0 else "📤 отток с бирж"
+            tail = " — возможно распределение" if nf > 0 else ""
+            lines.append(f"   {arrow} ${abs(nf)/1e6:.1f}M/7д{tail}")
     # суммы считаем по ВСЕМ позициям (не только показанным), включая realized
     for r in ok:
         realized = r.get("realized_usdt") or 0.0
@@ -193,6 +289,11 @@ def format_weekly(stats: dict, cfg) -> str:
                  f"уровней лестницы {stats['ladder_hits']}, трейлингов {stats['trailings']}")
     lines.append(f"📝 paper P&L: unrealized {stats['paper_pnl_usdt']:+.2f} · "
                  f"realized {stats.get('paper_realized_usdt', 0.0):+.2f} USDT")
+    ab = stats.get("ab") or {}
+    if ab.get("pairs"):
+        lines.append(f"🅰🅱 выход при перегреве: A (обычный трейл) {ab['a_usdt']:+.2f} · "
+                     f"B (сужение) {ab['b_usdt']:+.2f} USDT на {ab['pairs']} парах; "
+                     f"разошлись {ab.get('diverged', 0)}, B лучше в {ab.get('b_better', 0)}")
     if stats.get("real_open") or abs(stats.get("real_realized_usdt", 0.0)) > 1e-9:
         lines.append(f"💰 real: открыто {stats['real_open']}, unrealized "
                      f"{stats['real_pnl_usdt']:+.2f} · realized "
@@ -244,10 +345,10 @@ def format_exit_alert(rows: list[dict], cfg) -> str | None:
     return "\n".join(lines)
 
 
-def notify(watchlist: list, cfg) -> bool:
+def notify(watchlist: list, cfg, market_ctx: dict | None = None) -> bool:
     token = cfg.get("api_keys.telegram_token", "")
     chat_id = cfg.get("api_keys.telegram_chat_id", "")
-    text = format_alert(watchlist, cfg)
+    text = format_alert(watchlist, cfg, market_ctx)
     if not text:
         print("[telegram] нет кандидатов под критерии алерта")
         return False
