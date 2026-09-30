@@ -73,6 +73,84 @@ def test_filters(cfg, failures: list[str]) -> None:
     _check("итог: ровно 1 прошёл", len(passed) == 1, failures)
 
 
+def test_track_q(cfg, failures: list[str]) -> None:
+    print("Трек Q — монеты без контракта через гейт качества:")
+    import json as _json
+    import os
+    import tempfile
+    import time as _t
+    from scanner.pipeline import stage2_antirug
+    from scanner.quality import load_quality
+    qual = {"BTC": {"sym": "BTC", "mcap": 1.6e12, "fails": []},
+            "FAKE": {"sym": "FAKE", "mcap": 5e9, "fails": []}}
+    mk = lambda sym, mcap, **kw: Candidate(source="coingecko", track="A", symbol=sym,  # noqa: E731
+                                           coin_id=sym.lower(), volume_24h=1e9,
+                                           market_cap=mcap, **kw)
+    cands = [mk("BTC", 1.65e12, drawdown_from_ath_pct=33.0),
+             mk("BTC", 1.65e12),                        # тёзка/дубль — только первое вхождение
+             mk("XRP", 1.5e11),                         # без контракта и не в срезе
+             mk("FAKE", 4e7),                           # тикер совпал, капа в 125 раз меньше
+             mk("ARB", 1e9, chain="arbitrum", address="0xabc")]
+    passed, rejected = apply_filters(cands, cfg, qual)
+    q = [c for c in passed if c.track == "Q"]
+    _check("BTC без контракта из среза -> трек Q", len(q) == 1 and q[0].symbol == "BTC"
+           and "no_contract_quality_gate" in q[0].flags, failures)
+    _check("дубль тикера, XRP вне среза, тёзка по капе -> отклонены",
+           sorted(c.symbol for c in rejected) == ["BTC", "FAKE", "XRP"], failures)
+    _check("монета с контрактом — обычный Track A", any(c.symbol == "ARB" and c.track == "A"
+                                                          for c in passed), failures)
+    _check("без среза поведение прежнее (BTC отклонён)",
+           not any(c.track == "Q" for c in apply_filters([mk("BTC", 1.65e12)], cfg)[0]), failures)
+    wl, rj = stage2_antirug(cfg, None, q)               # сети нет: Q анти-раг не вызывает
+    _check("Stage 2: трек Q идёт в watchlist без запроса анти-рага", len(wl) == 1 and not rj,
+           failures)
+    wl[0].zone, wl[0].rf_venue = "ПРУЖИНА/ДНО", "Bybit spot"
+    s, conf, brk = compute_score(wl[0], cfg)
+    _check("скор Q считается (safety 10 — гейт вместо контракта)",
+           brk["safety"]["sub"] == 10.0 and s > 0, failures)
+
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+    day = _t.strftime("%Y-%m-%d", _t.localtime())
+    _json.dump({"date": day, "rows": [{"sym": "BTC", "mcap": 1, "fails": []},
+                                      {"sym": "DOGE", "mcap": 1, "fails": ["мем"]}]}, tmp)
+    tmp.close()
+    fresh = load_quality(tmp.name, 30)
+    stale = load_quality(tmp.name, 30, now=_t.time() + 60 * 86400)
+    os.unlink(tmp.name)
+    _check("срез: берутся только прошедшие (BTC, не DOGE)",
+           fresh["ok"] and list(fresh["by_sym"]) == ["BTC"], failures)
+    _check("срез старше max_age_days -> пусто + подсказка обновить",
+           not stale["ok"] and not stale["by_sym"] and "обнови" in stale["note"], failures)
+    _check("нет файла -> пусто, без падения", not load_quality("nope/none.json")["ok"], failures)
+
+    # Авто-paper: близнец S (стоп −50%) — только монетам фильтра качества.
+    from scanner.pipeline import _open_paper_positions
+    spring = lambda sym, mcap, track="A": Candidate(  # noqa: E731
+        source="t", track=track, symbol=sym, coin_id=sym.lower(), price_usd=2.0,
+        market_cap=mcap, zone="ПРУЖИНА/ДНО", score=80.0, confidence=0.9)
+    wl = [spring("BTC", 1.6e12, "Q"), spring("LINK", 9e9), spring("JUNK", 5e8),
+          spring("FAKE", 4e7)]                              # FAKE: тикер в срезе, капа нет
+    tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp_db.close()
+    saved = cfg["output"]["db_path"]
+    cfg["output"]["db_path"] = tmp_db.name
+    try:
+        n = _open_paper_positions(cfg, wl, {**qual, "LINK": {"sym": "LINK", "mcap": 1e10}})
+        ps = PositionStore(tmp_db.name)
+        rows = ps.all_positions()
+        ps.close_db()
+    finally:
+        cfg["output"]["db_path"] = saved
+        os.unlink(tmp_db.name)
+    by = {}
+    for r in rows:
+        by.setdefault(r["variant"], []).append(r["symbol"])
+    _check("paper: 4 позиции A и 4 близнеца B", n == 4 and len(by.get("A", [])) == 4
+           and len(by.get("B", [])) == 4, failures)
+    _check("paper: близнецы S — только BTC (трек Q) и LINK (срез + капа)",
+           sorted(by.get("S", [])) == ["BTC", "LINK"], failures)
+
+
 def test_antirug_evm(cfg, failures: list[str]) -> None:
     print("Stage 2 — анти-раг (EVM):")
 
@@ -633,6 +711,22 @@ def test_exit(cfg, failures: list[str]) -> None:
     _check("B на холодном рынке ведёт себя как A",
            not any(s["type"] == "trailing" for s in tbc), failures)
 
+    # 6) Близнец S (A/B ширины стопа): пол −50% (0.45) вместо −25% (0.675).
+    pos_s = {**pos, "variant": "S"}
+    mid = [0.62, 0.58]                 # ниже 0.675, выше 0.45
+    deep = [0.44, 0.40]                # ниже обоих полов
+    _check("S: 2 закрытия ниже −25%, но выше −50% — A выходит, S держит",
+           any(s["type"] == "invalidation" for s in
+               exit_stage.evaluate_exit(pos, 0.58, 1.0, None, set(), cfg, recent_closes=mid))
+           and not exit_stage.evaluate_exit(pos_s, 0.58, 1.0, None, set(), cfg, recent_closes=mid),
+           failures)
+    ds = exit_stage.evaluate_exit(pos_s, 0.40, 1.0, None, set(), cfg, recent_closes=deep)
+    _check("S: ниже −50% -> инвалидация с буфером −50% в заметке",
+           len(ds) == 1 and ds[0]["type"] == "invalidation" and "−50%" in ds[0]["note"], failures)
+    _check("S: лестница как у A (+110% -> ladder_0)",
+           any(s["type"] == "ladder_0" for s in
+               exit_stage.evaluate_exit(pos_s, 2.1, 2.1, None, set(), cfg)), failures)
+
     # P&L net-of-fees.
     pnl = exit_stage.position_pnl({"entry_price": 1.0, "qty": 1000.0}, 2.0)
     _check("P&L ~ +99.7% (комиссии учтены)", 99.0 < pnl["pnl_pct"] < 100.0, failures)
@@ -670,7 +764,35 @@ def test_positions_store(cfg, failures: list[str]) -> None:
     _check("ab_pairs: пара A↔B", len(prs) == 1 and prs[0][0]["id"] == pa and prs[0][1]["id"] == pb,
            failures)
     _check("find_open по тикеру -> A раньше B", ps.find_open("TWN")["id"] == pa, failures)
+    psn = ps.add("TWN", 1.0, 100, coin_id="twn", paper=True, variant="S", twin_of=pa)
+    _check("близнец S: не в лимите paper, своя пара в ab_pairs('S')",
+           ps.count_open_paper() == 1 and [(a["id"], b["id"]) for a, b in ps.ab_pairs("S")]
+           == [(pa, psn)] and len(ps.ab_pairs()) == 1, failures)
     ps.close(pa, 1.0); ps.close(pb, 1.0)
+    _check("открытый S не блокирует переоткрытие A (has_open_for только по A)",
+           not ps.has_open_for("twn", "TWN"), failures)
+    ps.close(psn, 1.0)
+
+    # pos add --merge: ступени одной монеты -> одна позиция со средней ценой.
+    mp = ps.add("MRG", 0.8, 50, coin_id="mrg", paper=True)       # paper не сливается
+    pm = ps.add("MRG", 1.0, 100, coin_id="mrg", base_low=0.9)
+    _check("merge: находит реальную, а не paper", ps.find_open_real("MRG")["id"] == pm, failures)
+    m = ps.merge(pm, 0.8, 150)
+    _check("merge: qty 250, средняя (100+120)/250 = 0.88, base_low не меняется",
+           abs(m["qty"] - 250) < 1e-9 and abs(m["entry_price"] - 0.88) < 1e-12
+           and m["base_low"] == 0.9 and abs(m["initial_qty"] - 250) < 1e-9, failures)
+    _check("merge: событие в журнале", "merge" in ps.event_types(pm), failures)
+    sig_avg = exit_stage.evaluate_exit(m, 1.32, 1.32, None, set(), cfg)      # +50% от 0.88
+    sig_first = exit_stage.evaluate_exit({**m, "entry_price": 1.0}, 1.32, 1.32, None, set(), cfg)
+    _check("merge: +50% считается от средней (1.32 = +50% от 0.88, но +32% от 1-й ступени)",
+           any(s["type"] == "ladder_0" for s in sig_avg)
+           and not any(s["type"] == "ladder_0" for s in sig_first), failures)
+    r = ps.close(pm, 1.2)
+    legs = 250 * 1.2 * (1 - 0.0015) - (100 * 1.0 + 150 * 0.8) * (1 + 0.0015)
+    _check("merge: realized = сумма ступеней по отдельности (комиссии не задвоены)",
+           abs(r - legs) < 1e-9, failures)
+    _check("merge в закрытую позицию -> None", ps.merge(pm, 1.0, 10) is None, failures)
+    ps.close(mp, 0.8)
 
     # Cooldown re-open: закрытая paper-монета не переоткрывается N дней.
     cp = ps.add("CD", 1.0, 100, coin_id="cd-coin", paper=True)
@@ -765,6 +887,16 @@ def test_exit_alert_format(cfg, failures: list[str]) -> None:
                                 "diverged": 1, "b_better": 1}}, cfg)
     _check("A/B: строка сравнения A vs B", "🅰🅱" in wab and "+40.00" in wab
            and "+55.50" in wab and "3 парах" in wab, failures)
+    _check("нет пар S -> строки ширины стопа нет", "🅰🆂" not in wab, failures)
+    was = format_weekly({"week_no": 3, "milestone": False, "milestone_weeks": 4,
+                         "opened": 0, "open_now": 2, "invalidations": 1, "ladder_hits": 0,
+                         "trailings": 0, "paper_pnl_usdt": 0.0, "real_open": 0,
+                         "stop_pct": 25, "ab_stop_pct": 50,
+                         "ab_stop": {"pairs": 2, "a_usdt": -26.0, "b_usdt": 4.5, "diverged": 1,
+                                     "b_better": 1, "a_stopped": 1, "b_stopped": 0}}, cfg)
+    _check("A/S: строка ширины стопа (−25% vs −50%, срабатывания)",
+           "🅰🆂" in was and "A −25% -26.00" in was and "S −50% +4.50" in was
+           and "стоп сработал A 1 / S 0" in was, failures)
 
     # Итоговая 4-недельная: кумулятив + call-to-decide про капитал.
     ms = format_weekly({"week_no": 4, "milestone": True, "milestone_weeks": 4,
@@ -778,11 +910,51 @@ def test_exit_alert_format(cfg, failures: list[str]) -> None:
     _check("итоговая: call-to-decide про капитал", "capital_usdt" in ms, failures)
 
 
+def test_ladder(cfg, failures: list[str]) -> None:
+    print("Планировщик лестницы (run.py ladder):")
+    from scanner.ladder import plan_ladder, round_step
+    _check("round_step: 0.1+0.2 → 0.3 по шагу 0.1", round_step(0.1 + 0.2, 0.1) == 0.3, failures)
+    _check("round_step вверх: 1.23401 → 1.235", round_step(1.23401, 0.001, up=True) == 1.235,
+           failures)
+    # пример из отчёта: цена 1.00, лоу базы 0.95 -> стоп 0.7125, ступени 1/0.916/0.832/0.748
+    p = plan_ladder(1.0, 0.95, 100, tick=0.0001, qty_step=0.01)
+    pxs = [b["price"] for b in p["buys"]]
+    _check("4 ступени до пола: 1.000/0.916/0.832/0.748",
+           p["ok"] and [round(x, 3) for x in pxs] == [1.0, 0.916, 0.832, 0.748], failures)
+    _check("стоп = лоу базы −25% (0.7125)", abs(p["stop_px"] - 0.7125) < 1e-9, failures)
+    _check("убыток на стопе ≈ 17.5% (+комиссии) против ≈ 29% разом",
+           0.17 < p["worst"]["stop_loss_pct"] < 0.19
+           and 0.28 < p["worst"]["lump_stop_loss_pct"] < 0.30, failures)
+    _check("лимитки кратны шагу цены, ступени ≥ $10",
+           all(abs(round(b["price"] / 0.0001) * 0.0001 - b["price"]) < 1e-12 for b in p["buys"])
+           and all(b["usd"] >= 10 - 1e-9 for b in p["buys"]), failures)
+    _check("prod: +50% и +150% от средней, остаток под трейл",
+           [s["gain"] for s in p["sells"]] == [0.5, 1.5, None], failures)
+    p = plan_ladder(1.0, 0.95, 30, qty_step=0.01)
+    _check("$30 при минимуме $10 → 3 ступени с предупреждением",
+           p["steps"] == 3 and any("ступеней 3" in w for w in p["warns"]), failures)
+    p = plan_ladder(1.0, 0.95, 20, steps=2, qty_step=0.01, filled=1)
+    _check("продажа < $5 сливается со следующей целью",
+           any("слита" in w for w in p["warns"]) and p["sells"][0]["gain"] == 1.5, failures)
+    p = plan_ladder(1.0, 0.95, 50, sell="paired", qty_step=0.001, tick=0.0001)
+    _check("парная: каждая ступень продаётся на ≥ +40% от своей цены",
+           len(p["sells"]) == 4 and all(s["gain"] >= 0.40 - 1e-9 for s in p["sells"]), failures)
+    _check("цена ниже стопа → план не строится",
+           not plan_ladder(0.70, 0.95, 50)["ok"], failures)
+    _check("бюджет меньше минимума → план не строится",
+           not plan_ladder(1.0, 0.95, 8)["ok"], failures)
+    p = plan_ladder(1.30, 0.95, 50)
+    _check("цена далеко над базой → предупреждение «не вход у дна»",
+           any("не вход у дна" in w for w in p["warns"]), failures)
+
+
 def main() -> int:
     cfg = load_config()
     failures: list[str] = []
     print("=== SELFTEST (офлайн, без сети) ===\n")
     test_filters(cfg, failures)
+    print()
+    test_track_q(cfg, failures)
     print()
     test_antirug_evm(cfg, failures)
     print()
@@ -817,6 +989,8 @@ def main() -> int:
     test_positions_store(cfg, failures)
     print()
     test_exit_alert_format(cfg, failures)
+    print()
+    test_ladder(cfg, failures)
     print()
     if failures:
         print(f"РЕЗУЛЬТАТ: {_FAIL} — провалено {len(failures)}: {failures}")

@@ -41,3 +41,35 @@ def fetch_daily_closes(http: HttpClient, symbol: str = "BTCUSDT",
         except (ValueError, IndexError, TypeError):
             continue
     return out
+
+
+def fetch_instrument(http: HttpClient, symbol: str) -> dict | None:
+    """Правила спот-пары: tickSize, basePrecision, minOrderQty/minOrderAmt, stTag, status."""
+    data = http.get_json(f"{_BASE}/v5/market/instruments-info",
+                         params={"category": "spot", "symbol": symbol}, use_cache=False)
+    rows = (data or {}).get("result", {}).get("list", []) if isinstance(data, dict) else []
+    if not rows:
+        return None
+    it = rows[0]
+    lot, pf = it.get("lotSizeFilter") or {}, it.get("priceFilter") or {}
+
+    def _f(v, default=0.0):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+    return {"symbol": it.get("symbol"), "status": it.get("status"),
+            "st": it.get("stTag") == "1", "tick": _f(pf.get("tickSize")),
+            "qty_step": _f(lot.get("basePrecision")), "min_qty": _f(lot.get("minOrderQty")),
+            "min_amt": _f(lot.get("minOrderAmt"), 5.0)}
+
+
+def fetch_last_price(http: HttpClient, symbol: str) -> float | None:
+    """Последняя цена спот-пары (без кэша)."""
+    data = http.get_json(f"{_BASE}/v5/market/tickers",
+                         params={"category": "spot", "symbol": symbol}, use_cache=False)
+    rows = (data or {}).get("result", {}).get("list", []) if isinstance(data, dict) else []
+    try:
+        return float(rows[0]["lastPrice"]) if rows else None
+    except (KeyError, TypeError, ValueError):
+        return None

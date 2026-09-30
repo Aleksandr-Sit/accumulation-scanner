@@ -16,6 +16,8 @@
   5. ПЕРЕГРЕВ РЫНКА (информационный): индекс перегрева альт-рынка ≥ market_hot_alert.
      Опционально сужает трейлинг (market_hot_tighten или paper-близнец variant=B):
      market_regime_study — медиана лучше, но режет хвост маний, поэтому A/B на paper.
+  Близнец variant=S (paper, монеты фильтра качества) — инвалидация шире (−50% вместо
+  −25%, ladder_dca_study: главный рычаг — ширина стопа); остальное как у A.
 
 Сигнал — алерт для ручного решения, НЕ ордер. Идемпотентность — по журналу
 position_events (типы уже сработавших событий передаются в triggered).
@@ -53,8 +55,12 @@ def evaluate_exit(position: dict, last_price: float, hwm: float,
     # 1) Инвалидация тезиса — важнее всего, дальше можно не смотреть.
     #    Подтверждение N закрытий подряд ниже пола отсекает однодневный shakeout
     #    (59-70% пружин прокалывают базу перед разворотом — калибровка 16.07.2026).
+    #    Близнец S (A/B ширины стопа на paper) — пол ниже: stage7_positions.paper_ab_stop_pct.
+    inv_pct = e["invalidation_below_base_low_pct"]
+    if position.get("variant") == "S":
+        inv_pct = cfg.get("stage7_positions.paper_ab_stop_pct", inv_pct)
     if isinstance(base_low, (int, float)) and base_low > 0:
-        floor = base_low * (1 - e["invalidation_below_base_low_pct"] / 100.0)
+        floor = base_low * (1 - inv_pct / 100.0)
         confirm = int(e.get("invalidation_confirm_days", 1))
         if recent_closes and len(recent_closes) >= confirm and confirm >= 1:
             tail = recent_closes[-confirm:]
@@ -67,7 +73,7 @@ def evaluate_exit(position: dict, last_price: float, hwm: float,
                 "type": "invalidation", "urgency": "high",
                 "action": "ВЫЙТИ ПОЛНОСТЬЮ",
                 "note": (f"цена {last_price:.6g} пробила лоу базы {base_low:.6g} "
-                         f"(−{e['invalidation_below_base_low_pct']}% буфер{conf_note}) — тезис «дно» сломан"),
+                         f"(−{inv_pct:g}% буфер{conf_note}) — тезис «дно» сломан"),
             })
             return signals  # инвалидация исключает остальные сигналы
 

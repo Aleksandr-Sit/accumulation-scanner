@@ -141,7 +141,8 @@ def format_alert(watchlist: list, cfg, market_ctx: dict | None = None) -> str | 
         val = next((f for f in c.flags if "valued" in f), c.category or "")
         dd = f"DD {c.drawdown_from_ath_pct:.0f}%" if c.drawdown_from_ath_pct else ""
         mr = " ⚠️проверить" if c.manual_review else ""
-        parts = [p for p in (c.zone, c.rf_venue, dd, val) if p]
+        q = "без контракта · гейт качества" if c.track == "Q" else ""
+        parts = [p for p in (c.zone, c.rf_venue, dd, val, q) if p]
         # живость: dev-активность + LP + флаги риска
         live = []
         if c.liveness_score is not None:
@@ -294,6 +295,14 @@ def format_weekly(stats: dict, cfg) -> str:
         lines.append(f"🅰🅱 выход при перегреве: A (обычный трейл) {ab['a_usdt']:+.2f} · "
                      f"B (сужение) {ab['b_usdt']:+.2f} USDT на {ab['pairs']} парах; "
                      f"разошлись {ab.get('diverged', 0)}, B лучше в {ab.get('b_better', 0)}")
+    abs_ = stats.get("ab_stop") or {}
+    if abs_.get("pairs"):
+        lines.append(f"🅰🆂 ширина стопа (монеты фильтра качества): "
+                     f"A −{stats.get('stop_pct', 25):g}% {abs_['a_usdt']:+.2f} · "
+                     f"S −{stats.get('ab_stop_pct', 50):g}% {abs_['b_usdt']:+.2f} USDT "
+                     f"на {abs_['pairs']} парах; стоп сработал A {abs_.get('a_stopped', 0)} / "
+                     f"S {abs_.get('b_stopped', 0)}, S лучше в {abs_.get('b_better', 0)} из "
+                     f"{abs_.get('diverged', 0)} разошедшихся")
     if stats.get("real_open") or abs(stats.get("real_realized_usdt", 0.0)) > 1e-9:
         lines.append(f"💰 real: открыто {stats['real_open']}, unrealized "
                      f"{stats['real_pnl_usdt']:+.2f} · realized "

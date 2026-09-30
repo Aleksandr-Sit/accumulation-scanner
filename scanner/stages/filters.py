@@ -30,7 +30,16 @@ def _is_wrapped_lst(c: Candidate) -> bool:
     return any(s in name for s in _WRAP_LST_NAME)
 
 
-def apply_filters(candidates: list[Candidate], cfg: Config) -> tuple[list[Candidate], list[Candidate]]:
+def apply_filters(candidates: list[Candidate], cfg: Config,
+                  quality: dict[str, dict] | None = None) -> tuple[list[Candidate], list[Candidate]]:
+    """quality — {SYM: строка среза quality_screen} (прошедшие гейт). Монета Track A без
+    контракта, найденная там (тикер + капа сходится), идёт в трек Q: анти-раг ей не
+    нужен и невозможен, вместо него — гейт качества. Первое вхождение тикера (ингест
+    CoinGecko отсортирован по капе) — остальные тёзки отсекаются как раньше."""
+    from ..quality import mcap_matches
+    quality = quality or {}
+    q_ratio = cfg.get("track_q.max_mcap_ratio", 3.0)
+    q_seen: set[str] = set()
     f = cfg["stage1_filters"]
     min_vol = f["min_volume_24h_usd"]
     min_liq = f["min_liquidity_usd"]
@@ -70,10 +79,17 @@ def apply_filters(candidates: list[Candidate], cfg: Config) -> tuple[list[Candid
             c.reject(f"age>{max_age}d (not fresh)")
             rejected.append(c); continue
 
-        # Анти-раг требует контракт+сеть. Без адреса кандидат непроверяем на легитимность.
+        # Анти-раг требует контракт+сеть. Без адреса кандидат непроверяем на легитимность —
+        # кроме трека Q: нативные монеты L1, прошедшие гейт качества.
         if not c.address or not c.chain:
-            c.reject("no contract/chain (anti-rug impossible)")
-            rejected.append(c); continue
+            row = quality.get(c.symbol) if c.track == "A" else None
+            if row and c.symbol not in q_seen and mcap_matches(c.market_cap, row, q_ratio):
+                q_seen.add(c.symbol)
+                c.track = "Q"
+                c.flags.append("no_contract_quality_gate")
+            else:
+                c.reject("no contract/chain (anti-rug impossible)")
+                rejected.append(c); continue
 
         # Предфильтр «пружины»: сильная просадка от ATH (Track A).
         if c.drawdown_from_ath_pct is not None and c.drawdown_from_ath_pct >= spring_dd:

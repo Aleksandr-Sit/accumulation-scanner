@@ -3,9 +3,11 @@
 
   python run.py scan --track all            # полный прогон воронки (сеть)
   python run.py pos add ARB --price 0.5 --qty 1000    # записать покупку
+  python run.py pos add ARB --price 0.45 --qty 500 --merge   # ступень -> средняя цена
   python run.py pos list                    # открытые позиции
   python run.py pos close ARB --price 1.2   # закрыть (P&L в журнал)
   python run.py watch [--notify]            # ре-скан позиций -> exit-сигналы
+  python run.py ladder LINK --budget 50      # план лестницы под Bybit spot (без ордеров)
   python run.py market [--backfill]         # история рынка альтов + индекс перегрева
   python run.py selftest                    # офлайн-проверка логики на фикстурах
 """
@@ -147,13 +149,41 @@ def cmd_pos(args) -> int:
     if args.action == "add":
         if args.price is None or args.qty is None:
             print("Нужны --price и --qty"); return 1
+        prices_map = {s["position_id"]: s["price"]
+                      for s in pstore.last_snapshots().values()}
+        cur = pstore.find_open_real(args.symbol) if args.merge else None
+        if cur:
+            # Ступень лестницы в существующую позицию: одна позиция со средней ценой.
+            others = [p for p in pstore.open_positions() if p["id"] != cur["id"]]
+            held = prices_map.get(cur["id"], cur["entry_price"]) * cur["qty"]
+            for w in risk_check(others, held + args.price * args.qty, cfg, prices_map):
+                print(f"⚠ РИСК: {w}")
+            if args.base_low is not None and cur["base_low"] and \
+                    abs(args.base_low - cur["base_low"]) > 1e-12:
+                print(f"⚠ --base-low {args.base_low:g} проигнорирован: у позиции остаётся "
+                      f"{cur['base_low']:.6g} (стоп считается от базы первой ступени)")
+            if pstore.event_types(cur["id"]) & {"ladder_0", "ladder_1", "trailing"}:
+                print("⚠ по позиции уже были сигналы лестницы/трейла — они не переармируются "
+                      "от новой средней")
+            m = pstore.merge(cur["id"], args.price, args.qty)
+            fee = 0.0015                       # как в position_pnl / sell
+            bl = f"{m['base_low']:.6g}" if m["base_low"] else "—"
+            print(f"Позиция #{m['id']} {m['symbol']}: +{args.qty:g} @ {args.price:g} → "
+                  f"qty={m['qty']:g}, средняя {m['entry_price']:.6g} "
+                  f"(с комиссией {m['entry_price'] * (1 + fee):.6g}), base_low={bl}")
+            e = cfg["stage8_exit"]
+            tgt = " / ".join(f"+{g * 100:.0f}% ≈ {m['entry_price'] * (1 + g):.6g}"
+                             for g, _ in e["ladder"])
+            print(f"  цели watch от средней: {tgt}; трейл после "
+                  f"+{e['trailing_arm_after_gain_pct']}%")
+            pstore.close_db(); return 0
+        if args.merge:
+            print(f"Открытой реальной позиции {args.symbol.upper()} нет — открываю новую")
         info = _lookup_coin(cfg, args.symbol)
         coin_id = args.coin_id or info.get("coin_id", "")
         if not coin_id:
             print(f"⚠ coin_id для {args.symbol} не найден в watchlist/БД — "
                   f"watch не сможет достать цену. Задай: --coin-id <id CoinGecko>")
-        prices_map = {s["position_id"]: s["price"]
-                      for s in pstore.last_snapshots().values()}
         warns = risk_check(pstore.open_positions(), args.price * args.qty, cfg, prices_map)
         for w in warns:
             print(f"⚠ РИСК: {w}")
@@ -185,7 +215,8 @@ def cmd_pos(args) -> int:
             import time as _t
             days = int((_t.time() - p["entry_ts"]) / 86400)
             bl = f"{p['base_low']:.6g}" if p["base_low"] else "—"
-            tag = ("📝paper" + ("·B" if p.get("variant") == "B" else "  ")
+            v = p.get("variant") or "A"
+            tag = ("📝paper" + (f"·{v}" if v != "A" else "  ")
                    if p.get("is_paper") else "💰real   ")
             rz = p.get("realized_usdt") or 0.0
             rzs = f" realized={rz:+.2f}" if abs(rz) > 1e-9 else ""
@@ -223,6 +254,130 @@ def cmd_pos(args) -> int:
     return 1
 
 
+def _quality_note(sym: str) -> str:
+    """Строка о монете из последнего среза backtest/quality_screen.py (если он есть)."""
+    import json as _json
+    from pathlib import Path
+    p = Path(__file__).resolve().parent / "backtest" / "quality_screen_results.json"
+    if not p.exists():
+        return "фильтр качества: среза нет (py -3 -u backtest/quality_screen.py)"
+    try:
+        d = _json.loads(p.read_text(encoding="utf-8"))
+    except ValueError:
+        return "фильтр качества: файл среза повреждён"
+    row = next((r for r in d.get("rows", []) if r.get("sym") == sym), None)
+    day = d.get("date", "?")
+    if row is None:
+        return f"фильтр качества ({day}): нет в топ-500 — вне проверенной зоны"
+    if not row["fails"]:
+        return f"фильтр качества ({day}): ✅ прошла"
+    return f"фильтр качества ({day}): ⚠ отсеяна — " + "; ".join(row["fails"])
+
+
+def cmd_ladder(args) -> int:
+    """План лестницы покупок/продаж под Bybit spot. Ничего не выставляет — только считает."""
+    import os
+    cfg = load_config(args.config)
+    from scanner.ladder import fmt_step, plan_ladder
+    from scanner.pipeline import _make_http
+    from scanner.sources import bybit
+    from scanner.stages.exit import compute_base_low
+
+    base = args.symbol.upper().removesuffix("USDT")
+    pair = f"{base}USDT"
+    http = _make_http(cfg)
+    inst = bybit.fetch_instrument(http, pair)
+    if not inst:
+        print(f"{pair} нет на Bybit spot (или API недоступен) — план не строю")
+        return 1
+    price = args.price or bybit.fetch_last_price(http, pair)
+    base_low = args.base_low
+    if base_low is None:
+        closes = bybit.fetch_daily_closes(http, pair, 40)[:-1]     # без живой свечи
+        base_low = compute_base_low(closes, 30)
+    if not price or not base_low:
+        print("Нет цены или истории закрытий — задай --price и --base-low вручную")
+        return 1
+    e = cfg["stage8_exit"]
+    floor_pct = e["invalidation_below_base_low_pct"]
+    plan = plan_ladder(price, base_low, args.budget, steps=args.steps, min_order=args.min_order,
+                       tick=inst["tick"], qty_step=inst["qty_step"],
+                       exch_min_amt=inst["min_amt"], exch_min_qty=inst["min_qty"],
+                       floor_pct=floor_pct, stop_pct=args.stop_pct, sell=args.sell,
+                       prod_levels=e["ladder"], filled=args.filled,
+                       worst_case_pct=cfg.get("stage7_positions.worst_case_loss_pct", 60))
+    if not plan["ok"]:
+        print(f"⚠ {plan['error']}")
+        return 1
+    tick, qs = inst["tick"], inst["qty_step"]
+    P = lambda x: fmt_step(x, tick)  # noqa: E731
+    Q = lambda x: fmt_step(x, qs)  # noqa: E731
+
+    print(f"=== ЛЕСТНИЦА {pair} (Bybit spot) — расчёт, не рекомендация ===")
+    if inst["st"] or inst["status"] != "Trading":
+        print(f"⚠ Bybit: метка ST (риск делистинга) или статус {inst['status']}")
+    print(f"  {_quality_note(base)}")
+    print(f"  цена {P(price)} · лоу базы 30д {P(base_low)} · шаг цены {tick:g} · "
+          f"шаг кол-ва {qs:g} · мин. ордер биржи ${inst['min_amt']:g}, ваш ${args.min_order:g}")
+    confirm = e.get("invalidation_confirm_days", 1)
+    print(f"  стоп: {confirm} закрытия ниже {P(plan['stop_px'])} "
+          f"(лоу базы −{plan['stop_pct']:g}%, {plan['stop_px'] / price - 1:+.1%} от цены)"
+          + ("" if args.stop_pct is None else f"; ступени — до пола прод-стопа −{floor_pct:g}%"))
+
+    print(f"\nПокупка — бюджет ${args.budget:g}, ступеней {plan['steps']}:")
+    print(f"  {'#':>2} {'тип':6} {'цена':>12} {'кол-во':>12} {'$':>8} {'от цены':>8}")
+    for b in plan["buys"]:
+        px = f"~{P(b['price'])}" if b["type"] == "рынок" else P(b["price"])
+        print(f"  {b['n']:>2} {b['type']:6} {px:>12} {Q(b['qty']):>12} {b['usd']:>8.2f} "
+              f"{b['from_price']:>+8.1%}")
+    w = plan["worst"]
+    print("  ступень 1 — рыночный ордер на сумму в USDT, остальные — лимитки GTC")
+    print(f"\nХудший случай (все ступени, выход по стопу): −${w['stop_loss_usd']:.2f} "
+          f"({-w['stop_loss_pct']:.1%} вложенного; разом было бы {-w['lump_stop_loss_pct']:.1%})")
+    print(f"  гэп/делистинг — стоп не гарантирован: risk_check закладывает "
+          f"−${w['gap_loss_usd']:.2f} ({cfg.get('stage7_positions.worst_case_loss_pct', 60)}%)")
+
+    k = plan["filled"]
+    what = "все ступени" if k == len(plan["buys"]) else f"первые {k} ступ."
+    print(f"\nПродажа ({args.sell}) — если исполнены {what}: вложено "
+          f"${sum(b['usd'] for b in plan['buys'][:k]):.2f}, средняя {P(plan['avg'])}, "
+          f"кол-во {Q(plan['qty'])}:")
+    for s in plan["sells"]:
+        if s["price"] is None:
+            print(f"  {s['label']:18} {Q(s['qty']):>12}  трейл {e['trailing_from_hwm_pct']}% "
+                  f"от максимума после +{e['trailing_arm_after_gain_pct']}% — ведёт `watch`")
+        else:
+            print(f"  {s['label']:18} {Q(s['qty']):>12}  по {P(s['price']):>12}  ≈ ${s['usd']:.2f}")
+    if args.sell != "paired":
+        print("  после частичного исполнения пересчитай цели: --filled N")
+
+    for msg in plan["warns"]:
+        print(f"⚠ {msg}")
+
+    # бюджет риска проекта (как в pos add): лимит позиции и worst-case просадка портфеля
+    from scanner.positions import PositionStore, risk_check
+    cap = args.capital if args.capital is not None else cfg.get("stage7_positions.capital_usdt", 0)
+    if cap:
+        cfg["stage7_positions"]["capital_usdt"] = cap
+        opens = []
+        if os.path.exists(cfg["output"]["db_path"]):
+            ps = PositionStore(cfg["output"]["db_path"])
+            opens = ps.open_positions()
+            ps.close_db()
+        warns = risk_check(opens, plan["spent"], cfg)
+        print(f"\nБюджет риска (капитал ${cap:g}): " + ("в лимитах ✅" if not warns else "превышен"))
+        for msg in warns:
+            print(f"  ⚠ {msg}")
+    else:
+        print("\nБюджет риска не проверен: задай --capital (или stage7_positions.capital_usdt)")
+
+    print(f"\nПосле каждой исполненной ступени (первая откроет позицию, следующие усреднят её):"
+          f"\n  py -3 run.py pos add {base} --price <факт> --qty <факт> "
+          f"--base-low {P(base_low)} --merge")
+    print("  цели продажи и трейл `watch` считает от средней всей позиции")
+    return 0
+
+
 def cmd_watch(args) -> int:
     cfg = load_config(args.config)
     out = run_watch(cfg)
@@ -242,8 +397,8 @@ def cmd_watch(args) -> int:
             continue
         pnl = r["pnl"]
         tag = "📝" if p.get("is_paper") else "💰"
-        if p.get("variant") == "B":
-            tag += "B"
+        if (p.get("variant") or "A") != "A":
+            tag += p["variant"]
         rz = r.get("realized_usdt") or 0.0
         rzs = f", realized {rz:+.2f}" if abs(rz) > 1e-9 else ""
         print(f"  {tag} {p['symbol']:<8} {pnl['pnl_pct']:+7.1f}%  "
@@ -259,9 +414,9 @@ def cmd_watch(args) -> int:
         from scanner.notify import telegram
         token = cfg.get("api_keys.telegram_token", "")
         chat = cfg.get("api_keys.telegram_chat_id", "")
-        # Близнецы B (A/B выхода) — тихий эксперимент: в алерты и дайджест не идут,
-        # итог сравнения — в недельном report.
-        rows = [r for r in rows if r["position"].get("variant") != "B"]
+        # Близнецы B/S (A/B выхода и стопа) — тихий эксперимент: в алерты и дайджест
+        # не идут, итог сравнения — в недельном report.
+        rows = [r for r in rows if (r["position"].get("variant") or "A") == "A"]
         text = telegram.format_exit_alert(rows, cfg)
         if text:
             ok = telegram.send_message(token, chat, text)
@@ -286,9 +441,12 @@ def cmd_report(args) -> int:
 
     now = _t.time()
     week_ago = now - 7 * 86400
-    # Близнецы B (A/B выхода) не входят в основные счётчики — только в блок сравнения.
-    events = [e for e in pstore.events_since(week_ago) if e.get("variant") != "B"]
-    opens = [p for p in pstore.open_positions() if p.get("variant") != "B"]
+    # Близнецы B/S (A/B выхода и стопа) не входят в основные счётчики — только в блоки
+    # сравнения.
+    def _main(x):
+        return (x.get("variant") or "A") == "A"
+    events = [e for e in pstore.events_since(week_ago) if _main(e)]
+    opens = [p for p in pstore.open_positions() if _main(p)]
     snaps = pstore.last_snapshots()
 
     def _pnl(pos_list):
@@ -303,7 +461,7 @@ def cmd_report(args) -> int:
     real_open = [p for p in opens if not p.get("is_paper")]
 
     # Realized по закрытым paper-позициям (paper-executor фиксирует по сигналам).
-    all_pos = [p for p in pstore.all_positions() if p.get("variant") != "B"]
+    all_pos = [p for p in pstore.all_positions() if _main(p)]
     paper_realized = round(sum(p.get("realized_usdt") or 0.0
                                for p in all_pos if p.get("is_paper")), 2)
     real_realized = round(sum(p.get("realized_usdt") or 0.0
@@ -316,7 +474,7 @@ def cmd_report(args) -> int:
     week_no = int((now - first_ts) // (7 * 86400)) + 1 if first_ts else 0
     milestone = (week_no >= args.milestone_weeks
                  and not pstore.system_flag("milestone_4w"))
-    all_events = ([e for e in pstore.events_since(0) if e.get("variant") != "B"]
+    all_events = ([e for e in pstore.events_since(0) if _main(e)]
                   if milestone else events)
 
     # A/B выхода: полный P&L пар A↔B net-of-fees (realized + unrealized по последнему
@@ -328,13 +486,22 @@ def cmd_report(args) -> int:
         unreal = (position_pnl(p, s["price"])["pnl_usdt"]
                   if s and p["status"] == "open" and p["qty"] > 0 else 0.0)
         return (p.get("realized_usdt") or 0.0) + unreal
-    pairs = pstore.ab_pairs()
-    diffs = [_total(b) - _total(a) for a, b in pairs]
-    ab = {"pairs": len(pairs),
-          "a_usdt": round(sum(_total(a) for a, _ in pairs), 2),
-          "b_usdt": round(sum(_total(b) for _, b in pairs), 2),
-          "diverged": sum(1 for d in diffs if abs(d) > 0.01),
-          "b_better": sum(1 for d in diffs if d > 0.01)}
+    def _ab(variant):
+        pairs = pstore.ab_pairs(variant)
+        diffs = [_total(b) - _total(a) for a, b in pairs]
+        return {"pairs": len(pairs),
+                "a_usdt": round(sum(_total(a) for a, _ in pairs), 2),
+                "b_usdt": round(sum(_total(b) for _, b in pairs), 2),
+                "diverged": sum(1 for d in diffs if abs(d) > 0.01),
+                "b_better": sum(1 for d in diffs if d > 0.01),
+                # сколько раз стоп сработал у каждой стороны (для S — главный вопрос)
+                "a_stopped": sum(1 for a, _ in pairs
+                                 if "invalidation" in pstore.event_types(a["id"])),
+                "b_stopped": sum(1 for _, b in pairs
+                                 if "invalidation" in pstore.event_types(b["id"])),
+                "b_open": sum(1 for _, b in pairs if b["status"] == "open")}
+    ab = _ab("B")
+    ab_stop = _ab("S")
 
     stats = {
         "week_no": week_no,
@@ -357,6 +524,9 @@ def cmd_report(args) -> int:
         "cum_ladder_hits": sum(1 for e in all_events if e["type"].startswith("ladder_")),
         "cum_trailings": sum(1 for e in all_events if e["type"] == "trailing"),
         "ab": ab,
+        "ab_stop": ab_stop,
+        "ab_stop_pct": cfg.get("stage7_positions.paper_ab_stop_pct", 50),
+        "stop_pct": cfg.get("stage8_exit.invalidation_below_base_low_pct", 25),
     }
     if milestone:
         pstore.set_system_flag("milestone_4w", f"week={week_no}")
@@ -430,10 +600,31 @@ def main() -> int:
     pp.add_argument("--coin-id", default="", help="id CoinGecko (если не найден автоматически)")
     pp.add_argument("--base-low", type=float, default=None,
                     help="лоу базы входа для инвалидации (иначе — из истории цены)")
+    pp.add_argument("--merge", action="store_true",
+                    help="add: докупка в открытую реальную позицию монеты (средняя цена, "
+                         "base_low не меняется); позиции нет — откроется новая")
     pp.add_argument("--notes", default="")
     pp.add_argument("--all", action="store_true", help="list: включая закрытые")
     pp.add_argument("--config", default=None)
     pp.set_defaults(func=cmd_pos)
+
+    pl = sub.add_parser("ladder", help="план лестницы покупок/продаж под Bybit spot (без ордеров)")
+    pl.add_argument("symbol", help="тикер: LINK или LINKUSDT")
+    pl.add_argument("--budget", type=float, required=True, help="бюджет на монету, USDT")
+    pl.add_argument("--steps", type=int, default=4, help="ступеней покупки (1 рынком + лимитки)")
+    pl.add_argument("--min-order", type=float, default=10.0, help="минимум на ступень, USDT")
+    pl.add_argument("--sell", choices=["prod", "even", "paired"], default="prod",
+                    help="prod: +50/+150 по 1/3 + трейл; even: +30/60/100/200; paired: +40%% на ступень")
+    pl.add_argument("--stop-pct", type=float, default=None,
+                    help="стоп: %% ниже лоу базы (по умолчанию как в проде, 25)")
+    pl.add_argument("--filled", type=int, default=None,
+                    help="цели продажи для первых N исполненных ступеней")
+    pl.add_argument("--price", type=float, default=None, help="цена вместо последней с Bybit")
+    pl.add_argument("--base-low", type=float, default=None,
+                    help="лоу базы вместо минимума 30 закрытий Bybit")
+    pl.add_argument("--capital", type=float, default=None, help="капитал для проверки risk_check")
+    pl.add_argument("--config", default=None)
+    pl.set_defaults(func=cmd_ladder)
 
     pw = sub.add_parser("watch", help="ре-скан открытых позиций -> exit-сигналы")
     pw.add_argument("--notify", action="store_true", help="отправить exit-алерт в Telegram")

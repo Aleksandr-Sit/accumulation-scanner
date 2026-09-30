@@ -77,7 +77,8 @@ class PositionStore:
             self.conn.execute("UPDATE positions SET initial_qty=qty WHERE initial_qty IS NULL")
         if "realized_usdt" not in cols:
             self.conn.execute("ALTER TABLE positions ADD COLUMN realized_usdt REAL DEFAULT 0")
-        # A/B выхода на paper: B — близнец A с сужением трейла при перегреве рынка.
+        # A/B выхода на paper: B — близнец A с сужением трейла при перегреве рынка,
+        # S — близнец со стопом −50% (только монеты фильтра качества).
         if "variant" not in cols:
             self.conn.execute("ALTER TABLE positions ADD COLUMN variant TEXT DEFAULT 'A'")
         if "twin_of" not in cols:
@@ -102,19 +103,50 @@ class PositionStore:
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def has_open_for(self, coin_id: str, symbol: str = "") -> bool:
-        """Есть ли уже открытая позиция по монете (paper или реальная)."""
+    def find_open_real(self, symbol: str) -> dict[str, Any] | None:
+        """Открытая РЕАЛЬНАЯ позиция по тикеру (для pos add --merge: paper не трогаем)."""
         cur = self.conn.execute(
-            "SELECT 1 FROM positions WHERE status='open' AND "
+            "SELECT * FROM positions WHERE symbol=? AND status='open' AND is_paper=0 "
+            "ORDER BY id ASC", (symbol.upper(),))
+        row = cur.fetchone()
+        return _row_to_dict(cur, row) if row else None
+
+    def merge(self, position_id: int, price: float, qty: float) -> dict[str, Any] | None:
+        """Докупка (ступень лестницы) в существующую позицию: qty суммируется, entry —
+        средневзвешенная по количеству. Комиссия в проекте берётся в P&L пропорционально
+        стоимости (position_pnl/sell: entry×(1+fee)), поэтому средняя по сырым ценам +
+        этот учёт = ровно средняя с комиссиями; вшивать fee в entry — считать её дважды.
+        base_low, entry_ts, hwm и realized не меняются; initial_qty растёт (доли лестницы
+        paper-исполнителя считаются от всей набранной позиции)."""
+        pos = self.get(position_id)
+        if not pos or pos["status"] != "open" or price <= 0 or qty <= 0:
+            return None
+        new_qty = pos["qty"] + qty
+        entry = (pos["entry_price"] * pos["qty"] + price * qty) / new_qty
+        self.conn.execute(
+            "UPDATE positions SET entry_price=?, qty=?, initial_qty=COALESCE(initial_qty,0)+?, "
+            "hwm=MAX(COALESCE(hwm,0), ?) WHERE id=?",
+            (entry, new_qty, qty, entry, position_id))
+        self.record_event(position_id, "merge", price,
+                          f"ступень +{qty:.6g} @ {price:.6g}: средняя "
+                          f"{pos['entry_price']:.6g} → {entry:.6g}, кол-во {new_qty:.6g}")
+        return self.get(position_id)
+
+    def has_open_for(self, coin_id: str, symbol: str = "") -> bool:
+        """Есть ли уже открытая позиция по монете (paper или реальная). Близнецы A/B-тестов
+        (variant B/S) не считаются: S со стопом −50% живёт дольше A и иначе блокировал бы
+        переоткрытие основной книги."""
+        cur = self.conn.execute(
+            "SELECT 1 FROM positions WHERE status='open' AND COALESCE(variant,'A')='A' AND "
             "((coin_id != '' AND coin_id=?) OR (?!='' AND symbol=?)) LIMIT 1",
             (coin_id, symbol.upper(), symbol.upper()))
         return cur.fetchone() is not None
 
     def count_open_paper(self) -> int:
-        """Открытые paper-позиции без близнецов B (лимит paper_max_open — по монетам)."""
+        """Открытые paper-позиции без близнецов B/S (лимит paper_max_open — по монетам)."""
         cur = self.conn.execute(
             "SELECT COUNT(*) FROM positions WHERE status='open' AND is_paper=1 "
-            "AND COALESCE(variant,'A')!='B'")
+            "AND COALESCE(variant,'A')='A'")
         return int(cur.fetchone()[0])
 
     def open_positions(self) -> list[dict[str, Any]]:
@@ -232,6 +264,7 @@ class PositionStore:
         cutoff = time.time() - days * 86400
         cur = self.conn.execute(
             "SELECT 1 FROM positions WHERE status='closed' AND is_paper=1 AND closed_ts>=? "
+            "AND COALESCE(variant,'A')='A' "
             "AND ((coin_id!='' AND coin_id=?) OR (?!='' AND symbol=?)) LIMIT 1",
             (cutoff, coin_id, symbol.upper(), symbol.upper()))
         return cur.fetchone() is not None
@@ -261,11 +294,12 @@ class PositionStore:
             "SELECT * FROM position_events WHERE position_id=? ORDER BY ts", (position_id,))
         return [_row_to_dict(cur, r) for r in cur.fetchall()]
 
-    def ab_pairs(self) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-        """Пары (A, B) paper-близнецов для сравнения выхода: B.twin_of = A.id."""
+    def ab_pairs(self, variant: str = "B") -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """Пары (A, близнец) paper для сравнения выхода: twin.twin_of = A.id.
+        variant: B — сужение трейла при перегреве, S — стоп −50% (монеты фильтра качества)."""
         cur = self.conn.execute(
-            "SELECT * FROM positions WHERE is_paper=1 AND variant='B' AND twin_of IS NOT NULL "
-            "ORDER BY id")
+            "SELECT * FROM positions WHERE is_paper=1 AND variant=? AND twin_of IS NOT NULL "
+            "ORDER BY id", (variant,))
         pairs = []
         for b in [_row_to_dict(cur, r) for r in cur.fetchall()]:
             a = self.get(b["twin_of"])

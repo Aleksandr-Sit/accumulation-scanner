@@ -53,6 +53,12 @@ def stage2_antirug(cfg: Config, http: HttpClient, candidates: list[Candidate]) -
 
     for c in candidates:
         c.stage = "2"
+        if c.track == "Q":
+            # Нативная монета без контракта: проверять нечего, её «анти-раг» — гейт
+            # качества на Stage 1 (quality_screen). Идёт дальше на зону и скор.
+            c.stage = "watchlist"
+            watchlist.append(c)
+            continue
         sec = fetch_goplus(http, c.chain, c.address, key)
         if not sec:
             # Нет данных безопасности — не пропускаем вслепую, отправляем на ручную проверку.
@@ -125,7 +131,15 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
     if limit:
         ingested = ingested[:limit]
 
-    passed1, rejected1 = apply_filters(ingested, cfg)
+    # Трек Q: срез фильтра качества (монеты без контракта вместо анти-рага).
+    qual = {"ok": False, "by_sym": {}, "note": "выключен"}
+    if cfg.get("track_q.enabled", False):
+        from .quality import load_quality
+        qual = load_quality(cfg.get("track_q.source"), cfg.get("track_q.max_age_days", 30))
+        if not qual["ok"]:
+            print(f"[scan] трек Q пуст: {qual['note']}")
+
+    passed1, rejected1 = apply_filters(ingested, cfg, qual["by_sym"])
     watchlist, rejected2 = stage2_antirug(cfg, http, passed1)
 
     # Stage 3 — фундамент/оценка по выжившим анти-раг.
@@ -239,7 +253,13 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
     # покупки вносятся руками (pos add) и в риск-бюджете учитываются только они.
     n_paper = 0
     if cfg.get("stage7_positions.paper_auto", False):
-        n_paper = _open_paper_positions(cfg, watchlist)
+        q_by_sym = qual["by_sym"]
+        if not q_by_sym and cfg.get("stage7_positions.paper_ab_stop", False):
+            # трек Q выключен, но A/B стопа тоже опирается на срез качества
+            from .quality import load_quality
+            q_by_sym = load_quality(cfg.get("track_q.source"),
+                                    cfg.get("track_q.max_age_days", 30))["by_sym"]
+        n_paper = _open_paper_positions(cfg, watchlist, q_by_sym)
 
     _write_watchlist(cfg, watchlist)
 
@@ -250,6 +270,8 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
         "after_filters": len(passed1),
         "rejected_filters": len(rejected1),
         "watchlist": len(watchlist),
+        "track_q": (f"{sum(1 for c in watchlist if c.track == 'Q')} без контракта "
+                    f"(срез {qual.get('date') or '—'})" if qual["ok"] else qual["note"]),
         "rejected_antirug": len(rejected2),
         "manual_review": sum(1 for c in rejected2 if c.manual_review),
         "stage3_enriched": n_fund,
@@ -263,9 +285,15 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
     return summary
 
 
-def _open_paper_positions(cfg: Config, watchlist: list[Candidate]) -> int:
-    """Открывает paper-позиции по пружинам, прошедшим пороги. Возвращает число новых."""
+def _open_paper_positions(cfg: Config, watchlist: list[Candidate],
+                          quality: dict[str, dict] | None = None) -> int:
+    """Открывает paper-позиции по пружинам, прошедшим пороги. Возвращает число новых.
+    quality — срез фильтра качества {SYM: row}: монетам из него открывается близнец S
+    (стоп −50%) для A/B ширины стопа."""
+    from .quality import in_quality
     p = cfg["stage7_positions"]
+    ab_stop = p.get("paper_ab_stop", False)
+    q_ratio = cfg.get("track_q.max_mcap_ratio", 3.0)
     min_score = p.get("paper_min_score", 70)
     min_conf = p.get("paper_min_confidence", 0.6)
     stake = p.get("paper_stake_usdt", 100)
@@ -301,6 +329,13 @@ def _open_paper_positions(cfg: Config, watchlist: list[Candidate]) -> int:
                        coin_id=c.coin_id, chain=c.chain, address=c.address,
                        venue=c.rf_venue, paper=True, variant="B", twin_of=pid,
                        notes=f"ab-twin of #{pid}")
+        if ab_stop and in_quality(c, quality or {}, q_ratio):
+            # Близнец S: тот же вход и выходы, но инвалидация −50% (A/B ширины стопа,
+            # ladder_dca_study) — только для монет фильтра качества.
+            pstore.add(c.symbol, c.price_usd, stake / c.price_usd,
+                       coin_id=c.coin_id, chain=c.chain, address=c.address,
+                       venue=c.rf_venue, paper=True, variant="S", twin_of=pid,
+                       notes=f"stop-twin of #{pid} (−{p.get('paper_ab_stop_pct', 50)}%)")
         opened += 1
     pstore.close_db()
     return opened
