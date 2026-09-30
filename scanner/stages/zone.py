@@ -4,7 +4,8 @@
 Считается из бесплатной истории цены CoinGecko. Чистые функции — тестируются офлайн.
 
 НЕ покрыто на free (помечается «нет данных»): on-chain приток smart money, MVRV,
-реализованная цена, соц-объём — это Stage 4b (Nansen/Glassnode/Santiment/Dune).
+реализованная цена, соц-объём монеты (Nansen/Glassnode/Santiment). Нетто-поток на биржи —
+Stage 4c (`stages/onchain.py`, Dune, опционально); качество пружины — Stage 4b.
 """
 from __future__ import annotations
 
@@ -139,5 +140,5 @@ def classify_zone(ind: dict | None, drawdown_pct: float | None,
         sig.append(f"глубокая просадка {dd:.0f}%, но нет сжатия/стабилизации — не пружина")
     if squeezed:
         sig.append(f"есть сжатие {contr:.2f}, но не в зоне дна")
-    sig.append("[нет данных] on-chain накопление / MVRV / соц-объём — Stage 4b (платно)")
+    sig.append("[нет данных] MVRV / реализованная цена / соц-объём (платно); on-chain поток — Stage 4c (Dune, опц.)")
     return "СЕРЕДИНА", sig

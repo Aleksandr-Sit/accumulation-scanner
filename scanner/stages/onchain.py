@@ -16,6 +16,17 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 10.0) -> float:
     return max(lo, min(hi, x))
 
 
+def match_onchain(onchain_map: dict, symbol: str | None, address: str | None) -> dict | None:
+    """Запись Dune для монеты: сначала по адресу контракта (однозначно), потом по
+    тикеру (однофамильцы из других сетей возможны — поэтому только fallback)."""
+    if not onchain_map:
+        return None
+    addr = (address or "").lower()
+    if addr and addr in onchain_map:
+        return onchain_map[addr]
+    return onchain_map.get((symbol or "").upper()) if symbol else None
+
+
 def flow_ratio(net_flow_usd_7d, volume_24h) -> float | None:
     """Нетто-поток на биржи как доля недельного оборота (net_flow / (vol*7))."""
     if not isinstance(net_flow_usd_7d, (int, float)):

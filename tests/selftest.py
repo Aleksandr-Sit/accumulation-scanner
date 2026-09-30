@@ -414,6 +414,27 @@ def test_onchain(cfg, failures: list[str]) -> None:
     _check("map по symbol (UPPER)", "ARB" in m and m["ARB"]["net_flow_usd_7d"] == -5e5, failures)
     _check("map по адресу (lower)", "0xabc" in m, failures)
 
+    # match_onchain: адрес приоритетнее тикера (однофамильцы из других сетей).
+    from scanner.stages.onchain import flow_ratio, match_onchain
+    m2 = {"ARB": {"net_flow_usd_7d": 1.0}, "0xabc": {"net_flow_usd_7d": 2.0}}
+    _check("match: по адресу раньше тикера",
+           match_onchain(m2, "ARB", "0xABC")["net_flow_usd_7d"] == 2.0, failures)
+    _check("match: fallback по тикеру", match_onchain(m2, "arb", "")["net_flow_usd_7d"] == 1.0, failures)
+    _check("match: пустая карта -> None", match_onchain({}, "ARB", "0xabc") is None, failures)
+
+    # flow_ratio = net_flow / (vol*7); нет объёма -> None.
+    _check("flow_ratio: -7M при vol 10M/д = -10%", abs(flow_ratio(-7e6, 1e7) + 0.10) < 1e-9, failures)
+    _check("flow_ratio: vol=0 -> None", flow_ratio(-7e6, 0) is None, failures)
+    _check("flow_ratio: нет потока -> None", flow_ratio(None, 1e7) is None, failures)
+
+    # Без DUNE_API_KEY -> {} без сетевых вызовов (блок onchain остаётся None).
+    import copy
+    from scanner.config import Config
+    from scanner.sources.dune import fetch_onchain
+    nokey = copy.deepcopy(cfg._d)
+    nokey.setdefault("api_keys", {})["dune"] = ""
+    _check("нет Dune-ключа -> {} (нейтрально)", fetch_onchain(Config(nokey)) == {}, failures)
+
     # Блок onchain в скоре теперь читает onchain_score (не всегда None).
     from scanner.stages.score import compute_score
     c = Candidate(source="t", track="A", symbol="OC", zone="ПРУЖИНА/ДНО",
@@ -423,6 +444,49 @@ def test_onchain(cfg, failures: list[str]) -> None:
     _, conf, brk = compute_score(c, cfg)
     _check("onchain-блок наполнен -> confidence 1.0", conf == 1.0, failures)
     _check("onchain sub в breakdown = 9.0", brk["onchain"]["sub"] == 9.0, failures)
+
+
+def test_sources_parse(cfg, failures: list[str]) -> None:
+    print("Парсинг источников (фандинг Bybit, klines, SQLite):")
+    from scanner.sources.funding import parse_funding
+    from scanner.sources.bybit import parse_daily_closes
+
+    data = {"result": {"list": [
+        {"symbol": "ARBUSDT", "fundingRate": "-0.0004"},
+        {"symbol": "1000PEPEUSDT", "fundingRate": "0.0006"},
+        {"symbol": "BTCPERP", "fundingRate": "0.0001"},       # не USDT -> мимо
+        {"symbol": "ETHUSDT", "fundingRate": ""},             # пустая ставка -> мимо
+        {"symbol": "1000BONKUSDT", "fundingRate": "0.0002"},
+        {"symbol": "BONKUSDT", "fundingRate": "0.0003"},      # прямой листинг приоритетнее
+    ]}}
+    fm = parse_funding(data)
+    _check("фандинг: строка -> float", fm.get("ARB") == -0.0004, failures)
+    _check("фандинг: 1000PEPE -> PEPE", fm.get("PEPE") == 0.0006, failures)
+    _check("фандинг: прямой BONK приоритетнее 1000BONK", fm.get("BONK") == 0.0003, failures)
+    _check("фандинг: не-USDT и пустые пропущены", "BTC" not in fm and "ETH" not in fm, failures)
+    _check("фандинг: мусорный ответ -> {}", parse_funding(None) == {} and parse_funding({}) == {}, failures)
+
+    day = 86_400_000
+    now = 12 * day + 3_600_000                     # 12-й день, 01:00 UTC — свеча дня 12 не закрыта
+    kl = {"result": {"list": [[str(12 * day), "0", "0", "0", "99"],     # newest-first, live
+                              [str(11 * day), "0", "0", "0", "101"],
+                              [str(10 * day), "0", "0", "0", "100"]]}}
+    _check("klines: oldest->newest, live-свеча отброшена",
+           parse_daily_closes(kl, now) == [100.0, 101.0], failures)
+    _check("klines: пустой ответ -> []", parse_daily_closes(None, now) == [], failures)
+
+    # SQLite: поля Stage 4b/4c пишутся в candidates.
+    from scanner.db import Store
+    st = Store(":memory:")
+    c = Candidate(source="t", track="A", symbol="Q", coin_id="q", chain="ethereum",
+                  address="0x1", market_dd=0.42, spring_quality=1.1, funding_rate=-0.0004,
+                  onchain_score=7.5, net_flow_usd_7d=-2e6, holders_change_pct_7d=3.0)
+    rid = st.new_run("t")
+    st.save_candidates(rid, [c])
+    row = st.conn.execute("SELECT market_dd, spring_quality, funding_rate, onchain_score,"
+                          " net_flow_usd_7d, holders_change_pct_7d FROM candidates").fetchone()
+    st.close()
+    _check("SQLite: поля Stage 4b/4c сохранены", row == (0.42, 1.1, -0.0004, 7.5, -2e6, 3.0), failures)
 
 
 def test_entry_quality(cfg, failures: list[str]) -> None:
@@ -971,6 +1035,8 @@ def main() -> int:
     test_rf_gate(cfg, failures)
     print()
     test_liveness(cfg, failures)
+    print()
+    test_sources_parse(cfg, failures)
     print()
     test_entry_quality(cfg, failures)
     print()

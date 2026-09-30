@@ -13,28 +13,46 @@ USDT-перпам → строим map baseCoin -> ставка/8h. Дёшево
 """
 from __future__ import annotations
 
+import re
+
 from ..http import HttpClient
 
 _URL = "https://api.bybit.com/v5/market/tickers"
+_MULT_PREFIX = re.compile(r"^(10+)([A-Z].*)$")   # 1000PEPE, 10000SATS, 1000000MOG
 
 
-def fetch_funding_map(http: HttpClient) -> dict[str, float]:
-    """baseCoin(UPPER) -> fundingRate (доля/8h). Один вызов на все линейные перпы."""
-    data = http.get_json(_URL, params={"category": "linear"})
+def parse_funding(data) -> dict[str, float]:
+    """Ответ /v5/market/tickers -> baseCoin(UPPER) -> fundingRate (доля/8h).
+
+    Чистая функция (офлайн-тест). Мультипликаторные контракты (1000PEPEUSDT)
+    мапятся и на базовый тикер (PEPE): ставка фандинга от номинала не зависит.
+    Прямой листинг тикера приоритетнее мультипликаторного.
+    """
     out: dict[str, float] = {}
+    mult: dict[str, float] = {}
     if not isinstance(data, dict):
         return out
     for it in (data.get("result", {}) or {}).get("list", []) or []:
-        sym = it.get("symbol", "")
+        sym = (it.get("symbol") or "").upper()
         if not sym.endswith("USDT"):
             continue
-        base = sym[:-4].upper()
+        base = sym[:-4]
         fr = it.get("fundingRate")
         if fr in (None, ""):
             continue
         try:
-            # первый перп по тикеру выигрывает (мультипликаторные 1000X — мимо)
-            out.setdefault(base, float(fr))
+            rate = float(fr)
         except (ValueError, TypeError):
             continue
+        out.setdefault(base, rate)
+        m = _MULT_PREFIX.match(base)
+        if m:
+            mult.setdefault(m.group(2), rate)
+    for base, rate in mult.items():
+        out.setdefault(base, rate)
     return out
+
+
+def fetch_funding_map(http: HttpClient) -> dict[str, float]:
+    """baseCoin(UPPER) -> fundingRate (доля/8h). Один вызов на все линейные перпы."""
+    return parse_funding(http.get_json(_URL, params={"category": "linear"}))

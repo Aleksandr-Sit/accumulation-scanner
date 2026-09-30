@@ -293,7 +293,7 @@ def cmd_ladder(args) -> int:
     price = args.price or bybit.fetch_last_price(http, pair)
     base_low = args.base_low
     if base_low is None:
-        closes = bybit.fetch_daily_closes(http, pair, 40)[:-1]     # без живой свечи
+        closes = bybit.fetch_daily_closes(http, pair, 40)   # только закрытые свечи
         base_low = compute_base_low(closes, 30)
     if not price or not base_low:
         print("Нет цены или истории закрытий — задай --price и --base-low вручную")

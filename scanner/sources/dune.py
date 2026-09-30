@@ -15,9 +15,9 @@
 """
 from __future__ import annotations
 
+import http.client
 import json
 import time
-import urllib.error
 import urllib.request
 
 _BASE = "https://api.dune.com/api/v1"
@@ -30,7 +30,7 @@ def _req(url: str, key: str, method: str = "GET", timeout: int = 20):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+    except (OSError, http.client.HTTPException, ValueError) as e:  # URLError ⊂ OSError
         print(f"[dune] {method} {url.split('/api')[-1]} fail: {e}")
         return None
 

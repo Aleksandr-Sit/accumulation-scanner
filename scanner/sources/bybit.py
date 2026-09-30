@@ -9,9 +9,12 @@ baseCoin. Наличие токена там = есть CEX-ликвидност
 """
 from __future__ import annotations
 
+import time
+
 from ..http import HttpClient
 
 _BASE = "https://api.bybit.com"
+_DAY_MS = 86_400_000
 
 
 def fetch_spot_basecoins(http: HttpClient) -> set[str]:
@@ -33,10 +36,21 @@ def fetch_daily_closes(http: HttpClient, symbol: str = "BTCUSDT",
     data = http.get_json(f"{_BASE}/v5/market/kline",
                          params={"category": "spot", "symbol": symbol,
                                  "interval": "D", "limit": limit})
-    rows = (data or {}).get("result", {}).get("list", []) if isinstance(data, dict) else []
+    return parse_daily_closes(data, int(time.time() * 1000))
+
+
+def parse_daily_closes(data, now_ms: int) -> list[float]:
+    """Ответ /v5/market/kline (D) -> закрытия oldest→newest, только ЗАКРЫТЫЕ свечи.
+
+    Текущая дневная свеча (start + 1д > now) — live-тик, отбрасывается: та же
+    дисциплина закрытых свечей, что coingecko.closed_daily. Чистая, офлайн-тест.
+    """
+    rows = ((data.get("result") or {}).get("list") or []) if isinstance(data, dict) else []
     out: list[float] = []
     for r in reversed(rows):     # Bybit отдаёт newest-first
         try:
+            if int(r[0]) + _DAY_MS > now_ms:
+                continue
             out.append(float(r[4]))
         except (ValueError, IndexError, TypeError):
             continue

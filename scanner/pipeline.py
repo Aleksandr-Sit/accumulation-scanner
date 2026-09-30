@@ -203,8 +203,8 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
             c.market_hot_score = mhot.get("score")
             c.market_hot_lit = list(mhot.get("lit") or [])
             c.funding_rate = funding.get(c.symbol.upper())
-            # On-chain накопление (Dune): по symbol или адресу; наполняет блок onchain.
-            oc = onchain_map.get(c.symbol.upper()) or onchain_map.get((c.address or "").lower())
+            # On-chain накопление (Dune): по адресу, затем по symbol; наполняет блок onchain.
+            oc = onchain.match_onchain(onchain_map, c.symbol, c.address)
             if oc:
                 c.net_flow_usd_7d = oc.get("net_flow_usd_7d")
                 c.holders_change_pct_7d = oc.get("holders_change_pct_7d")
@@ -436,7 +436,7 @@ def run_watch(cfg: Config) -> dict:
         pnl = exit_stage.position_pnl(cur, last_close)
         pstore.snapshot(pos["id"], last_close, pnl["pnl_pct"], hwm)
 
-        oc = onchain_map.get(pos["symbol"].upper()) or onchain_map.get((pos.get("address") or "").lower())
+        oc = onchain.match_onchain(onchain_map, pos["symbol"], pos.get("address"))
         rows.append({
             "position": cur, "last_price": last_close, "hwm": hwm,
             "pnl": pnl,

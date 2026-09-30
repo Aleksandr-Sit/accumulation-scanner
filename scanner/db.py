@@ -46,6 +46,12 @@ CREATE TABLE IF NOT EXISTS candidates (
     flags       TEXT,
     reject_reasons TEXT,
     security    TEXT,
+    market_dd   REAL,
+    spring_quality REAL,
+    funding_rate REAL,
+    onchain_score REAL,
+    net_flow_usd_7d REAL,
+    holders_change_pct_7d REAL,
     PRIMARY KEY (run_id, chain, address, symbol, coin_id)
 );
 CREATE INDEX IF NOT EXISTS idx_candidates_run ON candidates(run_id, stage);
@@ -93,6 +99,10 @@ _MIGRATIONS = [
     ("category", "TEXT"), ("val_notes", "TEXT"),
     ("zone", "TEXT"), ("rf_venue", "TEXT"),
     ("score", "REAL"), ("confidence", "REAL"),
+    # Stage 4b/4c: контекст рынка, качество пружины, фандинг, on-chain (Dune)
+    ("market_dd", "REAL"), ("spring_quality", "REAL"), ("funding_rate", "REAL"),
+    ("onchain_score", "REAL"), ("net_flow_usd_7d", "REAL"),
+    ("holders_change_pct_7d", "REAL"),
 ]
 
 
@@ -139,6 +149,8 @@ class Store:
                 c.zone, c.rf_venue, c.score, c.confidence,
                 json.dumps(c.flags), json.dumps(c.reject_reasons, ensure_ascii=False),
                 json.dumps(c.security),
+                c.market_dd, c.spring_quality, c.funding_rate,
+                c.onchain_score, c.net_flow_usd_7d, c.holders_change_pct_7d,
             ))
         self.conn.executemany(
             """INSERT OR REPLACE INTO candidates(
@@ -146,8 +158,11 @@ class Store:
                    market_cap, fdv, volume_24h, liquidity_usd,
                    drawdown_from_ath_pct, age_days, spring_prefilter, manual_review,
                    tvl, mc_tvl, fdv_mc, category, val_notes, zone, rf_venue,
-                   score, confidence, flags, reject_reasons, security)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows,
+                   score, confidence, flags, reject_reasons, security,
+                   market_dd, spring_quality, funding_rate,
+                   onchain_score, net_flow_usd_7d, holders_change_pct_7d)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                       ?,?,?,?,?,?)""", rows,
         )
         self.conn.commit()
 
