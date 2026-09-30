@@ -13,6 +13,24 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+_RETRY_CODES = (429, 500, 502, 503, 504)
+_WAIT_429_MIN = 60.0   # окно лимита free-тарифов — минута; backoff 2→16 с его не переживает
+_WAIT_429_MAX = 90.0
+
+
+def retry_wait(code: int, retry_after: str | None, backoff: float) -> float:
+    """Пауза перед повтором, сек. 429: Retry-After (в секундах), иначе ждём окно
+    лимита целиком. 5xx — обычный экспоненциальный backoff."""
+    if code != 429:
+        return backoff
+    try:
+        ra = float(retry_after) if retry_after else None
+    except ValueError:
+        ra = None   # HTTP-date вместо секунд — редкость, берём окно
+    if ra is not None and ra >= 0:
+        return min(ra + 1.0, _WAIT_429_MAX)
+    return min(max(backoff, _WAIT_429_MIN), _WAIT_429_MAX)
+
 
 class HttpClient:
     _PRUNE_AGE = 7 * 86400   # кэш старше недели бесполезен (TTL максимум часы)
@@ -98,8 +116,9 @@ class HttpClient:
                     self._write_cache(url, data)
                 return data
             except urllib.error.HTTPError as e:
-                if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
-                    time.sleep(backoff)
+                if e.code in _RETRY_CODES and attempt < retries - 1:
+                    time.sleep(retry_wait(e.code, e.headers.get("Retry-After")
+                                          if e.headers else None, backoff))
                     backoff *= 2
                     continue
                 print(f"[http] {e.code} {url}")

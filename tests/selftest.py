@@ -297,6 +297,17 @@ def test_closed_daily(cfg, failures: list[str]) -> None:
     _check("чистые закрытия не трогаем", closed_daily(clean)["prices"] == [100.0, 101.0], failures)
 
 
+def test_retry_wait(cfg, failures: list[str]) -> None:
+    print("http.retry_wait — пауза перед повтором:")
+    from scanner.http import retry_wait
+    _check("429 без Retry-After ждёт окно 60 с", retry_wait(429, None, 2.0) == 60.0, failures)
+    _check("429 с Retry-After: 30 -> 31 с", retry_wait(429, "30", 2.0) == 31.0, failures)
+    _check("429 Retry-After сверху ограничен 90 с", retry_wait(429, "600", 2.0) == 90.0, failures)
+    _check("429 Retry-After в виде даты -> окно",
+           retry_wait(429, "Wed, 30 Sep 2026 09:00:00 GMT", 2.0) == 60.0, failures)
+    _check("5xx — обычный backoff", retry_wait(503, None, 4.0) == 4.0, failures)
+
+
 def test_regime(cfg, failures: list[str]) -> None:
     print("Режим BTC (контекст, не блокер):")
     from scanner.regime import classify_regime, rs_vs_btc
@@ -1029,6 +1040,8 @@ def main() -> int:
     test_zone(cfg, failures)
     print()
     test_closed_daily(cfg, failures)
+    print()
+    test_retry_wait(cfg, failures)
     print()
     test_regime(cfg, failures)
     print()
