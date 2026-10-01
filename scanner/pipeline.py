@@ -28,8 +28,12 @@ from .stages.filters import apply_filters
 
 def _make_http(cfg: Config) -> HttpClient:
     h = cfg["http"]
-    return HttpClient(h["cache_dir"], h["cache_ttl_seconds"], h["timeout_seconds"],
-                      h["rate_limits_per_min"])
+    limits = dict(h["rate_limits_per_min"])
+    # Лимит CoinGecko в конфиге — под demo-ключ; без ключа анонимный тариф 429-ит раньше.
+    if not cfg.get("api_keys.coingecko_demo", "") and "api.coingecko.com" in limits:
+        limits["api.coingecko.com"] = min(limits["api.coingecko.com"],
+                                          h.get("coingecko_no_key_per_min", 10))
+    return HttpClient(h["cache_dir"], h["cache_ttl_seconds"], h["timeout_seconds"], limits)
 
 
 def stage0_ingest(cfg: Config, http: HttpClient, track: str) -> list[Candidate]:

@@ -299,6 +299,7 @@ def test_closed_daily(cfg, failures: list[str]) -> None:
 
 def test_retry_wait(cfg, failures: list[str]) -> None:
     print("http.retry_wait — пауза перед повтором:")
+    import tempfile
     from scanner.http import retry_wait
     _check("429 без Retry-After ждёт окно 60 с", retry_wait(429, None, 2.0) == 60.0, failures)
     _check("429 с Retry-After: 30 -> 31 с", retry_wait(429, "30", 2.0) == 31.0, failures)
@@ -306,6 +307,21 @@ def test_retry_wait(cfg, failures: list[str]) -> None:
     _check("429 Retry-After в виде даты -> окно",
            retry_wait(429, "Wed, 30 Sep 2026 09:00:00 GMT", 2.0) == 60.0, failures)
     _check("5xx — обычный backoff", retry_wait(503, None, 4.0) == 4.0, failures)
+
+    # Лимит CoinGecko: конфиг под demo-ключ, без ключа — coingecko_no_key_per_min.
+    import copy
+    from scanner.config import Config
+    from scanner.pipeline import _make_http
+    data = copy.deepcopy(cfg._d)
+    data["http"]["cache_dir"] = tempfile.mkdtemp()
+    data["http"]["rate_limits_per_min"]["api.coingecko.com"] = 25
+    data["http"]["coingecko_no_key_per_min"] = 10
+    data.setdefault("api_keys", {})["coingecko_demo"] = "CG-x"
+    with_key = _make_http(Config(data))._min_interval["api.coingecko.com"]
+    data["api_keys"]["coingecko_demo"] = ""
+    no_key = _make_http(Config(data))._min_interval["api.coingecko.com"]
+    _check("с demo-ключом CG 25/мин (2.4 с)", abs(with_key - 2.4) < 1e-9, failures)
+    _check("без ключа CG 10/мин (6 с)", abs(no_key - 6.0) < 1e-9, failures)
 
 
 def test_regime(cfg, failures: list[str]) -> None:

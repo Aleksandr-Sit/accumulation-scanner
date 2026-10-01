@@ -249,6 +249,21 @@ py -3 backtest/market_regime_study.py   # валидация входа/выхо
 
 На VPS (Linux) обычно просто `python3 run.py scan --track all`.
 
+### Ежедневный запуск (Windows)
+
+`scripts/daily_run.ps1` — `scan` → `watch` с `--notify`, лог в `logs/daily_*.log`
+(хранится 30 дней); `watch` идёт и при сбое `scan`. Задачу Планировщика регистрирует
+`scripts/register_task.ps1` (по умолчанию 10:00, `-At "08:30"`, `-NoNotify` — без Telegram):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scriptsegister_task.ps1
+Start-ScheduledTask -TaskName AccumulationScannerDaily        # прогнать сейчас
+Unregister-ScheduledTask -TaskName AccumulationScannerDaily -Confirm:$false   # удалить
+```
+
+Задача работает, пока пользователь в системе; проспал ноутбук — стартует после пробуждения.
+Без регулярного запуска paper A/B не копит выборку: сигналы у дна редки и идут пачками.
+
 ## Конфигурация — `config.json`
 
 Все пороги — дефолты `[оценка]`, тюнятся на бэктесте. Ключевое:
@@ -261,6 +276,9 @@ py -3 backtest/market_regime_study.py   # валидация входа/выхо
   Живой срез 29.09: 34 монеты (BTC, ETH, XRP, SOL, TRX, ADA, …). Каждая — ещё 2 вызова
   CoinGecko на Stage 3b/4, скан на free-лимите дольше на несколько минут.
 - Ключи API — через env: `COINGECKO_DEMO_KEY`, `GOPLUS_KEY` (не обязательны, поднимают лимиты).
+  `http.rate_limits_per_min["api.coingecko.com"]` (25) рассчитан на demo-ключ; без ключа
+  берётся `http.coingecko_no_key_per_min` (10). С ключом полный scan ~15–30 мин, без него
+  анонимный тариф отдаёт 429 и зона у части монет остаётся «?» (балл завышается).
 
 ## Выход
 

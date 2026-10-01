@@ -200,8 +200,10 @@
     "cache_dir": ".cache",
     "cache_ttl_seconds": 3600,
     "timeout_seconds": 25,
+    "_coingecko_note": "25/мин — под demo-ключ (лимит 30). Без COINGECKO_DEMO_KEY берётся coingecko_no_key_per_min: анонимный лимит ниже и плавает.",
+    "coingecko_no_key_per_min": 10,
     "rate_limits_per_min": {
-      "api.coingecko.com": 10,
+      "api.coingecko.com": 25,
       "api.geckoterminal.com": 25,
       "api.dexscreener.com": 200,
       "api.gopluslabs.io": 50,
