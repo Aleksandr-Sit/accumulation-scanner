@@ -9,10 +9,13 @@ param(
 $taskName = "AccumulationScannerDaily"
 $script = Join-Path $PSScriptRoot "daily_run.ps1"
 $root = Split-Path -Parent $PSScriptRoot
-$arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`""
+$arg = "-NoProfile -ExecutionPolicy Bypass -File `"$script`""
 if ($NoNotify) { $arg += " -NoNotify" }
 
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arg -WorkingDirectory $root
+# conhost --headless: окна нет вообще. На Windows 11 консоль открывается в Windows Terminal,
+# он игнорирует -WindowStyle Hidden — окно висит, закрыли его — прогон убит (0xC000013A).
+$action = New-ScheduledTaskAction -Execute "conhost.exe" `
+    -Argument "--headless powershell.exe $arg" -WorkingDirectory $root
 $trigger = New-ScheduledTaskTrigger -Daily -At $At
 # StartWhenAvailable: ноутбук спал в 10:00 — прогон стартует после пробуждения.
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RunOnlyIfNetworkAvailable `
