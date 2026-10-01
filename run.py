@@ -25,7 +25,12 @@ def cmd_scan(args) -> int:
     if args.pages is not None:
         cfg["universe"]["track_a_pages"] = args.pages
     print(f"[scan] track={args.track} limit={args.limit} pages={cfg['universe']['track_a_pages']} — старт")
-    summary = run_scan(cfg, track=args.track, limit=args.limit)
+    try:
+        summary = run_scan(cfg, track=args.track, limit=args.limit)
+    except Exception as e:
+        if args.notify:
+            _notify_failure(cfg, "scan", e)
+        raise
     print("\n=== ИТОГ ПРОГОНА ===")
     for k, v in summary.items():
         if not isinstance(v, dict):
@@ -76,13 +81,43 @@ def cmd_scan(args) -> int:
             from scanner.sources.coingecko import fetch_global
             mctx = fetch_global(_make_http(cfg), cfg.get("api_keys.coingecko_demo", ""))
             mctx["market_dd"] = rows[0].get("market_dd") if rows else None
-        if telegram.notify(fresh, cfg, mctx):
-            # mute только тем, кто был в сообщении: раньше писались все score ≥ порога,
-            # и монета из СЕРЕДИНЫ / за лимитом max_alerts глушилась, так и не придя.
-            for c in telegram.select_picks(fresh, cfg):
-                st.record_alert(c.symbol, c.score)
+        token = cfg.get("api_keys.telegram_token", "")
+        chat = cfg.get("api_keys.telegram_chat_id", "")
+        text = telegram.format_alert(fresh, cfg, mctx)
+        if text:
+            ok = telegram.send_message(token, chat, text)
+            print(f"[telegram] отправка: {'ok' if ok else 'fail'}")
+            if ok:
+                # mute только тем, кто был в сообщении: раньше писались все score ≥ порога,
+                # и монета из СЕРЕДИНЫ / за лимитом max_alerts глушилась, так и не придя.
+                for c in telegram.select_picks(fresh, cfg):
+                    st.record_alert(c.symbol, c.score)
+        elif cfg.get("stage6_telegram.heartbeat", True):
+            # Алерта нет — всё равно сообщаем, что прогон дошёл до конца: иначе тишина
+            # «кандидатов нет» неотличима от упавшего/не запустившегося прогона.
+            fresh_ids = {id(c) for c in fresh}
+            muted_picks = [c for c in telegram.select_picks(cands, cfg)
+                           if id(c) not in fresh_ids]
+            hb = telegram.format_heartbeat(cands, cfg, mctx, muted=muted_picks,
+                                           elapsed_sec=summary.get("elapsed_sec"))
+            ok = telegram.send_message(token, chat, hb)
+            print(f"[telegram] алерта нет, heartbeat: {'ok' if ok else 'fail'}")
+        else:
+            print("[telegram] нет кандидатов под критерии алерта")
         st.close()
     return 0
+
+
+def _notify_failure(cfg, step: str, e: Exception) -> None:
+    """Шаг прогона упал исключением — шлём короткое сообщение (ошибки отправки глотаем,
+    чтобы не заслонить исходное исключение)."""
+    try:
+        from scanner.notify import telegram
+        telegram.send_message(cfg.get("api_keys.telegram_token", ""),
+                              cfg.get("api_keys.telegram_chat_id", ""),
+                              telegram.format_failure(step, f"{type(e).__name__}: {e}"))
+    except Exception as e2:  # noqa: BLE001
+        print(f"[telegram] сообщение о сбое не отправлено: {e2}")
 
 
 def cmd_chatid(args) -> int:
@@ -380,7 +415,12 @@ def cmd_ladder(args) -> int:
 
 def cmd_watch(args) -> int:
     cfg = load_config(args.config)
-    out = run_watch(cfg)
+    try:
+        out = run_watch(cfg)
+    except Exception as e:
+        if args.notify:
+            _notify_failure(cfg, "watch", e)
+        raise
     rows, summary = out["rows"], out["summary"]
     if not rows:
         print("Открытых позиций нет — нечего отслеживать (run.py pos add ...).")
@@ -440,6 +480,14 @@ def cmd_report(args) -> int:
     pstore = PositionStore(cfg["output"]["db_path"])
 
     now = _t.time()
+    if args.if_due:
+        # Ежедневный прогон зовёт report каждый день, сводка уходит раз в неделю.
+        last = pstore.last_event_ts(0, "weekly_report")
+        if not telegram.weekly_due(last, now, cfg.get("stage6_telegram.weekly_report_weekday", 0)):
+            print(f"[report] сводка этой недели уже была "
+                  f"({_t.strftime('%d.%m %H:%M', _t.localtime(last))}) — пропуск")
+            pstore.close_db()
+            return 0
     week_ago = now - 7 * 86400
     # Близнецы B/S (A/B выхода и стопа) не входят в основные счётчики — только в блоки
     # сравнения.
@@ -528,16 +576,21 @@ def cmd_report(args) -> int:
         "ab_stop_pct": cfg.get("stage7_positions.paper_ab_stop_pct", 50),
         "stop_pct": cfg.get("stage8_exit.invalidation_below_base_low_pct", 25),
     }
-    if milestone:
-        pstore.set_system_flag("milestone_4w", f"week={week_no}")
-    pstore.close_db()
-
     text = telegram.format_weekly(stats, cfg)
     print(text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
+    delivered = True
     if args.notify:
-        ok = telegram.send_message(cfg.get("api_keys.telegram_token", ""),
-                                   cfg.get("api_keys.telegram_chat_id", ""), text)
-        print(f"[telegram] недельная сводка: {'ok' if ok else 'fail'}")
+        delivered = telegram.send_message(cfg.get("api_keys.telegram_token", ""),
+                                          cfg.get("api_keys.telegram_chat_id", ""), text)
+        print(f"[telegram] недельная сводка: {'ok' if delivered else 'fail'}")
+    # Флаги — только после доставки: сбой Telegram не должен «съесть» итоговую
+    # 4-недельную сводку или неделю.
+    if delivered:
+        if milestone:
+            pstore.set_system_flag("milestone_4w", f"week={week_no}")
+        if args.notify or args.if_due:
+            pstore.set_system_flag("weekly_report", f"week={week_no}")
+    pstore.close_db()
     return 0
 
 
@@ -635,6 +688,9 @@ def main() -> int:
     pr.add_argument("--notify", action="store_true", help="отправить в Telegram")
     pr.add_argument("--milestone-weeks", type=int, default=4,
                     help="на какой неделе выдать итоговую сводку (одноразово)")
+    pr.add_argument("--if-due", action="store_true",
+                    help="только если сводки этой недели ещё не было "
+                         "(stage6_telegram.weekly_report_weekday) — для ежедневного прогона")
     pr.add_argument("--config", default=None)
     pr.set_defaults(func=cmd_report)
 

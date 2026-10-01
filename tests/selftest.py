@@ -776,6 +776,44 @@ def test_telegram_format(cfg, failures: list[str]) -> None:
     cap = cfg["stage6_telegram"]["max_alerts"]
     _check("select_picks: не больше max_alerts", len(select_picks(many, cfg)) == cap, failures)
 
+    # Heartbeat: алерта нет — сообщение «прогон завершён» с ближайшими к порогу.
+    from scanner.notify.telegram import format_failure, format_heartbeat, weekly_due
+    wl = [Candidate(source="t", track="A", symbol="GRAM", zone="ПРУЖИНА/ДНО", score=69.8,
+                    confidence=0.9),
+          Candidate(source="t", track="A", symbol="MID", zone="СЕРЕДИНА", score=68.0,
+                    confidence=0.9),
+          Candidate(source="t", track="A", symbol="LUNC", zone="ПРУЖИНА/ДНО", score=67.0,
+                    confidence=0.9)]
+    hb = format_heartbeat(wl, cfg, {"alt_dd": 0.4, "day": time.time()}, elapsed_sec=1680)
+    _check("heartbeat: прогон завершён за 28 мин", "прогон завершён за 28 мин" in hb, failures)
+    _check("heartbeat: «кандидатов нет» + порог", "Кандидатов под алерт нет" in hb
+           and "балл ≥ 70" in hb, failures)
+    _check("heartbeat: ближе всех из зоны дна, без СЕРЕДИНЫ",
+           "в зоне: 2 · ближе всех: GRAM 69.8, LUNC 67" in hb, failures)
+    _check("heartbeat: контекст рынка", "🌍 альты −40%" in hb, failures)
+    hbm = format_heartbeat(cands, cfg, muted=[cands[0]])
+    _check("heartbeat: все заглушены -> «уже приходили (ICP)»",
+           "1 уже приходили" in hbm and "(ICP)" in hbm, failures)
+    fail = format_failure("scan", "RuntimeError: <boom>")
+    _check("сбой: шаг и экранированная ошибка", "Accumulation scan" in fail
+           and "&lt;boom&gt;" in fail, failures)
+
+    # Недельная сводка из ежедневного прогона: первый прогон недели (пн по умолчанию).
+    from datetime import datetime as _dt
+    mon = _dt(2026, 10, 5, 10, 0).timestamp()          # понедельник
+    _check("сводка: никогда не было -> пора", weekly_due(None, mon), failures)
+    _check("сводка: прошлый пн -> пора", weekly_due(_dt(2026, 9, 28, 10).timestamp(), mon),
+           failures)
+    _check("сводка: уже в этот пн -> нет",
+           not weekly_due(_dt(2026, 10, 5, 9, 0).timestamp(), _dt(2026, 10, 7, 10).timestamp()),
+           failures)
+    _check("сводка: пн пропущен (ноутбук выкл.) -> во вторник",
+           weekly_due(_dt(2026, 9, 28, 10).timestamp(), _dt(2026, 10, 6, 10).timestamp()), failures)
+    _check("сводка: день недели настраивается (пт)",
+           not weekly_due(_dt(2026, 10, 2, 10).timestamp(), _dt(2026, 10, 5, 10).timestamp(), 4)
+           and weekly_due(_dt(2026, 10, 2, 10).timestamp(), _dt(2026, 10, 9, 10).timestamp(), 4),
+           failures)
+
 
 def test_exit(cfg, failures: list[str]) -> None:
     print("Stage 8 — выходной контур (hodl-профиль):")
@@ -1059,6 +1097,11 @@ def test_exit_alert_format(cfg, failures: list[str]) -> None:
     _check("недельная сводка: счётчик недели", "неделя 2" in wk, failures)
     _check("недельная сводка: напоминание + отсчёт", "До итоговой сводки: 2 нед" in wk, failures)
     _check("недельная сводка: цифры", "инвалидаций 1" in wk and "+12.50" in wk, failures)
+    _check("идёт неделя -> без «paper не стартовал»", "не стартовал" not in wk, failures)
+    w0 = format_weekly({"week_no": 0, "milestone": False, "milestone_weeks": 4, "opened": 0,
+                        "open_now": 0, "invalidations": 0, "ladder_hits": 0, "trailings": 0,
+                        "paper_pnl_usdt": 0.0, "real_open": 0}, cfg)
+    _check("paper не стартовал -> так и сказано", "Paper ещё не стартовал" in w0, failures)
     _check("нет A/B пар -> строки сравнения нет", "🅰🅱" not in wk, failures)
     wab = format_weekly({"week_no": 2, "milestone": False, "milestone_weeks": 4,
                          "opened": 0, "open_now": 2, "invalidations": 0, "ladder_hits": 0,

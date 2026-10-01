@@ -179,8 +179,13 @@ py -3 run.py pos close ARB --price 0.90            # закрыть (P&L net-of-
 - On-chain поток (Dune) берётся из кэша, только если он моложе `onchain.max_age_hours`;
   иначе запрос перезапускается, а при отказе блок пуст (старые цифры не используются).
   Перезапуск через API с текущим ключом даёт 402 — без платного плана Dune блок пуст.
+- **Heartbeat** (`stage6_telegram.heartbeat`): `scan --notify` без алерта шлёт «✅ прогон
+  завершён, кандидатов нет» с контекстом рынка и ближайшими к порогу. Каждый завершённый
+  прогон даёт ровно одно сообщение; нет его в день прогона — прогон не дошёл до конца.
+  Если `scan`/`watch` падают исключением — приходит «⚠ прогон упал» с ошибкой.
 - `report --notify` — **недельная сводка форвард-теста** (без сети, из снапшотов):
   открыто/инвалидировано/уровни/трейлинги, агрегированный P&L paper и real.
+  `--if-due` — только если сводки этой недели ещё не было (так её зовёт ежедневный прогон).
 - `position_snapshots` — дневная история P&L каждой позиции (пишется watch):
   сырьё для кривой капитала и анализа качества входов через месяцы.
 
@@ -261,12 +266,13 @@ py -3 backtest/market_regime_study.py   # валидация входа/выхо
 
 ### Ежедневный запуск (Windows)
 
-`scripts/daily_run.ps1` — `scan` → `watch` с `--notify`, лог в `logs/daily_*.log`
-(хранится 30 дней); `watch` идёт и при сбое `scan`. Задачу Планировщика регистрирует
-`scripts/register_task.ps1` (по умолчанию 10:00, `-At "08:30"`, `-NoNotify` — без Telegram):
+`scripts/daily_run.ps1` — `scan` → `watch` → `report --if-due` с `--notify`, лог в
+`logs/daily_*.log` (хранится 30 дней); `watch` идёт и при сбое `scan`. Недельная сводка
+уходит первым прогоном недели (`stage6_telegram.weekly_report_weekday`, 0 = пн).
+Задачу Планировщика регистрирует `scripts/register_task.ps1` (по умолчанию 10:00, `-At "08:30"`, `-NoNotify` — без Telegram):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scriptsegister_task.ps1
+powershell -ExecutionPolicy Bypass -File scripts\register_task.ps1
 Start-ScheduledTask -TaskName AccumulationScannerDaily        # прогнать сейчас
 Unregister-ScheduledTask -TaskName AccumulationScannerDaily -Confirm:$false   # удалить
 ```

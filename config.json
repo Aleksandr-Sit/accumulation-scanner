@@ -154,7 +154,10 @@
     "max_alerts": 10,
     "daily_digest": true,
     "digest_max_positions": 20,
-    "alert_mute_days": 3
+    "alert_mute_days": 3,
+    "_heartbeat_note": "heartbeat: scan --notify без алерта шлёт «прогон завершён, кандидатов нет» — нет сообщения в день прогона = прогон не дошёл до конца. weekly_report_weekday: день недели (0 = пн) для report --if-due из ежедневного прогона; пропущен — уйдёт в первый прогон после.",
+    "heartbeat": true,
+    "weekly_report_weekday": 0
   },
 
   "stage7_positions": {

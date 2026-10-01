@@ -10,7 +10,7 @@ import json
 import time
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 _API = "https://api.telegram.org/bot"
 
@@ -326,6 +326,9 @@ def format_weekly(stats: dict, cfg) -> str:
     wk = stats.get("week_no", 0)
     wtag = f" · неделя {wk}" if wk else ""
     lines = [f"<b>🧪 Paper-статистика за неделю</b>{wtag} — {date.today().isoformat()}", ""]
+    if not wk:
+        lines.append(f"Paper ещё не стартовал: не было пружин с баллом ≥ "
+                     f"{cfg.get('stage7_positions.paper_min_score', 70)}.")
     lines.append(f"Открыто новых: {stats['opened']} · сейчас открыто: {stats['open_now']} "
                  f"· закрыто по сигналам: {stats.get('paper_closed', 0)}")
     lines.append(f"Сигналы: инвалидаций {stats['invalidations']}, "
@@ -402,13 +405,51 @@ def format_exit_alert(rows: list[dict], cfg) -> str | None:
     return "\n".join(lines)
 
 
-def notify(watchlist: list, cfg, market_ctx: dict | None = None) -> bool:
-    token = cfg.get("api_keys.telegram_token", "")
-    chat_id = cfg.get("api_keys.telegram_chat_id", "")
-    text = format_alert(watchlist, cfg, market_ctx)
-    if not text:
-        print("[telegram] нет кандидатов под критерии алерта")
-        return False
-    ok = send_message(token, chat_id, text)
-    print(f"[telegram] отправка: {'ok' if ok else 'fail'}")
-    return ok
+def format_heartbeat(watchlist: list, cfg, market_ctx: dict | None = None,
+                     muted: list | None = None, elapsed_sec: float | None = None) -> str:
+    """«Прогон прошёл, алерта нет» — уходит вместо алерта, когда слать нечего.
+
+    Правило: каждый завершённый scan --notify шлёт ровно одно сообщение (алерт или
+    это). Нет сообщения в день прогона = прогон не дошёл до конца (смотреть logs/).
+    muted — кандидаты, прошедшие фильтры, но заглушённые как повтор."""
+    t = cfg["stage6_telegram"]
+    zones = t.get("only_zones") or []
+    took = f" за {elapsed_sec / 60:.0f} мин" if isinstance(elapsed_sec, (int, float)) else ""
+    lines = [f"<b>🛰 Accumulation scan</b> — {date.today().isoformat()} · ✅ прогон завершён{took}"]
+    if market_ctx:
+        mc = format_market_ctx(market_ctx)
+        if mc:
+            lines.append(f"🌍 {mc}")
+    if muted:
+        syms = ", ".join(html.escape(c.symbol) for c in muted[:10])
+        lines.append(f"Новых кандидатов нет: {len(muted)} уже приходили за "
+                     f"{t.get('alert_mute_days', 3)} дн. ({syms}).")
+    else:
+        zone_s = "/".join(zones) if zones else "любая зона"
+        lines.append(f"Кандидатов под алерт нет ({zone_s}, балл ≥ {t.get('min_score', 0)}, "
+                     f"conf ≥ {t.get('min_confidence', 0.0)}).")
+    in_zone = [c for c in watchlist if not zones or c.zone in zones]   # watchlist по убыванию балла
+    near = ", ".join(f"{html.escape(c.symbol)} {c.score:g}" for c in in_zone[:3])
+    lines.append(f"Список наблюдения: {len(watchlist)} · в зоне: {len(in_zone)}"
+                 + (f" · ближе всех: {near}" if near else ""))
+    lines.append("")
+    lines.append("<i>Приходит каждый прогон без алерта. Нет ни алерта, ни этого сообщения "
+                 "в день прогона — прогон не завершился, смотреть logs/.</i>")
+    return "\n".join(lines)
+
+
+def format_failure(step: str, error: str) -> str:
+    """Шаг ежедневного прогона упал исключением — сообщаем, а не молчим."""
+    return (f"<b>⚠ Accumulation {html.escape(step)}</b> — {date.today().isoformat()} · "
+            f"прогон упал\n<code>{html.escape(error[:500])}</code>\n"
+            f"<i>Подробности — logs/daily_*.log.</i>")
+
+
+def weekly_due(last_ts: float | None, now: float, weekday: int = 0) -> bool:
+    """Пора ли недельной сводке: с начала текущей недели (последний `weekday` 00:00
+    по локальному времени, 0 = понедельник) сводки ещё не было. Ноутбук был выключен
+    в этот день — уйдёт в первый прогон после."""
+    d = datetime.fromtimestamp(now)
+    start = (d - timedelta(days=(d.weekday() - weekday) % 7)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return last_ts is None or last_ts < start.timestamp()
