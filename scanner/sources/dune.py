@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import calendar
 import http.client
 import json
 import time
@@ -35,22 +36,41 @@ def _req(url: str, key: str, method: str = "GET", timeout: int = 20):
         return None
 
 
-def fetch_query_rows(key: str, query_id: str | int,
-                     max_poll: int = 40, use_cached: bool = True) -> list[dict]:
-    """Строки результата Dune-запроса. use_cached=True -> сначала последний кэш
-    (0 кредитов), иначе/если пусто -> execute+poll."""
+def result_age_hours(d: dict | None, now: float | None = None) -> float | None:
+    """Возраст результата Dune в часах по execution_ended_at. None — поля нет/не разобрать."""
+    s = (d or {}).get("execution_ended_at") or ""
+    try:
+        ended = calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+    return ((now if now is not None else time.time()) - ended) / 3600.0
+
+
+def fetch_query_rows(key: str, query_id: str | int, max_poll: int = 40,
+                     use_cached: bool = True, max_age_hours: float = 20.0) -> list[dict]:
+    """Строки результата Dune-запроса. use_cached=True -> последний кэш (0 кредитов),
+    если он свежее max_age_hours; иначе execute+poll (~2 кредита).
+
+    Кэш Dune сам не обновляется: без проверки возраста скан месяцами брал результат
+    01.08.2026 и выдавал его за «поток за 7 дней». Не удалось обновить -> [] (блок
+    onchain пуст), устаревшее не используем."""
     if not key or not query_id:
         return []
-    # 1) дешёвый путь: последние кэшированные результаты
+    # 1) дешёвый путь: последние кэшированные результаты, если свежие
     if use_cached:
         d = _req(f"{_BASE}/query/{query_id}/results?limit=1000", key)
         rows = (((d or {}).get("result") or {}).get("rows")) if d else None
-        if rows:
+        age = result_age_hours(d)
+        if rows and age is not None and age <= max_age_hours:
             return rows
+        if rows:
+            shown = f"{age:.0f} ч" if age is not None else "возраст неизвестен"
+            print(f"[dune] кэш запроса устарел ({shown}, порог {max_age_hours:g} ч) — перезапуск")
     # 2) выполнить и опросить
     ex = _req(f"{_BASE}/query/{query_id}/execute", key, method="POST")
     exec_id = (ex or {}).get("execution_id")
     if not exec_id:
+        print("[dune] перезапуск не удался — on-chain блок в этом прогоне пуст")
         return []
     for _ in range(max_poll):
         st = _req(f"{_BASE}/execution/{exec_id}/status", key)
@@ -97,4 +117,5 @@ def fetch_onchain(cfg, http=None) -> dict[str, dict]:
     qid = cfg.get("onchain.dune_query_id", "")
     if not key or not qid:
         return {}
-    return build_onchain_map(fetch_query_rows(key, qid))
+    max_age = cfg.get("onchain.max_age_hours", 20)
+    return build_onchain_map(fetch_query_rows(key, qid, max_age_hours=max_age))

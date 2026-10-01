@@ -419,6 +419,7 @@ def run_watch(cfg: Config) -> dict:
         signals = exit_stage.evaluate_exit(pos, last_close, hwm, indicators,
                                            triggered, cfg, recent_closes=prices,
                                            market=market_in)
+        pnl_at_signal = exit_stage.position_pnl(pos, last_close)   # до paper-исполнения
         executed: list[str] = []
         for s in signals:
             pstore.record_event(pos["id"], s["type"], last_close, s["note"])
@@ -442,13 +443,15 @@ def run_watch(cfg: Config) -> dict:
 
         oc = onchain.match_onchain(onchain_map, pos["symbol"], pos.get("address"))
         rows.append({
-            "position": cur, "last_price": last_close, "hwm": hwm,
-            "pnl": pnl,
+            "position": cur, "last_price": last_close, "last_ts": ts[-1], "hwm": hwm,
+            "pnl": pnl, "pnl_at_signal": pnl_at_signal,
             "realized_usdt": round(cur.get("realized_usdt") or 0.0, 2),
             "held_days": exit_stage.held_days(pos, now),
             "signals": signals, "executed": executed,
             "spark_prices": since_entry if since_entry else prices[-30:],
-            "triggered": triggered,
+            # с учётом сигналов этого прогона — иначе дайджест покажет ближайшим
+            # уровень лестницы, который только что сработал
+            "triggered": triggered | {s["type"] for s in signals},
             "net_flow_usd_7d": (oc or {}).get("net_flow_usd_7d"),
         })
 

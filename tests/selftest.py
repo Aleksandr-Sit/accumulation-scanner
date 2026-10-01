@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import time
+
 from scanner.config import load_config
 from scanner.models import Candidate
 from scanner.positions import PositionStore, risk_check
@@ -462,6 +464,46 @@ def test_onchain(cfg, failures: list[str]) -> None:
     nokey.setdefault("api_keys", {})["dune"] = ""
     _check("нет Dune-ключа -> {} (нейтрально)", fetch_onchain(Config(nokey)) == {}, failures)
 
+    # Свежесть кэша Dune: результат 01.08 не должен выдаваться за «поток за 7 дней».
+    from scanner.sources import dune as dune_mod
+    t_end = 1785557555.0   # 2026-08-01T04:12:35Z
+    age = dune_mod.result_age_hours({"execution_ended_at": "2026-08-01T04:12:35.665028366Z"},
+                                    now=t_end + 3 * 3600)
+    _check("возраст Dune: наносекунды+Z разбираются, 3 ч", age is not None and abs(age - 3) < 0.01,
+           failures)
+    _check("возраст Dune: нет поля -> None", dune_mod.result_age_hours({}) is None, failures)
+
+    def _fake_dune(cached_ended: str, exec_ok: bool):
+        calls: list[str] = []
+        def fake(url, key, method="GET", timeout=20):
+            calls.append(method + " " + url.split("/api/v1")[-1])
+            if url.endswith("/results?limit=1000") and "/query/" in url:
+                return {"execution_ended_at": cached_ended,
+                        "result": {"rows": [{"symbol": "OLD"}]}}
+            if url.endswith("/execute"):
+                return {"execution_id": "E1"} if exec_ok else None
+            if url.endswith("/status"):
+                return {"state": "QUERY_STATE_COMPLETED"}
+            return {"result": {"rows": [{"symbol": "NEW"}]}}
+        return fake, calls
+
+    real_req = dune_mod._req
+    try:
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 3600))
+        dune_mod._req, calls = _fake_dune(now_iso, exec_ok=True)
+        rows = dune_mod.fetch_query_rows("k", 1, max_age_hours=20)
+        _check("Dune: свежий кэш (1 ч) -> без перезапуска",
+               rows == [{"symbol": "OLD"}] and not any("execute" in c for c in calls), failures)
+        dune_mod._req, calls = _fake_dune("2026-08-01T04:12:35.665Z", exec_ok=True)
+        rows = dune_mod.fetch_query_rows("k", 1, max_age_hours=20)
+        _check("Dune: старый кэш -> перезапуск и новые строки",
+               rows == [{"symbol": "NEW"}] and any("execute" in c for c in calls), failures)
+        dune_mod._req, _ = _fake_dune("2026-08-01T04:12:35.665Z", exec_ok=False)
+        _check("Dune: старый кэш и перезапуск не удался -> [] (старое не берём)",
+               dune_mod.fetch_query_rows("k", 1, max_age_hours=20) == [], failures)
+    finally:
+        dune_mod._req = real_req
+
     # Блок onchain в скоре теперь читает onchain_score (не всегда None).
     from scanner.stages.score import compute_score
     c = Candidate(source="t", track="A", symbol="OC", zone="ПРУЖИНА/ДНО",
@@ -716,6 +758,23 @@ def test_telegram_format(cfg, failures: list[str]) -> None:
                              "hot": {"n_lit": 0, "avail": 8, "lit": [], "near": ["fng30"]}})
     _check("новый контекст: альты · BTC · перегрев 0/8 (близко) · BTC.D",
            mc2 == "альты −42% · BTC −33% · перегрев 0/8 (близко: F&G) · F&G 45 · BTC.D 58%", failures)
+    # Обновление рынка не удалось и последний день старый -> дата вместо «как будто сегодня».
+    day = 1790812800.0   # 2026-10-01 00:00 UTC
+    old = format_market_ctx({"alt_dd": 0.42, "day": day}, now=day + 5 * 86400)
+    _check("контекст старше 2 дней помечен датой", old.endswith("⚠ рынок на 01.10"), failures)
+    fresh_ctx = format_market_ctx({"alt_dd": 0.42, "day": day}, now=day + 10 * 3600)
+    _check("свежий контекст без пометки", "⚠" not in fresh_ctx, failures)
+
+    # select_picks = ровно то, что в сообщении (по нему пишется mute): СЕРЕДИНА со
+    # score ≥ порога и монеты за max_alerts не глушатся, так и не придя.
+    from scanner.notify.telegram import select_picks
+    picks = select_picks(cands, cfg)
+    _check("select_picks: только ICP (MID из СЕРЕДИНЫ не глушим)",
+           [c.symbol for c in picks] == ["ICP"], failures)
+    many = [Candidate(source="t", track="A", symbol=f"S{i}", zone="ПРУЖИНА/ДНО",
+                      score=90.0 - i, confidence=0.9) for i in range(15)]
+    cap = cfg["stage6_telegram"]["max_alerts"]
+    _check("select_picks: не больше max_alerts", len(select_picks(many, cfg)) == cap, failures)
 
 
 def test_exit(cfg, failures: list[str]) -> None:
@@ -960,6 +1019,36 @@ def test_exit_alert_format(cfg, failures: list[str]) -> None:
     _check("дайджест: ближайший уровень лестницы", "+50%" in (dig or ""), failures)
     _check("дайджест: суммы real/paper", "Σ" in (dig or ""), failures)
     _check("дайджест: пусто -> None", format_digest([], cfg) is None, failures)
+
+    # Цены watch — дневное закрытие, не текущая цена: подпись с датой; застрявшая цена
+    # (CoinGecko перестал обновлять монету) помечается.
+    day = 1790812800.0   # 2026-10-01 00:00 UTC
+    for r in drows:
+        r["last_ts"] = day
+    drows[1]["last_ts"] = day - 5 * 86400
+    dig2 = format_digest(drows, cfg) or ""
+    _check("дайджест: подпись «закрытие 01.10 00:00 UTC»", "закрытие 01.10 00:00 UTC" in dig2,
+           failures)
+    _check("дайджест: застрявшая цена помечена датой", "⚠ закрытие 26.09" in dig2, failures)
+
+    # Paper-позиция выбита стопом в этом прогоне: qty=0, P&L остатка «+0.0%» — врёт.
+    # Алерт берёт P&L на момент сигнала, дайджест — итог сделки.
+    closed = {"position": {"symbol": "STOP", "entry_price": 1.0, "qty": 0.0, "base_low": 0.9,
+                           "is_paper": 1, "status": "closed"},
+              "last_price": 0.6, "last_ts": day, "hwm": 1.1,
+              "pnl": {"pnl_pct": 0.0, "pnl_usdt": 0.0, "value_usdt": 0.0},
+              "pnl_at_signal": {"pnl_pct": -40.2, "pnl_usdt": -40.2, "value_usdt": 59.9},
+              "realized_usdt": -40.2, "held_days": 20, "triggered": {"invalidation"},
+              "executed": ["invalidation: выход, realized -40.20"],
+              "signals": [{"type": "invalidation", "urgency": "high",
+                           "action": "ВЫЙТИ ПОЛНОСТЬЮ", "note": "пробила лоу базы"}]}
+    ex = format_exit_alert([closed], cfg) or ""
+    _check("exit-алерт: P&L на момент сигнала (−40.2%), не +0.0%",
+           "-40.2%" in ex and "+0.0%" not in ex, failures)
+    _check("exit-алерт: строка paper-исполнения", "⚙ paper: invalidation" in ex, failures)
+    dig3 = format_digest([closed], cfg) or ""
+    _check("дайджест: закрытая в прогоне -> realized, без +0.0%",
+           "закрыта по сигналу" in dig3 and "-40.20" in dig3 and "+0.0%" not in dig3, failures)
 
     # Недельная сводка (обычная неделя): счётчик + напоминание + отсчёт до итога.
     wk = format_weekly({"week_no": 2, "milestone": False, "milestone_weeks": 4,

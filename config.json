@@ -214,6 +214,8 @@
   "onchain": {
     "_comment": "On-chain накопление через Dune (опц.). dune_query_id — id твоего Dune-запроса, отдающего таблицу: symbol|token_address, net_flow_usd_7d (<0=отток=накопление), holders_change_pct_7d. Ключ — DUNE_API_KEY в .env. Пусто = блок onchain выключен (как раньше). Пороги [оценка]. 8178559 = ERC20 нетто-поток на биржи 7д (Ethereum).",
     "dune_query_id": "8178559",
+    "_max_age_note": "Кэш результата Dune сам не обновляется. Старше max_age_hours — запрос перезапускается (~2.2 кредита за запуск, раз в день ≈ 65/мес из 2500 бесплатных); не удалось — блок onchain пуст, старые цифры не используются.",
+    "max_age_hours": 20,
     "flow_big_ratio": 0.10,
     "flow_small_ratio": 0.03,
     "flow_sanity_cap": 0.5,

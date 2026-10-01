@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import html
 import json
+import time
 import urllib.parse
 import urllib.request
-from datetime import date
+from datetime import date, datetime, timezone
 
 _API = "https://api.telegram.org/bot"
 
@@ -66,16 +67,33 @@ def _market_zone_label(mdd: float) -> str:
     return "средняя зона"
 
 
-def format_market_ctx(ctx: dict) -> str:
+_STALE_DAYS = 2   # дневные данные старше — помечаем датой, а не выдаём за текущие
+
+
+def _day_label(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%d.%m")
+
+
+def _is_stale(ts, now: float | None = None) -> bool:
+    return (isinstance(ts, (int, float))
+            and (now if now is not None else time.time()) - ts > _STALE_DAYS * 86400)
+
+
+def format_market_ctx(ctx: dict, now: float | None = None) -> str:
     """Строка рыночного контекста для шапки алерта.
 
     Новый формат (summary["market_ctx"] из market_daily): «альты −42% · BTC −33% ·
     перегрев 0/8 (близко: …) · F&G · BTC.D». Старый (только /global + market_dd) —
-    фолбэк, если таблица рынка пуста.
+    фолбэк, если таблица рынка пуста. Обновление market_daily не удалось и последний
+    день старый — помечаем «⚠ рынок на DD.MM».
     """
     from ..regime import context_line
     if "alt_dd" in ctx or "hot" in ctx:
-        return context_line(ctx)
+        line = context_line(ctx)
+        day = ctx.get("day")
+        if line and _is_stale(day, now):
+            line += f" · ⚠ рынок на {_day_label(day)}"
+        return line
     parts = []
     mdd = ctx.get("market_dd")
     if isinstance(mdd, (int, float)):
@@ -114,20 +132,25 @@ def coin_line(c) -> str:
     return " · ".join(out)
 
 
-def format_alert(watchlist: list, cfg, market_ctx: dict | None = None) -> str | None:
-    """Формирует HTML-сообщение из топ кандидатов по фильтрам stage6_telegram."""
+def select_picks(watchlist: list, cfg) -> list:
+    """Кандидаты, которые реально попадут в алерт (фильтры stage6_telegram + лимит).
+    Им же пишется mute: монета, которой не было в сообщении, не должна глушиться."""
     t = cfg["stage6_telegram"]
     zones = set(t.get("only_zones") or [])
     min_score = t.get("min_score", 0)
     min_conf = t.get("min_confidence", 0.0)
-    max_alerts = t.get("max_alerts", 10)
-
     picks = [c for c in watchlist
              if c.score >= min_score and c.confidence >= min_conf
              and (not zones or c.zone in zones)]
+    return picks[:t.get("max_alerts", 10)]
+
+
+def format_alert(watchlist: list, cfg, market_ctx: dict | None = None) -> str | None:
+    """Формирует HTML-сообщение из топ кандидатов по фильтрам stage6_telegram."""
+    min_score = cfg["stage6_telegram"].get("min_score", 0)
+    picks = select_picks(watchlist, cfg)
     if not picks:
         return None
-    picks = picks[:max_alerts]
 
     lines = [f"<b>🛰 Accumulation scan</b> — {date.today().isoformat()}"]
     if market_ctx:
@@ -214,6 +237,15 @@ def _dist_pct(target: float, price: float) -> str:
     return f"{(target / price - 1) * 100:+.0f}%"
 
 
+def _close_label(rows: list[dict]) -> list[str]:
+    """Строка «цены — закрытие 00:00 UTC DD.MM»: watch считает по последнему ЗАКРЫТОМУ
+    дневному закрытию CoinGecko, а не по текущей цене — иначе цифры путают с биржей."""
+    ts = [r["last_ts"] for r in rows if isinstance(r.get("last_ts"), (int, float))]
+    if not ts:
+        return []
+    return [f"<i>цены — дневное закрытие {_day_label(max(ts))} 00:00 UTC, не текущие</i>"]
+
+
 def format_digest(rows: list[dict], cfg) -> str | None:
     """Ежедневный дайджест ВСЕХ позиций (не только с сигналами): вход → текущая,
     P&L, спарклайн с момента входа, расстояния до инвалидации и уровней лестницы.
@@ -226,7 +258,9 @@ def format_digest(rows: list[dict], cfg) -> str | None:
     cap = t.get("digest_max_positions", 20)
     e = cfg["stage8_exit"]
     inv_pct = e["invalidation_below_base_low_pct"] / 100.0
-    lines = [f"<b>📊 Позиции</b> — {date.today().isoformat()}", ""]
+    lines = [f"<b>📊 Позиции</b> — {date.today().isoformat()}"]
+    lines += _close_label(ok)
+    lines.append("")
     total_real = total_paper = 0.0
     ordered = sorted(ok, key=lambda x: (x["position"].get("is_paper", 0),
                                         -x["pnl"]["pnl_pct"]))
@@ -234,12 +268,20 @@ def format_digest(rows: list[dict], cfg) -> str | None:
         p, pnl = r["position"], r["pnl"]
         tag = "📝" if p.get("is_paper") else "💰"
         sym = html.escape(p["symbol"])
+        if p.get("status") == "closed":
+            # paper-позиция закрыта исполнением сигнала в этом прогоне: P&L остатка
+            # (qty=0) был бы «+0.0%» — показываем итог сделки.
+            lines.append(f"{tag} <b>{sym}</b>  закрыта по сигналу · realized "
+                         f"{r.get('realized_usdt') or 0.0:+.2f} USDT")
+            continue
         spark = sparkline(r.get("spark_prices") or [])
         lines.append(f"{tag} <b>{sym}</b>  {pnl['pnl_pct']:+.1f}% "
                      f"({r.get('held_days', '?')}д)  <code>{spark}</code>")
         price, hwm = r["last_price"], r["hwm"]
         dd_hwm = (1 - price / hwm) * 100 if hwm > 0 else 0.0
-        lines.append(f"   {p['entry_price']:.6g} → {price:.6g} · "
+        old = (f" (⚠ закрытие {_day_label(r['last_ts'])}, свежих цен нет)"
+               if _is_stale(r.get("last_ts")) else "")
+        lines.append(f"   {p['entry_price']:.6g} → {price:.6g}{old} · "
                      f"hwm {hwm:.6g} (−{dd_hwm:.0f}%)")
         dists = []
         bl = p.get("base_low")
@@ -337,10 +379,14 @@ def format_exit_alert(rows: list[dict], cfg) -> str | None:
     hot = [r for r in rows if r.get("signals")]
     if not hot:
         return None
-    lines = [f"<b>📤 Exit watch</b> — {date.today().isoformat()}", ""]
+    lines = [f"<b>📤 Exit watch</b> — {date.today().isoformat()}"]
+    lines += _close_label(hot)
+    lines.append("")
     for r in hot:
         p = r["position"]
-        pnl = r.get("pnl") or {}
+        # P&L на момент сигнала: после paper-исполнения остаток может быть 0 шт.,
+        # и пост-фактум P&L показал бы «+0.0%» у позиции, выбитой стопом.
+        pnl = r.get("pnl_at_signal") or r.get("pnl") or {}
         sym = html.escape(p["symbol"])
         tag = "📝 " if p.get("is_paper") else "💰 "
         lines.append(f"{tag}<b>{sym}</b>  {pnl.get('pnl_pct', 0):+.1f}% "
@@ -349,6 +395,8 @@ def format_exit_alert(rows: list[dict], cfg) -> str | None:
             em = _URGENCY_EMOJI.get(s.get("urgency", "low"), "•")
             lines.append(f"  {em} <b>{html.escape(s['action'])}</b>")
             lines.append(f"     {html.escape(s['note'])}")
+        for ex in r.get("executed") or []:
+            lines.append(f"  ⚙ paper: {html.escape(ex)} USDT")
         lines.append("")
     lines.append("<i>Сигнал — алерт для ручного решения, не ордер. Издержки учтены в P&L.</i>")
     return "\n".join(lines)

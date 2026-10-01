@@ -77,10 +77,10 @@ def cmd_scan(args) -> int:
             mctx = fetch_global(_make_http(cfg), cfg.get("api_keys.coingecko_demo", ""))
             mctx["market_dd"] = rows[0].get("market_dd") if rows else None
         if telegram.notify(fresh, cfg, mctx):
-            min_s = cfg.get("stage6_telegram.min_score", 70)
-            for c in fresh:
-                if c.score >= min_s:
-                    st.record_alert(c.symbol, c.score)
+            # mute только тем, кто был в сообщении: раньше писались все score ≥ порога,
+            # и монета из СЕРЕДИНЫ / за лимитом max_alerts глушилась, так и не придя.
+            for c in telegram.select_picks(fresh, cfg):
+                st.record_alert(c.symbol, c.score)
         st.close()
     return 0
 
