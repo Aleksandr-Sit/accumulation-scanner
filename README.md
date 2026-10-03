@@ -1,9 +1,9 @@
-# Accumulation Scanner — MVP
+# Accumulation Scanner
 
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![Zero-dependency](https://img.shields.io/badge/dependencies-stdlib_only-success)
 ![SQLite](https://img.shields.io/badge/SQLite-storage-003B57?logo=sqlite&logoColor=white)
-![status](https://img.shields.io/badge/status-MVP-yellow)
+![status](https://img.shields.io/badge/status-daily_runs_since_Jul_2026-brightgreen)
 ![last commit](https://img.shields.io/github/last-commit/Aleksandr-Sit/accumulation-scanner)
 
 Автосканер кандидатов под откуп у дна: многостадийная воронка
@@ -28,7 +28,7 @@
 а не по одному замеру. В Telegram уходят карточки на действие и сводка дня — её отсутствие
 в день прогона само по себе сигнал, что прогон упал.
 
-## Что уже делает (MVP)
+## Что уже делает
 
 | Stage | Модуль | Действие |
 |-------|--------|----------|
