@@ -14,8 +14,10 @@ from .positions import PositionStore
 from .sources import coingecko, newtokens
 from .sources.goplus import fetch_goplus, fetch_honeypot_is
 from .sources import defillama
-from .sources.bybit import fetch_spot_basecoins, fetch_daily_closes
+from .sources.bybit import (fetch_spot_basecoins, fetch_daily_closes, fetch_spot_prices,
+                            same_coin)
 from .sources.funding import fetch_funding_map
+from .sources import github
 from . import regime
 from .stages import (antirug, entry_quality, exit as exit_stage, fundamentals,
                     liveness, onchain, zone, score)
@@ -163,17 +165,25 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
 
     # Stage 4 — зона (дно/пик) из истории цены+объёма, режим BTC, гейт доступа РФ.
     n_zone = 0
+    n_dev = 0
     btc_regime: dict = {"regime": "?"}
+    unavailable: set[str] = set()
     if cfg.get("stage4_zone.enabled", True) and watchlist:
         demo = cfg.get("api_keys.coingecko_demo", "")
         days = cfg["stage4_zone"]["price_history_days"]
         recent = cfg["stage4_zone"]["recent_days"]
         sma = cfg["stage4_zone"]["sma_days"]
         bybit_spot = fetch_spot_basecoins(http)
+        bybit_px = fetch_spot_prices(http)    # сверка тикера: та же ли монета на Bybit
         funding = fetch_funding_map(http)     # 1 вызов на все перпы (сигнал дна/вершины)
         onchain_map = dune.fetch_onchain(cfg)  # {} если Dune-ключ/query не заданы
+        if not onchain_map:
+            # Источник не ответил ни по одной монете (Dune 402) — дыра общая, в confidence
+            # не считается (иначе «conf 0.9» у всех и ни о чём не говорит).
+            unavailable.add("onchain")
         extras = coin_extras.load(cfg, http)   # выручка/OI/делистинги/Coinbase: 4 вызова
         hard = cfg.get("stage4_zone.rf_hard_gate", False)
+        use_github = cfg.get("stage3b_liveness.github", True)
 
         # Режим BTC из Bybit klines (1000 дней) — надёжнее CoinGecko (без 429),
         # окно шире = drawdown от ATH цикла. Fallback на CoinGecko при пустом ответе.
@@ -189,9 +199,15 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
             c.indicators = zone.compute_indicators(
                 chart["prices"], recent, sma, chart["volumes"]) or {}
             # Stage 3b — живость: dev-активность + широта листингов + wash-ratio.
+            # Разработка — из GitHub по ссылкам CoinGecko (developer_data CoinGecko убрал).
             if live_on:
                 detail = coingecko.fetch_coin_detail(http, c.coin_id, demo)
-                liveness.assess_liveness(c, detail, cfg)
+                dev = None
+                if use_github:
+                    links = github.repo_links(detail)
+                    dev = {**github.fetch_dev(http, links), "links": links} if links else {}
+                liveness.assess_liveness(c, detail, cfg, dev)
+                n_dev += c.dev_commits_4w is not None or c.dev_last_commit_days is not None
             c.zone, c.zone_signals = zone.classify_zone(
                 c.indicators or None, c.drawdown_from_ath_pct, cfg)
             if extras:
@@ -206,7 +222,13 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
             c.alt_market_dd = mctx.get("alt_dd")
             c.market_hot_score = mhot.get("score")
             c.market_hot_lit = list(mhot.get("lit") or [])
-            c.funding_rate = funding.get(c.symbol.upper())
+            sym = c.symbol.upper()
+            # Тикер совпал, а цена Bybit расходится с CoinGecko больше чем на 25% — это
+            # другая монета под тем же символом: не Bybit spot и не её фандинг.
+            mismatch = sym in bybit_spot and same_coin(bybit_px.get(sym), c.price_usd) is False
+            if mismatch:
+                c.flags.append("bybit_ticker_mismatch")
+            c.funding_rate = None if mismatch else funding.get(sym)
             # On-chain накопление (Dune): по адресу, затем по symbol; наполняет блок onchain.
             oc = onchain.match_onchain(onchain_map, c.symbol, c.address)
             if oc:
@@ -222,7 +244,8 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
             if btc_regime["regime"] == "BULL" and c.zone == "ПРУЖИНА/ДНО":
                 c.flags.append("dd_in_bull_market")
 
-            c.rf_access, c.rf_venue = rf_gate(c.symbol, c.chain, c.address, bybit_spot)
+            c.rf_access, c.rf_venue = rf_gate(c.symbol, c.chain, c.address,
+                                              bybit_spot - {sym} if mismatch else bybit_spot)
             if c.rf_venue == "DEX only":
                 c.flags.append("rf_dex_only")
             n_zone += 1
@@ -235,7 +258,7 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
     # Stage 5 — композитный скор 0–100 + confidence.
     if cfg.get("stage5_score.enabled", True):
         for c in watchlist:
-            c.score, c.confidence, c.score_breakdown = score.compute_score(c, cfg)
+            c.score, c.confidence, c.score_breakdown = score.compute_score(c, cfg, unavailable)
 
     # Ранжирование: по баллу, затем по доверию, затем глубже просадка.
     watchlist.sort(key=lambda c: (-c.score, -c.confidence,
@@ -249,7 +272,11 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
         if c.spring_prefilter and c.coin_id:
             metric_targets.setdefault(id(c), c)
     store.save_metrics(run_id, list(metric_targets.values()))
-    store.finish_run(run_id, len(ingested), len(passed1), len(watchlist))
+    store.finish_run(run_id, len(ingested), len(passed1), len(watchlist),
+                     {"elapsed_sec": round(time.time() - t0, 1),
+                      "unavailable": sorted(unavailable),
+                      "dev_github": f"{n_dev} из {n_zone}" if n_zone else None,
+                      "btc_dd": btc_regime.get("drawdown")})
     store.close()
 
     # Paper-режим: авто-открытие виртуальных позиций по топ-пружинам — фоновый
@@ -285,8 +312,33 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
         "market_ctx": {**mctx, "btc_dd": btc_regime.get("drawdown")} if mctx else {},
         "paper_opened": n_paper,
         "top_score": round(max((c.score for c in watchlist), default=0.0), 1),
+        "dev_github": f"{n_dev} из {n_zone}",
+        "unavailable": sorted(unavailable),
     }
     return summary
+
+
+def load_watchlist(path: str) -> list[Candidate]:
+    """watchlist.json -> кандидаты (все поля модели, что есть в файле). Для Telegram и
+    команд, которые работают по итогам последнего скана без сети."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        rows = json.loads(p.read_text(encoding="utf-8"))
+    except ValueError:
+        return []
+    fields = Candidate.__dataclass_fields__
+    out = []
+    for r in rows:
+        kw = {k: v for k, v in r.items() if k in fields and v is not None}
+        kw.setdefault("source", "wl")
+        kw.setdefault("track", r.get("track") or "")
+        kw.setdefault("symbol", r.get("symbol") or "")
+        if "spring" in r:
+            kw["spring_prefilter"] = bool(r["spring"])
+        out.append(Candidate(**kw))
+    return out
 
 
 def _open_paper_positions(cfg: Config, watchlist: list[Candidate],
@@ -471,10 +523,13 @@ def _write_watchlist(cfg: Config, watchlist: list[Candidate]) -> None:
             "address": c.address, "track": c.track, "coin_id": c.coin_id,
             "score": c.score, "confidence": c.confidence,
             "score_breakdown": c.score_breakdown,
+            # цена и ATH на момент скана — без них Telegram не покажет ни цену, ни уровни
+            "price_usd": c.price_usd, "ath": c.ath,
             "market_cap": c.market_cap, "fdv": c.fdv,
             "volume_24h": c.volume_24h, "liquidity_usd": c.liquidity_usd,
             "liveness_score": c.liveness_score, "liveness_notes": c.liveness_notes,
-            "dev_commits_4w": c.dev_commits_4w, "n_exchanges": c.n_exchanges,
+            "dev_commits_4w": c.dev_commits_4w, "dev_contributors": c.dev_contributors,
+            "dev_last_commit_days": c.dev_last_commit_days, "n_exchanges": c.n_exchanges,
             "on_cex": c.on_cex, "holder_count": c.holder_count,
             "lp_locked_pct": c.lp_locked_pct, "wash_ratio": c.wash_ratio,
             "drawdown_from_ath_pct": c.drawdown_from_ath_pct,

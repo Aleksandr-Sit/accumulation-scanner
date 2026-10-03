@@ -185,6 +185,18 @@ class PositionStore:
             ") m ON s.position_id=m.position_id AND s.ts=m.mt")
         return {r[0]: _row_to_dict(cur, r) for r in cur.fetchall()}
 
+    def snapshot_prices(self, position_id: int) -> list[tuple[float, float]]:
+        """[(ts, цена)] всех снапшотов позиции по времени — спарклайн сводки дня."""
+        cur = self.conn.execute("SELECT ts, price FROM position_snapshots WHERE position_id=? "
+                                "AND price IS NOT NULL ORDER BY ts", (position_id,))
+        return [(r[0], r[1]) for r in cur.fetchall()]
+
+    def closed_since(self, ts: float) -> list[dict[str, Any]]:
+        """Позиции, закрытые с момента ts (paper, выбитые сигналом в сегодняшнем watch)."""
+        cur = self.conn.execute("SELECT * FROM positions WHERE status='closed' AND closed_ts>=? "
+                                "ORDER BY id", (ts,))
+        return [_row_to_dict(cur, r) for r in cur.fetchall()]
+
     def events_since(self, ts: float) -> list[dict[str, Any]]:
         cur = self.conn.execute(
             "SELECT e.*, p.symbol, p.is_paper, COALESCE(p.variant,'A') AS variant "

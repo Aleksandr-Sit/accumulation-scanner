@@ -35,8 +35,9 @@ class Candidate:
 
     # --- живость / listings / LP (Stage 3b) ---
     dev_commits_4w: int | None = None      # коммиты за 4 недели (0 = проект встал)
-    dev_contributors: int | None = None
+    dev_contributors: int | None = None    # GitHub: разных авторов за 4 недели
     dev_stars: int | None = None
+    dev_last_commit_days: int | None = None  # GitHub: дней с последнего коммита/push
     n_exchanges: int | None = None         # число рынков (CoinGecko tickers)
     on_cex: bool = False                   # есть ли CEX-листинг (не только DEX)
     holder_count: int | None = None        # число холдеров (GoPlus)

@@ -50,9 +50,13 @@ def wash_ratio(volume_24h: float | None, liquidity_usd: float | None) -> float |
     return round(volume_24h / liquidity_usd, 1)
 
 
-def assess_liveness(c, detail: dict, cfg: Config) -> None:
+def assess_liveness(c, detail: dict, cfg: Config, dev: dict | None = None) -> None:
     """Проставляет c.dev_*, c.n_exchanges, c.on_cex, c.wash_ratio, c.liveness_score,
-    c.liveness_notes (in place). Чистая логика поверх detail + полей кандидата."""
+    c.liveness_notes (in place). Чистая логика поверх detail + полей кандидата.
+
+    dev — активность из GitHub (sources/github.fetch_dev): CoinGecko с 09.2026 не отдаёт
+    developer_data, и без этого блок разработки был пуст у всех монет. Лента commits.atom
+    содержит ~20 последних коммитов, поэтому «20» читается как «20 и больше»."""
     L = cfg.get("stage3b_liveness", {}) or {}
     dl = extract_dev_listings(detail) if detail else {}
     c.dev_commits_4w = dl.get("dev_commits_4w")
@@ -61,6 +65,10 @@ def assess_liveness(c, detail: dict, cfg: Config) -> None:
     c.n_exchanges = dl.get("n_exchanges")
     c.on_cex = bool(dl.get("on_cex"))
     c.wash_ratio = wash_ratio(c.volume_24h, c.liquidity_usd)
+    if c.dev_commits_4w is None and dev:
+        c.dev_commits_4w = dev.get("commits_4w")
+        c.dev_contributors = dev.get("authors_4w")
+        c.dev_last_commit_days = dev.get("last_commit_days")
 
     notes: list[str] = []
     s = 0.0
@@ -68,20 +76,36 @@ def assess_liveness(c, detail: dict, cfg: Config) -> None:
 
     # --- Разработка (если репозиторий привязан) ---
     commits = c.dev_commits_4w
-    if commits is not None:
+    last_days = getattr(c, "dev_last_commit_days", None)
+    if commits:
         present = True
+        shown = f"{commits}+" if dev and commits >= 20 else f"{commits}"
         if commits >= L.get("commits_active", 20):
-            s += 3.0; notes.append(f"[проверено] dev активен: {commits} коммитов/4нед")
+            s += 3.0; notes.append(f"[проверено] dev активен: {shown} коммитов/4нед")
         elif commits >= L.get("commits_alive", 3):
             s += 2.0; notes.append(f"[проверено] dev жив: {commits} коммитов/4нед")
-        elif commits >= 1:
-            s += 1.0; notes.append(f"[проверено] dev вялый: {commits} коммитов/4нед")
         else:
-            notes.append("⚠ dev встал: 0 коммитов/4нед")
+            s += 1.0; notes.append(f"[проверено] dev вялый: {commits} коммитов/4нед")
         if isinstance(c.dev_contributors, int) and c.dev_contributors >= 3:
             s += 1.0
         if isinstance(c.dev_stars, int) and c.dev_stars >= 500:
             s += 1.0
+    elif commits == 0 and not isinstance(last_days, int):
+        present = True
+        notes.append("⚠ dev встал: 0 коммитов/4нед")
+    elif isinstance(last_days, int):
+        # Ссылка на организацию (известна только дата push) или 0 коммитов за 4 недели в
+        # основной ветке: многие (TON) ведут разработку в другой ветке и сливают релизами —
+        # «встал» только если коммитов нет дольше last_commit_stale_days.
+        present = True
+        if last_days <= L.get("last_commit_alive_days", 30):
+            s += 2.0; notes.append(f"[проверено] dev жив: последний коммит {last_days} дн. назад")
+        elif last_days <= L.get("last_commit_stale_days", 180):
+            s += 1.0; notes.append(f"[проверено] dev вялый: последний коммит {last_days} дн. назад")
+        else:
+            notes.append(f"⚠ код не обновлялся {last_days} дн. (мог переехать — проверить)")
+    elif dev is not None and dev.get("links"):
+        notes.append("[нет данных] GitHub не ответил")
     else:
         notes.append("[нет данных] GitHub не привязан (нормально для мемкоинов)")
 

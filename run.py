@@ -7,6 +7,8 @@
   python run.py pos list                    # открытые позиции
   python run.py pos close ARB --price 1.2   # закрыть (P&L в журнал)
   python run.py watch [--notify]            # ре-скан позиций -> exit-сигналы
+  python run.py brief [--notify]            # сводка дня (без сети) — последним шагом прогона
+  python run.py card GRAM [--notify]        # карточка монеты: лестница, стоп, цели, картинка
   python run.py ladder LINK --budget 50      # план лестницы под Bybit spot (без ордеров)
   python run.py market [--backfill]         # история рынка альтов + индекс перегрева
   python run.py selftest                    # офлайн-проверка логики на фикстурах
@@ -21,10 +23,12 @@ from scanner.pipeline import run_scan, run_watch
 
 
 def cmd_scan(args) -> int:
+    import time as _t
     cfg = load_config(args.config)
     if args.pages is not None:
         cfg["universe"]["track_a_pages"] = args.pages
     print(f"[scan] track={args.track} limit={args.limit} pages={cfg['universe']['track_a_pages']} — старт")
+    t_start = _t.time()
     try:
         summary = run_scan(cfg, track=args.track, limit=args.limit)
     except Exception as e:
@@ -39,73 +43,46 @@ def cmd_scan(args) -> int:
     print(f"База      → {cfg['output']['db_path']}")
 
     if args.notify:
-        import json as _json
-        from scanner.notify import telegram
-        from scanner.models import Candidate
-        rows = _json.loads(open(cfg["output"]["watchlist_json"], encoding="utf-8").read())
-        cands = [Candidate(source="wl", track=r.get("track", ""), symbol=r.get("symbol", ""),
-                           name=r.get("name", ""), score=r.get("score", 0.0),
-                           confidence=r.get("confidence", 0.0), zone=r.get("zone", ""),
-                           rf_venue=r.get("rf_venue", ""), category=r.get("category", ""),
-                           drawdown_from_ath_pct=r.get("drawdown_from_ath_pct"),
-                           manual_review=r.get("manual_review", False),
-                           flags=r.get("flags", []),
-                           liveness_score=r.get("liveness_score"),
-                           dev_commits_4w=r.get("dev_commits_4w"),
-                           market_dd=r.get("market_dd"),
-                           spring_quality=r.get("spring_quality"),
-                           funding_rate=r.get("funding_rate"),
-                           onchain_score=r.get("onchain_score"),
-                           net_flow_usd_7d=r.get("net_flow_usd_7d"),
-                           alt_market_dd=r.get("alt_market_dd"),
-                           market_hot_score=r.get("market_hot_score"),
-                           market_hot_lit=r.get("market_hot_lit") or [],
-                           supply_growth=r.get("supply_growth"), p_f=r.get("p_f"),
-                           oi_mcap=r.get("oi_mcap"), delist=r.get("delist") or "",
-                           us_tag=r.get("us_tag") or "") for r in rows]
-        # mute: не повторять алерт по монете N дней, если балл не вырос заметно
+        # Гибрид: здесь — только карточки новых монет у дна (со звуком). Итог дня, рынок
+        # и «прогон прошёл» — тихая сводка `run.py brief` последним шагом daily_run.
         from scanner.db import Store
+        from scanner.notify import deliver, telegram
+        from scanner.pipeline import _make_http, load_watchlist
+        cands = load_watchlist(cfg["output"]["watchlist_json"])
         st = Store(cfg["output"]["db_path"])
-        mute_days = cfg.get("stage6_telegram.alert_mute_days", 3)
-        recent = st.recent_alerts(mute_days)
+        # mute: не повторять карточку по монете N дней, если балл не вырос заметно
+        recent = st.recent_alerts(cfg.get("stage6_telegram.alert_mute_days", 3))
         fresh = [c for c in cands
                  if c.symbol not in recent or c.score > recent[c.symbol] + 5]
-        muted = len(cands) - len(fresh)
-        if muted:
-            print(f"[telegram] mute: {muted} повторных кандидатов пропущено")
-        # Рыночный контекст в шапку: из прогона (market_daily). Таблица пуста/сбой —
-        # фолбэк на срез CoinGecko /global + market_dd из watchlist.
-        mctx = summary.get("market_ctx") or {}
-        if not mctx:
-            from scanner.pipeline import _make_http
-            from scanner.sources.coingecko import fetch_global
-            mctx = fetch_global(_make_http(cfg), cfg.get("api_keys.coingecko_demo", ""))
-            mctx["market_dd"] = rows[0].get("market_dd") if rows else None
-        token = cfg.get("api_keys.telegram_token", "")
-        chat = cfg.get("api_keys.telegram_chat_id", "")
-        text = telegram.format_alert(fresh, cfg, mctx)
-        if text:
-            ok = telegram.send_message(token, chat, text)
-            print(f"[telegram] отправка: {'ok' if ok else 'fail'}")
+        if len(fresh) < len(cands):
+            print(f"[telegram] mute: {len(cands) - len(fresh)} повторных кандидатов пропущено")
+        picks = telegram.select_picks(fresh, cfg)
+        papers = _papers_opened_since(cfg, t_start)
+        http = _make_http(cfg)
+        for c in picks:
+            card = deliver.coin_card(cfg, http, c, paper=papers.get(c.symbol.upper()))
+            ok = deliver.send_card(cfg, card)
+            print(f"[telegram] карточка {c.symbol}: {'ok' if ok else 'fail'}"
+                  f"{' (с картинкой)' if card.get('png') else ''}")
             if ok:
-                # mute только тем, кто был в сообщении: раньше писались все score ≥ порога,
-                # и монета из СЕРЕДИНЫ / за лимитом max_alerts глушилась, так и не придя.
-                for c in telegram.select_picks(fresh, cfg):
-                    st.record_alert(c.symbol, c.score)
-        elif cfg.get("stage6_telegram.heartbeat", True):
-            # Алерта нет — всё равно сообщаем, что прогон дошёл до конца: иначе тишина
-            # «кандидатов нет» неотличима от упавшего/не запустившегося прогона.
-            fresh_ids = {id(c) for c in fresh}
-            muted_picks = [c for c in telegram.select_picks(cands, cfg)
-                           if id(c) not in fresh_ids]
-            hb = telegram.format_heartbeat(cands, cfg, mctx, muted=muted_picks,
-                                           elapsed_sec=summary.get("elapsed_sec"))
-            ok = telegram.send_message(token, chat, hb)
-            print(f"[telegram] алерта нет, heartbeat: {'ok' if ok else 'fail'}")
-        else:
-            print("[telegram] нет кандидатов под критерии алерта")
+                # mute только тем, кто реально пришёл карточкой (не СЕРЕДИНА, не за лимитом)
+                st.record_alert(c.symbol, c.score)
+        if not picks:
+            print("[telegram] новых монет у дна нет — карточек нет (итог дня — run.py brief)")
         st.close()
     return 0
+
+
+def _papers_opened_since(cfg, ts: float) -> dict[str, dict]:
+    """{SYMBOL: {entry_price, stake}} — paper-позиции A, открытые этим прогоном (пометка в карточке)."""
+    from scanner.positions import PositionStore
+    ps = PositionStore(cfg["output"]["db_path"])
+    out = {p["symbol"].upper(): {"entry_price": p["entry_price"],
+                                 "stake": p["entry_price"] * (p.get("initial_qty") or p["qty"])}
+           for p in ps.open_positions()
+           if p.get("is_paper") and (p.get("variant") or "A") == "A" and p["entry_ts"] >= ts}
+    ps.close_db()
+    return out
 
 
 def _notify_failure(cfg, step: str, e: Exception) -> None:
@@ -451,23 +428,85 @@ def cmd_watch(args) -> int:
     print(f"\n  Итого нереализованный P&L: {summary['pnl_total_usdt']:+.2f} USDT")
 
     if args.notify:
-        from scanner.notify import telegram
-        token = cfg.get("api_keys.telegram_token", "")
-        chat = cfg.get("api_keys.telegram_chat_id", "")
-        # Близнецы B/S (A/B выхода и стопа) — тихий эксперимент: в алерты и дайджест
-        # не идут, итог сравнения — в недельном report.
-        rows = [r for r in rows if (r["position"].get("variant") or "A") == "A"]
-        text = telegram.format_exit_alert(rows, cfg)
-        if text:
-            ok = telegram.send_message(token, chat, text)
-            print(f"[telegram] exit-алерт: {'ok' if ok else 'fail'}")
-        else:
-            print("[telegram] новых сигналов нет — алерт не отправлен")
-        if cfg.get("stage6_telegram.daily_digest", True):
-            dig = telegram.format_digest(rows, cfg)
-            if dig:
-                ok = telegram.send_message(token, chat, dig)
-                print(f"[telegram] дайджест: {'ok' if ok else 'fail'}")
+        # Гибрид: по карточке на позицию с новым сигналом. Звук — только реальная позиция
+        # и сигнал high/medium; paper и информационные — тихо. Позиции целиком — в сводке
+        # дня (run.py brief). Близнецы B/S (A/B выхода и стопа) — тихий эксперимент: в
+        # карточки не идут, итог сравнения — в недельном report.
+        from scanner.notify import deliver
+        from scanner.pipeline import _make_http
+        http = _make_http(cfg)
+        sent = 0
+        for r in rows:
+            if (r["position"].get("variant") or "A") != "A" or not r.get("signals"):
+                continue
+            card = deliver.exit_card(cfg, http, r)
+            ok = deliver.send_exit_card(cfg, card)
+            sent += 1
+            print(f"[telegram] сигнал {r['position']['symbol']}: {'ok' if ok else 'fail'} "
+                  f"({'со звуком' if card['loud'] else 'без звука'})")
+        if not sent:
+            print("[telegram] новых сигналов нет — карточек нет (позиции — в run.py brief)")
+    return 0
+
+
+def cmd_brief(args) -> int:
+    """Сводка дня — тихо, последним шагом ежедневного прогона. Без сети: scanner.db +
+    watchlist.json. Пришла сводка — прогон дошёл до конца."""
+    cfg = load_config(args.config)
+    from scanner.notify import deliver, telegram
+    try:
+        state = deliver.brief_state(cfg, scan_exit=args.scan_exit, watch_exit=args.watch_exit)
+        text = telegram.format_brief(state, cfg, test=args.test)
+    except Exception as e:
+        if args.notify:
+            _notify_failure(cfg, "brief", e)
+        raise
+    print(telegram.strip_html(text))
+    if not args.notify:
+        return 0
+    ok = telegram.send_message(cfg.get("api_keys.telegram_token", ""),
+                               cfg.get("api_keys.telegram_chat_id", ""), text, silent=True)
+    print(f"[telegram] сводка дня: {'ok' if ok else 'fail'}")
+    return 0 if ok else 1
+
+
+def cmd_card(args) -> int:
+    """Карточка монеты (лестница, стоп, цели, уровни, картинка) — как придёт в Telegram.
+    Без --notify печатает текст и сохраняет картинку в logs/card_SYMBOL.png."""
+    from pathlib import Path
+    cfg = load_config(args.config)
+    from scanner.models import Candidate
+    from scanner.notify import deliver, telegram
+    from scanner.pipeline import _make_http, load_watchlist
+    sym = args.symbol.upper().removesuffix("USDT")
+    c = next((x for x in load_watchlist(cfg["output"]["watchlist_json"])
+              if (x.symbol or "").upper() == sym), None)
+    if c is None:
+        info = _lookup_coin(cfg, sym)
+        c = Candidate(source="manual", track="", symbol=sym, coin_id=info.get("coin_id", ""),
+                      chain=info.get("chain", ""), address=info.get("address", ""),
+                      rf_venue=info.get("venue") or "Bybit spot")
+        print(f"⚠ {sym} нет в последнем watchlist — карточка без балла и зоны")
+    if args.budget:
+        cfg["stage6_telegram"]["card_budget_usdt"] = args.budget
+    from scanner.positions import PositionStore
+    ps = PositionStore(cfg["output"]["db_path"])
+    pp = next((p for p in ps.open_positions() if p["symbol"] == sym and p.get("is_paper")
+               and (p.get("variant") or "A") == "A"), None)
+    ps.close_db()
+    paper = ({"entry_price": pp["entry_price"],
+              "stake": pp["entry_price"] * (pp.get("initial_qty") or pp["qty"])} if pp else None)
+    card = deliver.coin_card(cfg, _make_http(cfg), c, paper=paper, test=args.test)
+    print(telegram.strip_html(card["caption"] if card.get("png") else card["text"]))
+    if card.get("png"):
+        out = Path(__file__).resolve().parent / "logs" / f"card_{sym}.png"
+        out.parent.mkdir(exist_ok=True)
+        out.write_bytes(card["png"])
+        print(f"\nкартинка → {out}")
+    if args.notify:
+        ok = deliver.send_card(cfg, card)
+        print(f"[telegram] карточка: {'ok' if ok else 'fail'}")
+        return 0 if ok else 1
     return 0
 
 
@@ -581,7 +620,8 @@ def cmd_report(args) -> int:
     delivered = True
     if args.notify:
         delivered = telegram.send_message(cfg.get("api_keys.telegram_token", ""),
-                                          cfg.get("api_keys.telegram_chat_id", ""), text)
+                                          cfg.get("api_keys.telegram_chat_id", ""), text,
+                                          silent=True)
         print(f"[telegram] недельная сводка: {'ok' if delivered else 'fail'}")
     # Флаги — только после доставки: сбой Telegram не должен «съесть» итоговую
     # 4-недельную сводку или неделю.
@@ -693,6 +733,24 @@ def main() -> int:
                          "(stage6_telegram.weekly_report_weekday) — для ежедневного прогона")
     pr.add_argument("--config", default=None)
     pr.set_defaults(func=cmd_report)
+
+    pb = sub.add_parser("brief", help="сводка дня в Telegram (без сети, последним шагом прогона)")
+    pb.add_argument("--notify", action="store_true", help="отправить в Telegram (без звука)")
+    pb.add_argument("--test", action="store_true", help="пометить сообщение «🧪 ТЕСТ»")
+    pb.add_argument("--scan-exit", type=int, default=None,
+                    help="код выхода scan из daily_run (иначе — по журналу прогонов)")
+    pb.add_argument("--watch-exit", type=int, default=None, help="код выхода watch из daily_run")
+    pb.add_argument("--config", default=None)
+    pb.set_defaults(func=cmd_brief)
+
+    pk = sub.add_parser("card", help="карточка монеты: лестница, стоп, цели, картинка уровней")
+    pk.add_argument("symbol", help="тикер: GRAM или GRAMUSDT")
+    pk.add_argument("--notify", action="store_true", help="отправить в Telegram")
+    pk.add_argument("--test", action="store_true", help="пометить сообщение «🧪 ТЕСТ»")
+    pk.add_argument("--budget", type=float, default=None,
+                    help="бюджет лестницы, USDT (по умолчанию stage6_telegram.card_budget_usdt)")
+    pk.add_argument("--config", default=None)
+    pk.set_defaults(func=cmd_card)
 
     pm = sub.add_parser("market", help="обновить историю рынка и показать контекст/перегрев")
     pm.add_argument("--backfill", action="store_true", help="полный бэкфилл с backfill_start (~3 мин)")

@@ -93,6 +93,18 @@ class HttpClient:
     def get_json(self, url: str, params: dict[str, Any] | None = None,
                  headers: dict[str, str] | None = None,
                  use_cache: bool = True, retries: int = 5) -> Any | None:
+        return self._get(url, params, headers, use_cache, retries, "application/json",
+                         lambda raw: json.loads(raw.decode("utf-8")))
+
+    def get_text(self, url: str, params: dict[str, Any] | None = None,
+                 headers: dict[str, str] | None = None,
+                 use_cache: bool = True, retries: int = 3) -> str | None:
+        """Как get_json, но тело — текст (Atom/XML GitHub). В кэше лежит JSON-строкой."""
+        return self._get(url, params, headers, use_cache, retries, "*/*",
+                         lambda raw: raw.decode("utf-8", errors="replace"))
+
+    def _get(self, url: str, params: dict[str, Any] | None, headers: dict[str, str] | None,
+             use_cache: bool, retries: int, accept: str, decode) -> Any | None:
         if params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
 
@@ -104,14 +116,14 @@ class HttpClient:
         host = urllib.parse.urlparse(url).netloc
         req = urllib.request.Request(url, headers=headers or {})
         req.add_header("User-Agent", "accumulation-scanner/0.1")
-        req.add_header("Accept", "application/json")
+        req.add_header("Accept", accept)
 
         backoff = 2.0
         for attempt in range(retries):
             self._throttle(host)
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                    data = decode(resp.read())
                 if use_cache:
                     self._write_cache(url, data)
                 return data

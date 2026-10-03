@@ -100,10 +100,15 @@ _SUBS = {
 }
 
 
-def compute_score(c, cfg: Config) -> tuple[float, float, dict]:
-    """Возвращает (score 0–100, confidence 0–1, breakdown)."""
+def compute_score(c, cfg: Config, unavailable: set[str] | frozenset[str] = frozenset()
+                  ) -> tuple[float, float, dict]:
+    """Возвращает (score 0–100, confidence 0–1, breakdown).
+
+    unavailable — блоки, источник которых не ответил в этом прогоне ни для одной монеты
+    (on-chain при Dune 402). Их вес не входит в знаменатель confidence: дыра общая для
+    всех, монеты она не различает, а «conf 0.9 у всех» ничего не сообщает."""
     weights: dict[str, float] = cfg["stage5_score"]["weights"]
-    total_w = sum(weights.values())
+    total_w = sum(w for name, w in weights.items() if name not in unavailable)
     acc = 0.0
     present_w = 0.0
     breakdown: dict[str, dict] = {}
@@ -111,10 +116,12 @@ def compute_score(c, cfg: Config) -> tuple[float, float, dict]:
     for name, w in weights.items():
         v = _SUBS[name](c)
         breakdown[name] = {"sub": v, "weight": w}
+        if name in unavailable:
+            breakdown[name]["source"] = "недоступен"
         if v is not None:
             acc += v * w
             present_w += w
 
     score = round(acc / present_w * 10, 1) if present_w > 0 else 0.0
-    confidence = round(present_w / total_w, 2) if total_w > 0 else 0.0
+    confidence = round(min(1.0, present_w / total_w), 2) if total_w > 0 else 0.0
     return score, confidence, breakdown

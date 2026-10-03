@@ -122,6 +122,12 @@ class Store:
         rcols = {r[1] for r in self.conn.execute("PRAGMA table_info(runs)")}
         if "cfg_version" not in rcols:
             self.conn.execute("ALTER TABLE runs ADD COLUMN cfg_version TEXT")
+        # Сводка дня (run.py brief) по ним понимает, дошёл ли скан до конца и что было
+        # недоступно — без сети и без парсинга логов.
+        if "finished_ts" not in rcols:
+            self.conn.execute("ALTER TABLE runs ADD COLUMN finished_ts REAL")
+        if "summary" not in rcols:
+            self.conn.execute("ALTER TABLE runs ADD COLUMN summary TEXT")
 
     def new_run(self, cfg_version: str = "") -> int:
         cur = self.conn.execute("INSERT INTO runs(ts, cfg_version) VALUES (?,?)",
@@ -129,12 +135,34 @@ class Store:
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def finish_run(self, run_id: int, n_ingested: int, n_stage1: int, n_watchlist: int) -> None:
+    def finish_run(self, run_id: int, n_ingested: int, n_stage1: int, n_watchlist: int,
+                   summary: dict | None = None) -> None:
         self.conn.execute(
-            "UPDATE runs SET n_ingested=?, n_stage1=?, n_watchlist=? WHERE id=?",
-            (n_ingested, n_stage1, n_watchlist, run_id),
+            "UPDATE runs SET n_ingested=?, n_stage1=?, n_watchlist=?, finished_ts=?, summary=? "
+            "WHERE id=?",
+            (n_ingested, n_stage1, n_watchlist, time.time(),
+             json.dumps(summary or {}, ensure_ascii=False, default=str), run_id),
         )
         self.conn.commit()
+
+    def last_run(self) -> dict | None:
+        """Последний прогон: {id, ts, finished_ts, n_watchlist, summary (dict)}."""
+        r = self.conn.execute("SELECT id, ts, finished_ts, n_watchlist, summary FROM runs "
+                              "ORDER BY id DESC LIMIT 1").fetchone()
+        if not r:
+            return None
+        try:
+            summ = json.loads(r[4]) if r[4] else {}
+        except ValueError:
+            summ = {}
+        return {"id": r[0], "ts": r[1], "finished_ts": r[2], "n_watchlist": r[3],
+                "summary": summ}
+
+    def alerts_since(self, ts: float) -> dict[str, float]:
+        """symbol -> score карточек, ушедших с момента ts (для сводки дня)."""
+        cur = self.conn.execute(
+            "SELECT symbol, MAX(score) FROM alert_log WHERE ts>=? GROUP BY symbol", (ts,))
+        return {r[0]: (r[1] or 0.0) for r in cur.fetchall()}
 
     def save_candidates(self, run_id: int, candidates: Iterable[Candidate]) -> None:
         rows = []

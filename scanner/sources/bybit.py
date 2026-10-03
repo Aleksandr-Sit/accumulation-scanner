@@ -57,6 +57,61 @@ def parse_daily_closes(data, now_ms: int) -> list[float]:
     return out
 
 
+def fetch_daily_ohlcv(http: HttpClient, symbol: str, limit: int = 400) -> dict:
+    """Дневные свечи спот-пары (oldest→newest, только закрытые): {ts, o, h, l, c, v, qv}.
+    qv — оборот в USDT. Для уровней (фитили, ATR, профиль объёма) и картинки в Telegram:
+    закрытия те же, что у fetch_daily_closes, плюс хаи/лои и объём именно этой биржи."""
+    data = http.get_json(f"{_BASE}/v5/market/kline",
+                         params={"category": "spot", "symbol": symbol,
+                                 "interval": "D", "limit": limit})
+    return parse_daily_ohlcv(data, int(time.time() * 1000))
+
+
+def parse_daily_ohlcv(data, now_ms: int) -> dict:
+    """Ответ /v5/market/kline (D) -> {ts (сек), o, h, l, c, v, qv}; незакрытая свеча отброшена."""
+    out: dict[str, list] = {k: [] for k in ("ts", "o", "h", "l", "c", "v", "qv")}
+    rows = ((data.get("result") or {}).get("list") or []) if isinstance(data, dict) else []
+    for r in reversed(rows):     # Bybit отдаёт newest-first
+        try:
+            start = int(r[0])
+            if start + _DAY_MS > now_ms:
+                continue
+            vals = [float(x) for x in r[1:7]]
+        except (ValueError, IndexError, TypeError):
+            continue
+        out["ts"].append(start // 1000)
+        for k, v in zip(("o", "h", "l", "c", "v", "qv"), vals):
+            out[k].append(v)
+    return out
+
+
+def fetch_spot_prices(http: HttpClient) -> dict[str, float]:
+    """baseCoin -> последняя цена …USDT-пары (один вызов на весь спот). Сверка тикера:
+    одинаковый символ на Bybit и в CoinGecko ещё не значит одну и ту же монету."""
+    data = http.get_json(f"{_BASE}/v5/market/tickers", params={"category": "spot"})
+    out: dict[str, float] = {}
+    for t in ((data or {}).get("result") or {}).get("list") or [] if isinstance(data, dict) else []:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        try:
+            px = float(t.get("lastPrice") or 0)
+        except (TypeError, ValueError):
+            continue
+        if px > 0:
+            out[sym[:-4].upper()] = px
+    return out
+
+
+def same_coin(bybit_price: float | None, other_price: float | None,
+              tolerance: float = 0.25) -> bool | None:
+    """Тикер совпал — та же ли монета? Цены расходятся больше tolerance -> нет.
+    None — сравнить не с чем (нет одной из цен)."""
+    if not bybit_price or not other_price or bybit_price <= 0 or other_price <= 0:
+        return None
+    return abs(bybit_price / other_price - 1) <= tolerance
+
+
 def fetch_instrument(http: HttpClient, symbol: str) -> dict | None:
     """Правила спот-пары: tickSize, basePrecision, minOrderQty/minOrderAmt, stTag, status."""
     data = http.get_json(f"{_BASE}/v5/market/instruments-info",

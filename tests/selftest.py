@@ -17,8 +17,7 @@ from scanner.stages.fundamentals import assess_valuation
 from scanner.stages import zone
 from scanner.stages.access import rf_gate
 from scanner.stages.score import compute_score
-from scanner.notify.telegram import (format_alert, format_digest, format_exit_alert,
-                                     format_weekly, sparkline)
+from scanner.notify.telegram import format_weekly
 
 _PASS = "\033[92mPASS\033[0m"
 _FAIL = "\033[91mFAIL\033[0m"
@@ -653,7 +652,7 @@ def test_coin_context(cfg, failures: list[str]) -> None:
     print("Stage 4d — монетный контекст (информационный):")
     from scanner.stages.coin_context import annotate, supply_growth
     from scanner.sources.coin_extras import parse_delist_title
-    from scanner.notify.telegram import coin_line
+    from scanner.notify.telegram import risk_lines
     _check("предложение: mcap/price 100→130 = +30%",
            supply_growth([1.0, 2.0], [100.0, 260.0]) == 0.3, failures)
     _check("предложение: мало точек -> None", supply_growth([1.0], [100.0]) is None, failures)
@@ -677,9 +676,9 @@ def test_coin_context(cfg, failures: list[str]) -> None:
     _check("делистинг спота -> флаг + заметка", z.delist == "spot" and "delist_spot" in z.flags, failures)
     _check("OI 50% капы -> high_leverage", "high_leverage" in z.flags, failures)
     _check("эмиссия +40% -> supply_inflation", "supply_inflation" in z.flags, failures)
-    line = coin_line(z)
-    _check("строка монеты: делистинг, эмиссия, OI", "делистинг" in line and "эмиссия +40%" in line
-           and "OI 50%" in line, failures)
+    risks = " · ".join(risk_lines(z, cfg))
+    _check("риски карточки: делистинг, эмиссия, OI", "снимает спот" in risks
+           and "эмиссия +40%" in risks and "OI 50% капы" in risks, failures)
     sol = Candidate(source="t", track="A", symbol="SOL")
     annotate(sol, {"coinbase": {"SOL"}}, cfg)
     _check("SOL в списке ETF -> us_tag etf", sol.us_tag == "etf", failures)
@@ -721,7 +720,9 @@ def test_score(cfg, failures: list[str]) -> None:
 
 
 def test_telegram_format(cfg, failures: list[str]) -> None:
-    print("Stage 6 — формат Telegram-алерта:")
+    print("Stage 6 — Telegram: отбор, рынок, карточка монеты, транспорт:")
+    from scanner.ladder import plan_ladder
+    from scanner.notify import telegram as tg
     cands = [
         Candidate(source="t", track="A", symbol="ICP", zone="ПРУЖИНА/ДНО",
                   rf_venue="Bybit spot", score=84.7, confidence=0.85,
@@ -731,75 +732,121 @@ def test_telegram_format(cfg, failures: list[str]) -> None:
         Candidate(source="t", track="A", symbol="MID", zone="СЕРЕДИНА",
                   rf_venue="Bybit spot", score=75.0, confidence=0.85),
     ]
-    msg = format_alert(cands, cfg)
-    _check("алерт не пустой", bool(msg), failures)
-    _check("включает ICP (зона дна, score>70)", "ICP" in (msg or ""), failures)
-    _check("исключает падающий нож KITE", "KITE" not in (msg or ""), failures)
-    _check("исключает СЕРЕДИНУ (only_zones=дно)", "MID" not in (msg or ""), failures)
-
-    # Никто не проходит порог -> None.
+    # select_picks = ровно те, кто придёт карточкой (по ним пишется mute)
+    _check("select_picks: только ICP (нож и СЕРЕДИНА не идут)",
+           [c.symbol for c in tg.select_picks(cands, cfg)] == ["ICP"], failures)
     low = [Candidate(source="t", track="A", symbol="X", zone="ПРУЖИНА/ДНО", score=10.0)]
-    _check("нет проходящих -> None", format_alert(low, cfg) is None, failures)
-
-    # Высокий балл, но низкий confidence (данных мало) -> гейт режет.
+    _check("ниже порога -> карточек нет", tg.select_picks(low, cfg) == [], failures)
     thin = [Candidate(source="t", track="B", symbol="THIN", zone="ПРУЖИНА/ДНО",
                       score=90.0, confidence=0.3)]
-    _check("низкий confidence отсечён гейтом", format_alert(thin, cfg) is None, failures)
-
-    # Рыночный контекст в шапке (BTC.D + просадка BTC).
-    from scanner.notify.telegram import format_market_ctx
-    mc = format_market_ctx({"market_dd": 0.49, "btc_dominance_pct": 58.0,
-                            "total2_mcap_usd": 1.2e12})
-    _check("контекст: BTC drawdown + зона (0.49=средняя)", "BTC −49%" in mc and "средняя зона" in mc, failures)
-    _check("контекст: BTC.D + альты", "BTC.D 58%" in mc and "альты $1200B" in mc, failures)
-    msg = format_alert(cands, cfg, {"market_dd": 0.49, "btc_dominance_pct": 58.0})
-    _check("шапка контекста в алерте", "🌍" in (msg or ""), failures)
-    mc2 = format_market_ctx({"alt_dd": 0.42, "btc_dd": 0.33, "fng": 45, "btc_d": 58.4,
-                             "hot": {"n_lit": 0, "avail": 8, "lit": [], "near": ["fng30"]}})
-    _check("новый контекст: альты · BTC · перегрев 0/8 (близко) · BTC.D",
-           mc2 == "альты −42% · BTC −33% · перегрев 0/8 (близко: F&G) · F&G 45 · BTC.D 58%", failures)
-    # Обновление рынка не удалось и последний день старый -> дата вместо «как будто сегодня».
-    day = 1790812800.0   # 2026-10-01 00:00 UTC
-    old = format_market_ctx({"alt_dd": 0.42, "day": day}, now=day + 5 * 86400)
-    _check("контекст старше 2 дней помечен датой", old.endswith("⚠ рынок на 01.10"), failures)
-    fresh_ctx = format_market_ctx({"alt_dd": 0.42, "day": day}, now=day + 10 * 3600)
-    _check("свежий контекст без пометки", "⚠" not in fresh_ctx, failures)
-
-    # select_picks = ровно то, что в сообщении (по нему пишется mute): СЕРЕДИНА со
-    # score ≥ порога и монеты за max_alerts не глушатся, так и не придя.
-    from scanner.notify.telegram import select_picks
-    picks = select_picks(cands, cfg)
-    _check("select_picks: только ICP (MID из СЕРЕДИНЫ не глушим)",
-           [c.symbol for c in picks] == ["ICP"], failures)
+    _check("низкий confidence отсечён гейтом", tg.select_picks(thin, cfg) == [], failures)
     many = [Candidate(source="t", track="A", symbol=f"S{i}", zone="ПРУЖИНА/ДНО",
                       score=90.0 - i, confidence=0.9) for i in range(15)]
-    cap = cfg["stage6_telegram"]["max_alerts"]
-    _check("select_picks: не больше max_alerts", len(select_picks(many, cfg)) == cap, failures)
+    _check("select_picks: не больше max_alerts",
+           len(tg.select_picks(many, cfg)) == cfg["stage6_telegram"]["max_alerts"], failures)
 
-    # Heartbeat: алерта нет — сообщение «прогон завершён» с ближайшими к порогу.
-    from scanner.notify.telegram import format_failure, format_heartbeat, weekly_due
-    wl = [Candidate(source="t", track="A", symbol="GRAM", zone="ПРУЖИНА/ДНО", score=69.8,
-                    confidence=0.9),
-          Candidate(source="t", track="A", symbol="MID", zone="СЕРЕДИНА", score=68.0,
-                    confidence=0.9),
-          Candidate(source="t", track="A", symbol="LUNC", zone="ПРУЖИНА/ДНО", score=67.0,
-                    confidence=0.9)]
-    hb = format_heartbeat(wl, cfg, {"alt_dd": 0.4, "day": time.time()}, elapsed_sec=1680)
-    _check("heartbeat: прогон завершён за 28 мин", "прогон завершён за 28 мин" in hb, failures)
-    _check("heartbeat: «кандидатов нет» + порог", "Кандидатов под алерт нет" in hb
-           and "балл ≥ 70" in hb, failures)
-    _check("heartbeat: ближе всех из зоны дна, без СЕРЕДИНЫ",
-           "в зоне: 2 · ближе всех: GRAM 69.8, LUNC 67" in hb, failures)
-    _check("heartbeat: контекст рынка", "🌍 альты −40%" in hb, failures)
-    hbm = format_heartbeat(cands, cfg, muted=[cands[0]])
-    _check("heartbeat: все заглушены -> «уже приходили (ICP)»",
-           "1 уже приходили" in hbm and "(ICP)" in hbm, failures)
-    fail = format_failure("scan", "RuntimeError: <boom>")
+    # Рынок: фаза по просадке альтов + «температура» по флагам; значения рядом с порогом.
+    day = 1790812800.0   # 2026-10-01 00:00 UTC
+    warm = {"alt_dd": 0.43, "btc_dd": 0.32, "fng30": 67.9, "breadth200": 83.45, "day": day,
+            "hot": {"n_lit": 0, "avail": 8, "lit": [], "near": ["fng30", "breadth200"]}}
+    mb = "\n".join(tg.market_block(warm, cfg, now=day + 3600))
+    _check("рынок: «середина цикла, теплеет 🟡»", "середина цикла, теплеет</b> 🟡" in mb, failures)
+    _check("рынок: альты со шкалой дна + BTC",
+           "Альты −43% от пика (дно цикла — от −65%) · BTC −32%" in mb, failures)
+    _check("рынок: у порога — значение/порог", "у порога: F&amp;G 68/70, ширина 83/85%" in mb,
+           failures)
+    hot = {"alt_dd": 0.2, "mvrv_btc": 2.5, "day": day,
+           "hot": {"avail": 8, "lit": ["mvrv_btc", "fng30", "breadth200"], "near": []}}
+    mh = "\n".join(tg.market_block(hot, cfg, now=day))
+    _check("рынок: 3/8 флагов -> «близко к хаям, перегрет 🔴», горит MVRV 2.50/2.20",
+           "близко к хаям, перегрет</b> 🔴" in mh and "MVRV BTC 2.50/2.20" in mh, failures)
+    calm = {"alt_dd": 0.7, "day": day, "hot": {"avail": 8, "lit": [], "near": []}}
+    _check("рынок: альты −70% без флагов -> «дно цикла, спокойный»",
+           "дно цикла, спокойный" in tg.market_block(calm, cfg, now=day)[0], failures)
+    _check("рынок: данные старше 2 дней помечены датой",
+           any("данные рынка на 01.10" in x for x in tg.market_block(warm, cfg, now=day + 5 * 86400)),
+           failures)
+    _check("рынок: нет данных -> так и сказано", "нет данных" in tg.market_block({}, cfg)[0], failures)
+
+    # Карточка монеты у дна: лестница/стоп/цели моноширинно, свёрнутые «почему/риски».
+    ind = {"days_since_low": 178, "base_len_days": 71, "vol_contraction": 0.66,
+           "vol_trend": 0.70, "trend_recent_pct": 7.4, "rs_vs_btc_pct": 3.4}
+    g = Candidate(source="t", track="A", symbol="GRAM", name="Gram (prev. Toncoin)",
+                  zone="ПРУЖИНА/ДНО", score=70.0, confidence=0.9, rf_venue="Bybit spot",
+                  coin_id="the-open-network", drawdown_from_ath_pct=81.9, indicators=ind,
+                  alt_market_dd=0.43, supply_growth=0.14, price_usd=1.5,
+                  flags=["mintable", "dd_in_bull_market"])
+    plan = plan_ladder(1.5, 1.317, 40, steps=4, min_order=10, tick=0.001, qty_step=0.01,
+                       exch_min_amt=5, floor_pct=25, sell="prod",
+                       prod_levels=cfg["stage8_exit"]["ladder"])
+    P = lambda x: f"{x:.3f}"  # noqa: E731
+    card = tg.format_coin_card(g, plan, cfg, price=1.5, price_src="Bybit", P=P,
+                               paper={"entry_price": 1.5, "stake": 100})
+    first = card.split("\n")[0]
+    _check("карточка: первая строка — суть (у дна, балл, биржа)",
+           "GRAM у дна — 70/100" in first and "Bybit" in first, failures)
+    _check("карточка: 4 ступени ценами + стоп в <pre>",
+           "<pre>" in card and all(P(b["price"]) in card for b in plan["buys"])
+           and "0.988" in card and "2 закрытия ниже" in card, failures)
+    _check("карточка: цели +50/+150 и трейл остатка",
+           "+50% → ⅓" in card and "+150% → ⅓" in card and "трейл 30%" in card, failures)
+    _check("карточка: свёрнутый блок «почему/риски»",
+           "<blockquote expandable>" in card and "Почему у дна" in card
+           and "178 дн. без нового минимума" in card and "эмиссия +14% за полгода" in card,
+           failures)
+    _check("карточка: paper-пометка и дисклеймер",
+           "paper-позиция $100 по 1.500" in card and "не рекомендация" in card, failures)
+    noisy = Candidate(**{**g.__dict__, "flags": list(_FLAG_KEYS),
+                         "liveness_notes": [f"⚠ заметка {i} " + "x" * 60 for i in range(6)]})
+    cap = tg.card_caption(noisy, plan, cfg, price=1.5, P=P)
+    _check("подпись к фото ≤ 1024 видимых символов, лестница на месте",
+           len(tg.strip_html(cap)) <= tg.CAPTION_MAX and "<pre>" in cap, failures)
+    bad = Candidate(source="t", track="A", symbol="X&Y", name="A&B <x>", zone="ПРУЖИНА/ДНО",
+                    score=71.0)
+    _check("карточка: имена экранированы", "A&amp;B &lt;x&gt;" in tg.format_coin_card(
+        bad, None, cfg), failures)
+    broken = plan_ladder(0.9, 1.317, 40, floor_pct=25)
+    _check("цена ниже стопа -> «лестница не построена»",
+           "Лестница не построена" in tg.format_coin_card(g, broken, cfg), failures)
+    manual = Candidate(source="manual", track="", symbol="LINK", rf_venue="Bybit spot")
+    _check("монета вне watchlist -> «план лестницы» без балла",
+           "LINK — план лестницы" in tg.format_coin_card(manual, plan, cfg), failures)
+
+    # Ссылки и транспорт — без сети.
+    links = tg.coin_links("GRAM", "Bybit spot", "the-open-network")
+    urls = " ".join(u for _, u in links)
+    _check("ссылки Bybit: TradingView, Bybit, CoinGecko",
+           "BYBIT:GRAMUSDT" in urls and "bybit.com/en/trade/spot/GRAM/USDT" in urls
+           and "coingecko.com/en/coins/the-open-network" in urls, failures)
+    dex = tg.coin_links("XYO", "DEX only", "xyo-network", "ethereum", "0xabc")
+    _check("ссылки DEX: DEXScreener по сети и адресу",
+           any("dexscreener.com/ethereum/0xabc" in u for _, u in dex), failures)
+    pl = tg.build_payload("1", "t", silent=True, buttons=[links])
+    _check("тихое сообщение с кнопками: disable_notification + inline_keyboard",
+           pl.get("disable_notification") == "true" and "inline_keyboard" in pl.get("reply_markup", "")
+           and pl["parse_mode"] == "HTML", failures)
+    pl2 = tg.build_payload("1", "t")
+    _check("обычное: со звуком, без кнопок",
+           "disable_notification" not in pl2 and "reply_markup" not in pl2, failures)
+    body = tg.multipart_body({"chat_id": "1", "caption": "тест"},
+                             {"photo": ("a.png", b"\x89PNG", "image/png")}, "BND")
+    _check("multipart для sendPhoto: файл, подпись, закрывающая граница",
+           b'name="photo"; filename="a.png"' in body and "тест".encode() in body
+           and body.endswith(b"--BND--\r\n"), failures)
+    _check("strip_html: видимый текст", tg.strip_html("<b>A&amp;B</b>") == "A&B", failures)
+    _check("цены: 4 значащие цифры",
+           [tg.fmt_price(x) for x in (84579, 1.4996, 0.00058621, 150.26)]
+           == ["84 579", "1.500", "0.0005862", "150.3"], failures)
+    _check("балл: 70.0 -> 70, 69.8 -> 69.8 (не «70» ниже порога)",
+           tg.fmt_score(70.0) == "70" and tg.fmt_score(69.8) == "69.8", failures)
+
+    fail = tg.format_failure("scan", "RuntimeError: <boom>")
     _check("сбой: шаг и экранированная ошибка", "Accumulation scan" in fail
            and "&lt;boom&gt;" in fail, failures)
 
     # Недельная сводка из ежедневного прогона: первый прогон недели (пн по умолчанию).
     from datetime import datetime as _dt
+    weekly_due = tg.weekly_due
     mon = _dt(2026, 10, 5, 10, 0).timestamp()          # понедельник
     _check("сводка: никогда не было -> пора", weekly_due(None, mon), failures)
     _check("сводка: прошлый пн -> пора", weekly_due(_dt(2026, 9, 28, 10).timestamp(), mon),
@@ -813,6 +860,10 @@ def test_telegram_format(cfg, failures: list[str]) -> None:
            not weekly_due(_dt(2026, 10, 2, 10).timestamp(), _dt(2026, 10, 5, 10).timestamp(), 4)
            and weekly_due(_dt(2026, 10, 2, 10).timestamp(), _dt(2026, 10, 9, 10).timestamp(), 4),
            failures)
+
+
+_FLAG_KEYS = ("mintable", "transfer_pausable", "proxy", "has_blacklist", "lp_unlocked",
+              "wash_suspect", "rf_dex_only", "bybit_ticker_mismatch", "dd_in_bull_market")
 
 
 def test_exit(cfg, failures: list[str]) -> None:
@@ -1017,76 +1068,138 @@ def test_positions_store(cfg, failures: list[str]) -> None:
 
 
 def test_exit_alert_format(cfg, failures: list[str]) -> None:
-    print("Stage 8 — формат exit-алерта:")
-    rows = [{
-        "position": {"symbol": "ARB"}, "held_days": 120,
-        "pnl": {"pnl_pct": 105.0, "pnl_usdt": 525.0, "value_usdt": 1025.0},
-        "signals": [{"type": "ladder_0", "urgency": "medium",
-                     "action": "ЗАФИКСИРОВАТЬ 25%", "note": "достигнут уровень +100%"}],
-    }]
-    msg = format_exit_alert(rows, cfg)
-    _check("алерт сформирован", bool(msg and "ARB" in msg), failures)
-    _check("действие в алерте", "ЗАФИКСИРОВАТЬ 25%" in (msg or ""), failures)
-    _check("нет сигналов -> None",
-           format_exit_alert([{"position": {"symbol": "X"}, "signals": []}], cfg) is None,
+    print("Stage 8 — карточки выхода и сводка дня:")
+    from scanner.notify import telegram as tg
+    day = 1790812800.0   # 2026-10-01 00:00 UTC — точка CoinGecko = закрытие 30.09
+    pos = {"symbol": "ARB", "entry_price": 0.30, "qty": 1000.0, "initial_qty": 1000.0,
+           "base_low": 0.25, "is_paper": 0, "status": "open"}
+    lad = {"position": pos, "last_price": 0.46, "last_ts": day, "held_days": 120, "hwm": 0.47,
+           "pnl": {"pnl_pct": 52.6, "pnl_usdt": 158.0},
+           "signals": [{"type": "ladder_0", "urgency": "medium", "action": "ЗАФИКСИРОВАТЬ 33%",
+                        "note": "достигнут уровень +50% (сейчас +53%)"}]}
+    text, loud = tg.format_exit_card(lad, cfg)
+    _check("выход: лестница — что и сколько продать",
+           "ARB — зафиксировать 33%" in text and "Продать: 330 ARB" in text, failures)
+    _check("выход: закрытие подписано днём закрытия (30.09)", "(30.09)" in text, failures)
+    _check("выход: реальная позиция, medium -> со звуком", loud, failures)
+    inv = {**lad, "signals": [{"type": "invalidation", "urgency": "high",
+                               "action": "ВЫЙТИ ПОЛНОСТЬЮ", "note": "2 закрытия ниже стопа"}]}
+    t2, l2 = tg.format_exit_card(inv, cfg)
+    _check("выход: стоп — продать весь остаток", "выйти полностью" in t2
+           and "весь остаток 1000 ARB" in t2 and l2, failures)
+    info = {**lad, "signals": [{"type": "peak_zone", "urgency": "low",
+                                "action": "ЗОНА РАСПРЕДЕЛЕНИЯ", "note": "разгон +35% над SMA"}]}
+    _check("выход: информационный сигнал -> без звука", tg.format_exit_card(info, cfg)[1] is False,
            failures)
-
-    # Спарклайн: растущий ряд заканчивается верхним блоком, короткий не падает.
-    s = sparkline([1, 2, 3, 4, 5, 6, 7, 8])
-    _check("спарклайн: рост -> последний символ верхний", s.endswith("█"), failures)
-    _check("спарклайн: 1 точка не падает", bool(sparkline([5.0])), failures)
-
-    # Дайджест: обе позиции (real+paper), суммы, ближайший уровень лестницы.
-    drows = [
-        {"position": {"symbol": "ARB", "entry_price": 0.30, "qty": 1000.0,
-                      "base_low": 0.25, "is_paper": 0},
-         "last_price": 0.36, "hwm": 0.40,
-         "pnl": {"pnl_pct": 19.6, "pnl_usdt": 58.7, "value_usdt": 358.7},
-         "held_days": 30, "signals": [], "triggered": set(),
-         "spark_prices": [0.30, 0.32, 0.35, 0.40, 0.36]},
-        {"position": {"symbol": "GRAM", "entry_price": 1.61, "qty": 62.0,
-                      "base_low": 1.5, "is_paper": 1},
-         "last_price": 1.60, "hwm": 1.61,
-         "pnl": {"pnl_pct": -0.9, "pnl_usdt": -0.9, "value_usdt": 99.1},
-         "held_days": 1, "signals": [], "triggered": set(),
-         "spark_prices": [1.61, 1.60]},
-    ]
-    dig = format_digest(drows, cfg)
-    _check("дайджест: обе позиции", "ARB" in (dig or "") and "GRAM" in (dig or ""), failures)
-    _check("дайджест: маркировка 💰/📝", "💰" in (dig or "") and "📝" in (dig or ""), failures)
-    _check("дайджест: ближайший уровень лестницы", "+50%" in (dig or ""), failures)
-    _check("дайджест: суммы real/paper", "Σ" in (dig or ""), failures)
-    _check("дайджест: пусто -> None", format_digest([], cfg) is None, failures)
-
-    # Цены watch — дневное закрытие, не текущая цена: подпись с датой; застрявшая цена
-    # (CoinGecko перестал обновлять монету) помечается.
-    day = 1790812800.0   # 2026-10-01 00:00 UTC
-    for r in drows:
-        r["last_ts"] = day
-    drows[1]["last_ts"] = day - 5 * 86400
-    dig2 = format_digest(drows, cfg) or ""
-    _check("дайджест: подпись «закрытие 01.10 00:00 UTC»", "закрытие 01.10 00:00 UTC" in dig2,
-           failures)
-    _check("дайджест: застрявшая цена помечена датой", "⚠ закрытие 26.09" in dig2, failures)
-
-    # Paper-позиция выбита стопом в этом прогоне: qty=0, P&L остатка «+0.0%» — врёт.
-    # Алерт берёт P&L на момент сигнала, дайджест — итог сделки.
+    # Paper выбита стопом в этом прогоне: P&L на момент сигнала, исполнено виртуально, тихо.
     closed = {"position": {"symbol": "STOP", "entry_price": 1.0, "qty": 0.0, "base_low": 0.9,
                            "is_paper": 1, "status": "closed"},
               "last_price": 0.6, "last_ts": day, "hwm": 1.1,
-              "pnl": {"pnl_pct": 0.0, "pnl_usdt": 0.0, "value_usdt": 0.0},
-              "pnl_at_signal": {"pnl_pct": -40.2, "pnl_usdt": -40.2, "value_usdt": 59.9},
+              "pnl": {"pnl_pct": 0.0, "pnl_usdt": 0.0},
+              "pnl_at_signal": {"pnl_pct": -40.2, "pnl_usdt": -40.2},
               "realized_usdt": -40.2, "held_days": 20, "triggered": {"invalidation"},
               "executed": ["invalidation: выход, realized -40.20"],
               "signals": [{"type": "invalidation", "urgency": "high",
                            "action": "ВЫЙТИ ПОЛНОСТЬЮ", "note": "пробила лоу базы"}]}
-    ex = format_exit_alert([closed], cfg) or ""
-    _check("exit-алерт: P&L на момент сигнала (−40.2%), не +0.0%",
-           "-40.2%" in ex and "+0.0%" not in ex, failures)
-    _check("exit-алерт: строка paper-исполнения", "⚙ paper: invalidation" in ex, failures)
-    dig3 = format_digest([closed], cfg) or ""
-    _check("дайджест: закрытая в прогоне -> realized, без +0.0%",
-           "закрыта по сигналу" in dig3 and "-40.20" in dig3 and "+0.0%" not in dig3, failures)
+    t3, l3 = tg.format_exit_card(closed, cfg)
+    _check("paper: P&L на момент сигнала (−40.2%), не +0.0%",
+           "−40.2%" in t3 and "+0.0%" not in t3, failures)
+    _check("paper: исполнено виртуально, без «Продать» и без звука",
+           "исполнено виртуально" in t3 and "Продать" not in t3 and l3 is False, failures)
+    _check("нет сигналов -> пусто", tg.format_exit_card({"position": pos, "signals": []}, cfg)
+           == ("", False), failures)
+
+    s = tg.sparkline([1, 2, 3, 4, 5, 6, 7, 8])
+    _check("спарклайн: рост -> последний символ верхний", s.endswith("█"), failures)
+    _check("спарклайн: 1 точка не падает", bool(tg.sparkline([5.0])), failures)
+
+    # Сводка дня: суть в первой строке, рынок, монеты, позиции с ценами стопа и цели.
+    gram = Candidate(source="t", track="A", symbol="GRAM", zone="ПРУЖИНА/ДНО", score=70.0)
+    lunc = Candidate(source="t", track="A", symbol="LUNC", zone="ПРУЖИНА/ДНО", score=67.1)
+    arb_row = {"position": pos, "last_price": 0.36, "last_ts": day, "hwm": 0.40,
+               "pnl": {"pnl_pct": 19.6, "pnl_usdt": 58.7}, "held_days": 30,
+               "triggered": set(), "spark_prices": [0.30, 0.31, 0.33, 0.35, 0.40, 0.38, 0.36]}
+    gram_row = {"position": {"symbol": "GRAM", "entry_price": 1.5, "qty": 66.7, "base_low": 1.3155,
+                             "is_paper": 1, "status": "open"},
+                "last_price": 1.4996, "last_ts": day, "hwm": 1.5,
+                "pnl": {"pnl_pct": -0.3, "pnl_usdt": -0.33}, "held_days": 0, "triggered": set()}
+    stop_row = {"position": closed["position"], "pnl": {"pnl_pct": 0.0, "pnl_usdt": 0.0},
+                "realized_usdt": -40.2}
+    state = {"scan": {"ran": True, "ok": True, "elapsed_min": 23.0, "watchlist": 83},
+             "watch_ok": True,
+             "market": {"alt_dd": 0.43, "day": day, "hot": {"avail": 8, "lit": [], "near": []}},
+             "new": [gram], "muted": [], "near": [lunc],
+             "positions": [arb_row, gram_row, stop_row],
+             "signals_today": [{"symbol": "ARB", "label": "фикс 33%", "is_paper": 0}],
+             "unavailable": ["onchain"], "dev_github": "62 из 83"}
+    br = tg.format_brief(state, cfg, now=day + 3600)
+    head = br.split("\n")[0]
+    _check("сводка: первая строка — у дна 1, позиций 2 (закрытая не в счёте), сигналов 1",
+           "🟢 у дна: 1" in head and "позиций: 2" in head and "🔔 сигналов: 1" in head, failures)
+    _check("сводка: монеты — карточка выше и ниже порога",
+           "GRAM 70 — карточка выше" in br and "ниже порога 70: LUNC 67.1" in br, failures)
+    _check("сводка: позиция со стопом и целью ценами",
+           "💰 <b>ARB</b> +19.6%" in br and "стоп 0.1875" in br and "цель 0.4500" in br, failures)
+    _check("сводка: спарклайн при ≥7 снапшотах, закрытая — итогом сделки",
+           "<code>" in br and "STOP закрыта по сигналу · итог −$40.20" in br, failures)
+    _check("сводка: подвал — длительность скана и недоступный on-chain",
+           "скан 23 мин" in br and "on-chain недоступен" in br, failures)
+    bad = tg.format_brief({**state, "scan": {"ran": True, "ok": False,
+                                             "error": "скан упал — смотреть logs/"}}, cfg,
+                          now=day + 3600)
+    _check("сводка: упал скан -> ⚠ в первой строке, без вчерашних монет",
+           "⚠ скан не завершился" in bad.split("\n")[0] and "нет свежих данных скана" in bad
+           and "карточка выше" not in bad, failures)
+    none = tg.format_brief({**state, "scan": {"ran": False, "ok": None}}, cfg, now=day + 3600)
+    _check("сводка: скана не было -> так и сказано", "скана сегодня не было" in none, failures)
+    _check("сводка: watch упал -> «позиции не обновлены»", "⚠ позиции не обновлены" in
+           tg.format_brief({**state, "watch_ok": False}, cfg, now=day + 3600), failures)
+    _check("сводка: пометка теста", tg.format_brief(state, cfg, now=day, test=True)
+           .startswith("<b>🧪 ТЕСТ"), failures)
+    old = tg.format_brief({**state, "positions": [arb_row]}, cfg, now=day + 5 * 86400)
+    _check("сводка: застрявшая цена помечена датой", "⚠ цена на 30.09" in old, failures)
+
+    # brief_state: из базы и watchlist (файловая SQLite во временной папке).
+    import copy
+    import json as _json
+    import tempfile
+    from pathlib import Path as _P
+    from scanner.config import Config
+    from scanner.db import Store
+    from scanner.notify.deliver import brief_state
+    with tempfile.TemporaryDirectory() as tmp:
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {"db_path": str(_P(tmp) / "t.db"),
+                       "watchlist_json": str(_P(tmp) / "wl.json")}
+        c2 = Config(d)
+        st = Store(d["output"]["db_path"])
+        rid = st.new_run("x")
+        st.finish_run(rid, 10, 5, 3, {"elapsed_sec": 600, "unavailable": ["onchain"],
+                                      "dev_github": "2 из 3", "btc_dd": 0.3})
+        st.record_alert("GRAM", 70.0)
+        st.close()
+        _P(d["output"]["watchlist_json"]).write_text(_json.dumps([
+            {"symbol": "GRAM", "zone": "ПРУЖИНА/ДНО", "score": 70.0, "confidence": 0.9, "track": "A"},
+            {"symbol": "LUNC", "zone": "ПРУЖИНА/ДНО", "score": 67.1, "confidence": 0.9, "track": "Q"},
+            {"symbol": "MID", "zone": "СЕРЕДИНА", "score": 69.0, "confidence": 0.9, "track": "A"},
+        ]), encoding="utf-8")
+        ps = PositionStore(d["output"]["db_path"])
+        pid = ps.add("GRAM", 1.5, 66.7, coin_id="the-open-network", base_low=1.3, paper=True)
+        ps.add("GRAM", 1.5, 66.7, paper=True, variant="B", twin_of=pid)
+        ps.snapshot(pid, 1.49, -0.8, 1.5)
+        ps.record_event(pid, "ladder_0", 2.25, "тест")
+        ps.close_db()
+        bs = brief_state(c2)
+    _check("brief_state: скан сегодня завершён, 10 мин, on-chain недоступен",
+           bs["scan"]["ok"] is True and bs["scan"]["elapsed_min"] == 10
+           and bs["unavailable"] == ["onchain"], failures)
+    _check("brief_state: карточка сегодня -> new, ниже порога -> near (без СЕРЕДИНЫ)",
+           [c.symbol for c in bs["new"]] == ["GRAM"] and [c.symbol for c in bs["near"]] == ["LUNC"],
+           failures)
+    _check("brief_state: позиции без близнецов, снапшот сегодня -> watch ok",
+           len(bs["positions"]) == 1 and bs["watch_ok"] is True, failures)
+    _check("brief_state: сигнал дня подписан («фикс 33%»)",
+           bs["signals_today"] == [{"symbol": "GRAM", "label": "фикс 33%", "is_paper": 1}], failures)
 
     # Недельная сводка (обычная неделя): счётчик + напоминание + отсчёт до итога.
     wk = format_weekly({"week_no": 2, "milestone": False, "milestone_weeks": 4,
@@ -1131,6 +1244,116 @@ def test_exit_alert_format(cfg, failures: list[str]) -> None:
     _check("итоговая: заголовок ИТОГОВАЯ", "ИТОГОВАЯ за 4" in ms, failures)
     _check("итоговая: кумулятив пружин", "34" in ms, failures)
     _check("итоговая: call-to-decide про капитал", "capital_usdt" in ms, failures)
+
+
+def test_github_levels(cfg, failures: list[str]) -> None:
+    print("GitHub-активность, свечи Bybit, картинка уровней плана:")
+    from scanner.sources import github
+    from scanner.stages import liveness
+    now = 1790812800.0   # 2026-10-01 00:00 UTC
+
+    # GitHub: ссылки из CoinGecko, разбор commits.atom, сводка за 4 недели.
+    det = {"links": {"repos_url": {"github": ["https://github.com/ton-blockchain/ton",
+                                             "https://github.com/", "", "https://github.com/tonorg"]}}}
+    _check("github: ссылки без пустых и «github.com/» без пути",
+           github.repo_links(det) == ["https://github.com/ton-blockchain/ton",
+                                      "https://github.com/tonorg"], failures)
+    _check("github: repo-ссылка и org-ссылка",
+           github.split_link("https://github.com/a/b.git/tree/x") == ("a", "b")
+           and github.split_link("https://github.com/org") == ("org", ""), failures)
+    entry = ("<entry><updated>{}</updated><author>\n<name>{}</name></author></entry>")
+    atom = "<feed><updated>2026-10-01T00:00:00Z</updated>" + "".join(
+        entry.format(t, a) for t, a in [("2026-09-30T10:00:00Z", "ann"), ("2026-09-20T10:00:00Z", "bob"),
+                                         ("2026-09-10T10:00:00Z", "cid"), ("2026-08-01T10:00:00Z", "ann")]) + "</feed>"
+    cm = github.parse_atom(atom)
+    _check("github: 4 коммита из ленты (заголовок ленты не считается)", len(cm) == 4, failures)
+    sm = github.summarize_commits(cm, now)
+    _check("github: за 4 нед. 3 коммита от 3 авторов, последний 0 дн. назад",
+           sm == {"commits_4w": 3, "authors_4w": 3, "last_commit_days": 0}, failures)
+    _check("github: пустая лента -> None", github.summarize_commits([], now)["commits_4w"] is None,
+           failures)
+
+    # Живость по GitHub (developer_data CoinGecko больше нет).
+    tick = {"tickers": [{"market": {"name": "Binance"}}] + [{"market": {"name": f"x{i}"}}
+                                                            for i in range(10)]}
+    c = Candidate(source="t", track="A", symbol="TON")
+    liveness.assess_liveness(c, tick, cfg, {"commits_4w": 20, "authors_4w": 4,
+                                            "last_commit_days": 0, "links": ["x"]})
+    _check("живость: 20+ коммитов и 4 автора -> 9/10 (dev 3 + авторы 1 + биржи 5)",
+           c.liveness_score == 9.0 and any("20+ коммитов" in n for n in c.liveness_notes), failures)
+    c2 = Candidate(source="t", track="A", symbol="ORG")
+    liveness.assess_liveness(c2, tick, cfg, {"commits_4w": None, "last_commit_days": 12,
+                                             "links": ["x"]})
+    _check("живость: org-ссылка, push 12 дн. назад -> «жив», 7/10",
+           c2.liveness_score == 7.0 and any("последний коммит 12 дн." in n for n in c2.liveness_notes),
+           failures)
+    c3 = Candidate(source="t", track="A", symbol="OLD")
+    liveness.assess_liveness(c3, tick, cfg, {"commits_4w": None, "last_commit_days": 400,
+                                             "links": ["x"]})
+    _check("живость: код не обновлялся 400 дн. -> предупреждение, только биржи (5)",
+           c3.liveness_score == 5.0 and any("не обновлялся 400" in n for n in c3.liveness_notes),
+           failures)
+    c5 = Candidate(source="t", track="A", symbol="TON")
+    liveness.assess_liveness(c5, tick, cfg, {"commits_4w": 0, "authors_4w": 0,
+                                             "last_commit_days": 46, "links": ["x"]})
+    _check("живость: 0 коммитов в основной ветке, последний 46 дн. -> «вялый», не «встал»",
+           c5.liveness_score == 6.0 and not any("встал" in n for n in c5.liveness_notes), failures)
+    c4 = Candidate(source="t", track="A", symbol="FAIL")
+    liveness.assess_liveness(c4, tick, cfg, {"commits_4w": None, "last_commit_days": None,
+                                             "links": ["x"]})
+    _check("живость: ссылка есть, GitHub не ответил -> так и сказано",
+           any("GitHub не ответил" in n for n in c4.liveness_notes), failures)
+
+    # Скор: источник, недоступный для всех монет, не режет confidence.
+    s1 = Candidate(source="t", track="A", symbol="S", zone="ПРУЖИНА/ДНО", rf_venue="Bybit spot",
+                   volume_24h=5e7, mc_tvl=0.3, fdv_mc=1.2, liveness_score=8.0)
+    sc, conf, br = compute_score(s1, cfg, {"onchain"})
+    sc0, conf0, _ = compute_score(s1, cfg)
+    _check("скор: on-chain недоступен -> confidence 1.0, балл тот же",
+           conf == 1.0 and conf0 == 0.9 and sc == sc0 and br["onchain"]["source"] == "недоступен",
+           failures)
+
+    # Свечи Bybit: только закрытые, oldest→newest; сверка тикера по цене.
+    from scanner.sources import bybit
+    day_ms = 86_400_000
+    now_ms = int(now * 1000) + 3 * 3600 * 1000
+    raw = {"result": {"list": [[str(int(now * 1000)), "3", "4", "2", "3.5", "10", "35"],
+                               [str(int(now * 1000) - day_ms), "2", "3", "1", "3", "10", "30"],
+                               [str(int(now * 1000) - 2 * day_ms), "1", "2", "1", "2", "10", "20"]]}}
+    ob = bybit.parse_daily_ohlcv(raw, now_ms)
+    _check("bybit: незакрытая свеча отброшена, порядок oldest→newest",
+           ob["c"] == [2.0, 3.0] and ob["h"] == [2.0, 3.0] and ob["qv"] == [20.0, 30.0], failures)
+    _check("bybit: тикер совпал, цена та же -> та же монета",
+           bybit.same_coin(1.50, 1.45) is True and bybit.same_coin(0.000586, 0.000300) is False
+           and bybit.same_coin(None, 1.0) is None, failures)
+
+    # watchlist.json -> кандидаты: цена и любые поля модели доезжают до Telegram.
+    import json as _json
+    import tempfile
+    from pathlib import Path as _P
+    from scanner.pipeline import load_watchlist
+    with tempfile.TemporaryDirectory() as tmp:
+        f = _P(tmp) / "wl.json"
+        f.write_text(_json.dumps([{"symbol": "GRAM", "price_usd": 1.5, "zone": "ПРУЖИНА/ДНО",
+                                   "score": 70.0, "spring": True, "unknown_field": 1,
+                                   "indicators": {"base_len_days": 71}}]), encoding="utf-8")
+        wl = load_watchlist(str(f))
+    _check("watchlist: цена, зона, индикаторы, spring -> spring_prefilter",
+           len(wl) == 1 and wl[0].price_usd == 1.5 and wl[0].indicators["base_len_days"] == 71
+           and wl[0].spring_prefilter is True, failures)
+
+    # Картинка: Pillow и шрифт есть — PNG; нет — None (сообщение уйдёт текстом).
+    from scanner.notify import chart
+    c_ = [10.0] * 100 + [8.0] * 250 + [9.0] * 50
+    ohlcv = {"o": c_, "c": c_, "h": [x * 1.02 for x in c_], "l": [x * 0.98 for x in c_]}
+    png = chart.render_levels(ohlcv, title="TEST/USDT", buys=[9.0, 8.5], stop=7.0,
+                              targets=[(13.5, "+50%")])
+    if chart.available():
+        _check("картинка: PNG с уровнями", isinstance(png, bytes) and png[:4] == b"\x89PNG", failures)
+    else:
+        _check("картинка: Pillow нет -> None (текстом)", png is None, failures)
+    _check("картинка: мало истории -> None", chart.render_levels({"c": [1.0, 2.0]}, title="x")
+           is None, failures)
 
 
 def test_ladder(cfg, failures: list[str]) -> None:
@@ -1218,6 +1441,8 @@ def main() -> int:
     test_exit_alert_format(cfg, failures)
     print()
     test_ladder(cfg, failures)
+    print()
+    test_github_levels(cfg, failures)
     print()
     if failures:
         print(f"РЕЗУЛЬТАТ: {_FAIL} — провалено {len(failures)}: {failures}")

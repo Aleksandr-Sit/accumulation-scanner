@@ -66,7 +66,11 @@
 
   "stage3b_liveness": {
     "_comment": "Живость проекта (survivorship-фильтр 'легит но труп'). Пороги [оценка].",
+    "_github_note": "CoinGecko с 09.2026 не отдаёт developer_data — разработка берётся из GitHub по ссылкам CoinGecko (sources/github.py): репозиторий — commits.atom (≈20 последних коммитов, «20» = 20 и больше; авторы за 4 нед. ≥3 = +1), организация — дата последнего push через GitHub API (60/час без GITHUB_TOKEN). Для org-ссылок пороги давности: ≤ last_commit_alive_days — жив, ≤ last_commit_stale_days — вялый.",
     "enabled": true,
+    "github": true,
+    "last_commit_alive_days": 30,
+    "last_commit_stale_days": 180,
     "commits_active": 20,
     "commits_alive": 3,
     "exchanges_broad": 10,
@@ -135,6 +139,7 @@
   },
 
   "stage5_score": {
+    "_confidence_note": "Блок, источник которого не ответил в прогоне ни по одной монете (on-chain при Dune 402), в знаменатель confidence не входит: общая дыра монеты не различает. Источник ответил, а по монете данных нет — confidence режется как раньше.",
     "enabled": true,
     "weights": {
       "zone": 0.28,
@@ -148,15 +153,18 @@
 
   "stage6_telegram": {
     "enabled": true,
+    "_format_note": "Гибрид (03.10.2026): карточка СО звуком — только когда есть действие: новая монета у дна (scan --notify: лестница, стоп, цели, картинка уровней) или сигнал выхода по РЕАЛЬНОЙ позиции (watch --notify; paper и информационные — без звука). Сводка дня БЕЗ звука — `run.py brief` последним шагом daily_run: рынок, монеты у дна, позиции, статус прогона. Нет сводки в день прогона = прогон не дошёл до конца (logs/). charts — картинка (Pillow, опционально; без него текст). card_* — бюджет лестницы в карточке: 4 ступени × $10 (минимум ступени по LADDER_REPORT). near_threshold_n — сколько монет зоны дна ниже порога показывать в сводке. weekly_report_weekday: день недели (0 = пн) для report --if-due; пропущен — уйдёт в первый прогон после.",
     "min_score": 70,
     "min_confidence": 0.6,
     "only_zones": ["ПРУЖИНА/ДНО"],
     "max_alerts": 10,
-    "daily_digest": true,
-    "digest_max_positions": 20,
     "alert_mute_days": 3,
-    "_heartbeat_note": "heartbeat: scan --notify без алерта шлёт «прогон завершён, кандидатов нет» — нет сообщения в день прогона = прогон не дошёл до конца. weekly_report_weekday: день недели (0 = пн) для report --if-due из ежедневного прогона; пропущен — уйдёт в первый прогон после.",
-    "heartbeat": true,
+    "charts": true,
+    "card_budget_usdt": 40,
+    "card_steps": 4,
+    "card_min_order_usdt": 10,
+    "near_threshold_n": 3,
+    "digest_max_positions": 20,
     "weekly_report_weekday": 0
   },
 
@@ -210,7 +218,9 @@
       "api.geckoterminal.com": 25,
       "api.dexscreener.com": 200,
       "api.gopluslabs.io": 50,
-      "api.honeypot.is": 50
+      "api.honeypot.is": 50,
+      "github.com": 30,
+      "api.github.com": 30
     }
   },
 
