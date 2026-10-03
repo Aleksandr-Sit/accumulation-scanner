@@ -301,7 +301,7 @@ py -3 run.py market                # контекст рынка: просадк
 py -3 backtest/market_regime_study.py   # валидация входа/выхода (нужен .cache/binance_1d)
 ```
 
-На VPS (Linux) обычно просто `python3 run.py scan --track all`.
+На VPS (Linux) — `python3 run.py scan --track all`; ежедневный прогон — ниже.
 
 ### Ежедневный запуск (Windows)
 
@@ -319,6 +319,21 @@ Unregister-ScheduledTask -TaskName AccumulationScannerDaily -Confirm:$false   # 
 
 Задача работает, пока пользователь в системе; проспал ноутбук — стартует после пробуждения.
 Без регулярного запуска paper A/B не копит выборку: сигналы у дна редки и идут пачками.
+
+### Ежедневный запуск (VPS, Linux)
+
+`scripts/daily_run.sh` — то же самое для Linux (`--no-notify` — без Telegram). Расписание —
+таймер systemd из `scripts/systemd/` (10:00 Europe/Samara; сервер был выключен — прогон после
+включения). Проект в `/opt/scanner`, `.env`/`scanner.db` переносятся вручную (не в git):
+
+```bash
+cp scripts/systemd/accumulation-scanner.* /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now accumulation-scanner.timer
+systemctl start accumulation-scanner.service      # прогнать сейчас
+systemctl list-timers accumulation-scanner.timer  # когда следующий
+```
+
+Обе машины сразу не запускать: один бот, общий mute и paper-позиции у каждой свои.
 
 ## Конфигурация — `config.json`
 

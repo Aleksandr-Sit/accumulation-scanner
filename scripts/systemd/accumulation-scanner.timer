@@ -1,0 +1,10 @@
+[Unit]
+Description=Accumulation Scanner — каждый день в 10:00 по Самаре (UTC+4)
+
+[Timer]
+OnCalendar=*-*-* 10:00:00 Europe/Samara
+# Сервер был выключен в 10:00 — прогон сразу после включения.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

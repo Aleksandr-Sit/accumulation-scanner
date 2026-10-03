@@ -1,0 +1,12 @@
+[Unit]
+Description=Accumulation Scanner — ежедневный прогон (scan, watch, report, brief)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/scanner
+ExecStart=/usr/bin/bash /opt/scanner/scripts/daily_run.sh
+# Прогон ~25 мин; больше двух часов — завис.
+TimeoutStartSec=2h
+Nice=10
