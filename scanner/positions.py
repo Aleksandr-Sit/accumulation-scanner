@@ -53,6 +53,20 @@ CREATE TABLE IF NOT EXISTS position_snapshots (
     hwm         REAL
 );
 CREATE INDEX IF NOT EXISTS idx_snap_pos ON position_snapshots(position_id, ts);
+CREATE TABLE IF NOT EXISTS exchange_fills (
+    exec_id     TEXT PRIMARY KEY,
+    venue       TEXT NOT NULL,
+    symbol      TEXT NOT NULL,
+    side        TEXT NOT NULL,
+    price       REAL NOT NULL,
+    qty         REAL NOT NULL,
+    fee_usdt    REAL DEFAULT 0,
+    base_delta  REAL NOT NULL,
+    ts          REAL NOT NULL,
+    order_id    TEXT DEFAULT '',
+    position_id INTEGER,
+    note        TEXT DEFAULT ''
+);
 """
 
 
@@ -211,16 +225,39 @@ class PositionStore:
         row = cur.fetchone()
         return row[0] if row and row[0] is not None else None
 
+    # --- исполнения биржи (run.py sync: идемпотентность по exec_id) ---
+    def has_fill(self, exec_id: str) -> bool:
+        cur = self.conn.execute("SELECT 1 FROM exchange_fills WHERE exec_id=?", (exec_id,))
+        return cur.fetchone() is not None
+
+    def record_fill(self, f: dict[str, Any], position_id: int | None, note: str = "") -> None:
+        """Записать исполнение (после того как оно применено к позиции). Повтор exec_id —
+        IntegrityError: вызывающий проверяет has_fill заранее."""
+        self.conn.execute(
+            "INSERT INTO exchange_fills(exec_id, venue, symbol, side, price, qty, fee_usdt, "
+            "base_delta, ts, order_id, position_id, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f["exec_id"], f["venue"], f["symbol"], f["side"], f["price"], f["qty"],
+             f["fee_usdt"], f["base_delta"], f["ts"], f.get("order_id", ""), position_id, note))
+        self.conn.commit()
+
+    def fills(self, position_id: int | None = None) -> list[dict[str, Any]]:
+        if position_id is None:
+            cur = self.conn.execute("SELECT * FROM exchange_fills ORDER BY ts, exec_id")
+        else:
+            cur = self.conn.execute("SELECT * FROM exchange_fills WHERE position_id=? "
+                                    "ORDER BY ts, exec_id", (position_id,))
+        return [_row_to_dict(cur, r) for r in cur.fetchall()]
+
     # --- системные флаги (идемпотентность одноразовых событий, position_id=0) ---
     def system_flag(self, name: str) -> bool:
         cur = self.conn.execute(
             "SELECT 1 FROM position_events WHERE position_id=0 AND type=? LIMIT 1", (name,))
         return cur.fetchone() is not None
 
-    def set_system_flag(self, name: str, note: str = "") -> None:
+    def set_system_flag(self, name: str, note: str = "", ts: float | None = None) -> None:
         self.conn.execute(
             "INSERT INTO position_events(position_id, ts, type, note) VALUES (0,?,?,?)",
-            (time.time(), name, note))
+            (ts if ts is not None else time.time(), name, note))
         self.conn.commit()
 
     def update_hwm(self, position_id: int, hwm: float) -> None:

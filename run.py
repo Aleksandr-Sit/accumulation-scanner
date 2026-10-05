@@ -13,6 +13,7 @@
   python run.py market [--backfill]         # история рынка альтов + индекс перегрева
   python run.py quality [--refresh-if-due]  # срез трека Q: дата, возраст; обновить, если пора
   python run.py backup [--send-weekly --notify]   # бэкап scanner.db (+ раз в неделю в Telegram)
+  python run.py sync                        # реальные позиции из исполнений Bybit (Read-Only)
   python run.py selftest                    # офлайн-проверка логики на фикстурах
 """
 from __future__ import annotations
@@ -453,7 +454,7 @@ def cmd_brief(args) -> int:
     from scanner.notify import deliver, telegram
     try:
         state = deliver.brief_state(cfg, scan_exit=args.scan_exit, watch_exit=args.watch_exit,
-                                    backup_exit=args.backup_exit)
+                                    backup_exit=args.backup_exit, sync_exit=args.sync_exit)
         text = telegram.format_brief(state, cfg, test=args.test)
     except Exception as e:
         if args.notify:
@@ -731,6 +732,24 @@ def cmd_backup(args) -> int:
     return code
 
 
+def cmd_sync(args) -> int:
+    """Реальные позиции из спот-исполнений Bybit (ключ Read-Only в .env). Нет ключа — тихий
+    пропуск, код 0; сбой API — код 1 (сводка дня: «⚠ синхронизация с Bybit не прошла»)."""
+    cfg = load_config(args.config)
+    from scanner import bybit, sync
+    from scanner.positions import PositionStore
+    ps = PositionStore(cfg["output"]["db_path"])
+    try:
+        code, lines = sync.run_sync(cfg, ps, lookup=lambda sym: _lookup_coin(cfg, sym))
+    except (bybit.BybitError, OSError) as e:   # сеть/ключ — без трейсбека, текст в лог
+        code, lines = 1, [f"FAIL: {type(e).__name__}: {e}"]
+    finally:
+        ps.close_db()
+    for line in lines:
+        print(f"[sync] {line}")
+    return code
+
+
 def cmd_selftest(args) -> int:
     from tests.selftest import main as selftest_main
     return selftest_main()
@@ -807,6 +826,9 @@ def main() -> int:
     pb.add_argument("--backup-exit", type=int, default=None,
                     help="код выхода backup из daily_run: ≠ 0 — «⚠ бэкап не сделан» в строке "
                          "статуса (3 — копия есть, но в Telegram не ушла)")
+    pb.add_argument("--sync-exit", type=int, default=None,
+                    help="код выхода sync из daily_run: ≠ 0 — «⚠ синхронизация с Bybit не "
+                         "прошла» в строке статуса")
     pb.add_argument("--config", default=None)
     pb.set_defaults(func=cmd_brief)
 
@@ -850,6 +872,11 @@ def main() -> int:
                           "проверяется и не пишется); с --notify")
     pbk.add_argument("--config", default=None)
     pbk.set_defaults(func=cmd_backup)
+
+    psy = sub.add_parser("sync", help="реальные позиции из спот-исполнений Bybit (ключ "
+                                      "Read-Only в .env; нет ключа — пропуск)")
+    psy.add_argument("--config", default=None)
+    psy.set_defaults(func=cmd_sync)
 
     pt = sub.add_parser("selftest", help="офлайн-проверка на фикстурах")
     pt.set_defaults(func=cmd_selftest)

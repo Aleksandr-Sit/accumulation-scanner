@@ -56,5 +56,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
         keys["dune"] = os.environ["DUNE_API_KEY"]
     keys["telegram_token"] = os.getenv("TELEGRAM_BOT_TOKEN", "")
     keys["telegram_chat_id"] = os.getenv("TELEGRAM_CHAT_ID", "")
+    # Ключ Bybit Read-Only для run.py sync — только из .env, в config.json его нет.
+    keys["bybit_key"] = os.getenv("BYBIT_API_KEY", "")
+    keys["bybit_secret"] = os.getenv("BYBIT_API_SECRET", "")
 
     return Config(data)

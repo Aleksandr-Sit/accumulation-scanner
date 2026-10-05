@@ -146,7 +146,8 @@ def send_exit_card(cfg, card: dict) -> bool:
 # ---------------------------------------------------------------- сводка дня
 
 def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
-                watch_exit: int | None = None, backup_exit: int | None = None) -> dict:
+                watch_exit: int | None = None, backup_exit: int | None = None,
+                sync_exit: int | None = None) -> dict:
     """Всё для сводки дня — из scanner.db, watchlist.json и среза трека Q, без сети."""
     from .. import regime
     from ..backup import EXIT_SEND_FAILED
@@ -248,4 +249,6 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
     return {"scan": scan, "watch_ok": watch_ok, "market": ctx, "new": new, "muted": muted,
             "near": near, "positions": rows, "signals_today": sigs,
             "unavailable": summ.get("unavailable") or [], "dev_github": summ.get("dev_github"),
-            "backup": backup, "track_q": track_q}
+            "backup": backup, "track_q": track_q,
+            # sync с Bybit: код шага из daily_run; ключа нет — шаг выходит с 0, пометки нет
+            "sync_fail": bool(sync_exit)}

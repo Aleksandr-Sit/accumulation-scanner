@@ -196,6 +196,17 @@
     "archive_label": "v1 (старый код, на 03.10)"
   },
 
+  "bybit_sync": {
+    "_comment": "run.py sync (scanner/sync.py): реальные позиции из спот-исполнений Bybit вместо ручного pos add. Ключ — ТОЛЬКО в .env (BYBIT_API_KEY, BYBIT_API_SECRET), права Read-Only, привязка к IP сервера (без неё ключ живёт 90 дней); нет ключа — шаг пропускается. Идемпотентно по execId (таблица exchange_fills). Окно: с прошлого успешного sync − overlap_days, первый раз — backfill_days назад (история Bybit — 2 года). Только пары к quote; остаток дешевле dust_usdt после продажи закрывается. base_url: https://api-demo.bybit.com — демо-счёт (ключ демо-режима).",
+    "enabled": true,
+    "base_url": "https://api.bybit.com",
+    "backfill_days": 30,
+    "overlap_days": 2,
+    "dust_usdt": 1.0,
+    "quote": "USDT",
+    "recv_window_ms": 5000
+  },
+
   "stage8_exit": {
     "_comment": "ОТКАЛИБРОВАНО history_calibration 16.07.2026 (Binance 2017-2026, 105 монет, 692 эпизода, ВЕРХНЯЯ граница из-за survivorship). Инвалидация 5%->25%: 59-70% пружин прокалывают базу перед ростом (shakeout), буфер 25% даёт win 31->50%, 2022 -6.5->-1.9%; 'без инвалидации' лучше на бумаге (+914%) но отвергнуто - survivorship скрывает делистинги. Лестница +100/+300 подтверждена: P(+100)=52-68%, P(+300)=23-31% по полным циклам. Трейлинг 30 после arm 60: p50 отката от HWM после +100% = 74% - без трейлинга отдаёшь почти всё.",
     "enabled": true,

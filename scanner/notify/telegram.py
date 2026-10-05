@@ -691,6 +691,8 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
         head.append("⚠ бэкап не сделан")
     elif state.get("backup") == "send_fail":
         head.append("⚠ бэкап не ушёл в Telegram")
+    if state.get("sync_fail"):
+        head.append("⚠ синхронизация с Bybit не прошла")
     lines = ["<b>" + " · ".join(head) + "</b>", ""]
     lines += market_block(state.get("market") or {}, cfg, now)
     lines.append("")

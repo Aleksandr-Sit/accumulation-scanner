@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Ежедневный прогон сканера на VPS: quality (срез трека Q, если пора) -> scan -> watch ->
-# report (раз в неделю) -> backup -> brief, Telegram, лог в logs/.
+# Ежедневный прогон сканера на VPS: quality (срез трека Q, если пора) -> scan -> sync (позиции
+# из Bybit) -> watch -> report (раз в неделю) -> backup -> brief, Telegram, лог в logs/.
 # Linux-двойник daily_run.ps1. Запускается таймером systemd (scripts/systemd/accumulation-scanner.timer).
 # Ручной запуск: bash scripts/daily_run.sh [--no-notify]
 set -u
@@ -27,6 +27,9 @@ run_step() {  # имя, аргументы run.py; код выхода — в $r
 run_step quality quality --refresh-if-due; quality_rc=$rc
 # watch идёт и при сбое scan: открытые позиции надо проверять независимо от воронки.
 run_step scan scan "${notify[@]}"; scan_rc=$rc
+# Реальные позиции из исполнений Bybit (ключ Read-Only в .env; нет ключа — пропуск, код 0) —
+# до watch, чтобы сегодняшние покупки сразу получили цену и сигналы. Сбой не блокирует watch.
+run_step sync sync; sync_rc=$rc
 run_step watch watch "${notify[@]}"; watch_rc=$rc
 # Недельная сводка: report сам решает, пора ли (--if-due, первый прогон недели).
 run_step report report --if-due "${notify[@]}"; report_rc=$rc
@@ -36,10 +39,10 @@ backup_dir=()
 run_step backup backup "${backup_dir[@]}" --send-weekly "${notify[@]}"; backup_rc=$rc
 # Сводка дня — тихо и последней; пришла сводка = прогон дошёл до конца.
 run_step brief brief --scan-exit "$scan_rc" --watch-exit "$watch_rc" --backup-exit "$backup_rc" \
-    "${notify[@]}"; brief_rc=$rc
+    --sync-exit "$sync_rc" "${notify[@]}"; brief_rc=$rc
 
 # Логи старше 30 дней не нужны.
 find logs -name 'daily_*.log' -mtime +30 -delete
 
-[ "$quality_rc" -eq 0 ] && [ "$scan_rc" -eq 0 ] && [ "$watch_rc" -eq 0 ] && [ "$report_rc" -eq 0 ] \
-    && [ "$backup_rc" -eq 0 ] && [ "$brief_rc" -eq 0 ]
+[ "$quality_rc" -eq 0 ] && [ "$scan_rc" -eq 0 ] && [ "$sync_rc" -eq 0 ] && [ "$watch_rc" -eq 0 ] \
+    && [ "$report_rc" -eq 0 ] && [ "$backup_rc" -eq 0 ] && [ "$brief_rc" -eq 0 ]

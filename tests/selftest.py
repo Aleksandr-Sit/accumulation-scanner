@@ -1860,6 +1860,224 @@ def test_ladder(cfg, failures: list[str]) -> None:
            any("не вход у дна" in w for w in p["warns"]), failures)
 
 
+def test_bybit_sync(cfg, failures: list[str]) -> None:
+    print("Bybit sync — подпись V5, исполнения -> реальные позиции, идемпотентность:")
+    import json as _json
+    import tempfile
+    import urllib.parse as _up
+    from pathlib import Path as _P
+    from scanner import bybit, sync
+    from scanner.config import Config
+
+    # Эталон — функция gen_signature официального примера bybit-exchange/api-usage-examples
+    # (V5_demo/api_demo/Encryption_HMAC.py; key = secret = "XXXXXXXXXX"), запущенная на строке
+    # GET из docs/v5/guide: timestamp 1658384314791, recv_window 5000.
+    q = "category=option&symbol=BTC-29JUL22-25000-C"
+    _check("подпись: совпадает с официальным примером Bybit (HMAC-SHA256, hex)",
+           bybit.sign("XXXXXXXXXX", "1658384314791", "XXXXXXXXXX", "5000", q)
+           == "c00720f96c5934ca7057ac28ae65b823f83b8b67a8fe784e7795ca0fa3c148ec", failures)
+
+    # Клиент: подписывается ровно та строка запроса, что ушла в URL; секрет не уходит в сеть.
+    calls = []
+
+    def fake(pages):
+        def _f(url, headers, timeout):
+            calls.append((url, headers))
+            qs = dict(_up.parse_qsl(_up.urlsplit(url).query))
+            body = pages(url, qs)
+            return (body.pop("_status", 200), _json.dumps(body).encode())
+        return _f
+
+    ok_body = lambda result: {"retCode": 0, "retMsg": "OK", "result": result}  # noqa: E731
+    cl = bybit.Client("KEY1", "SECRET1", fetch=fake(lambda u, qs: ok_body({"list": []})),
+                      clock=lambda: 1700000000.123, pause=0)
+    cl.get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    url, h = calls[-1]
+    sent_q = _up.urlsplit(url).query
+    _check("клиент: X-BAPI-* заголовки, timestamp в мс, подпись над строкой из URL",
+           h["X-BAPI-API-KEY"] == "KEY1" and h["X-BAPI-TIMESTAMP"] == "1700000000123"
+           and h["X-BAPI-RECV-WINDOW"] == "5000" and h["X-BAPI-SIGN-TYPE"] == "2"
+           and h["X-BAPI-SIGN"] == bybit.sign("SECRET1", "1700000000123", "KEY1", "5000", sent_q)
+           and sent_q == "accountType=UNIFIED", failures)
+    _check("клиент: секрет не попадает ни в URL, ни в заголовки",
+           "SECRET1" not in url and all("SECRET1" not in v for v in h.values()), failures)
+    bad = bybit.Client("KEY1", "SECRET1", pause=0, fetch=fake(
+        lambda u, qs: {"retCode": 10004, "retMsg": "error sign!", "result": {}}))
+    try:
+        bad.get("/v5/execution/list", {"category": "spot"})
+        err = None
+    except bybit.BybitError as e:
+        err = e
+    _check("клиент: retCode 10004 -> BybitError с кодом и подсказкой, без секрета",
+           err is not None and err.code == 10004 and "BYBIT_API_SECRET" in str(err)
+           and "SECRET1" not in str(err), failures)
+    try:
+        bybit.Client("", "")
+        no_key = False
+    except bybit.BybitError:
+        no_key = True
+    _check("клиент: без ключа — BybitError до любого запроса", no_key, failures)
+
+    # Исполнения: окна по 7 дней (предел запроса), страницы по курсору, дубли execId отброшены.
+    calls.clear()
+    day_ms = 86400 * 1000
+
+    def ex_pages(u, qs):
+        s = int(qs["startTime"])
+        if not qs.get("cursor"):
+            return ok_body({"list": [{"execId": f"a{s}"}, {"execId": "dup"}],
+                            "nextPageCursor": "p2"})
+        return ok_body({"list": [{"execId": f"b{s}"}, {"execId": "dup"}], "nextPageCursor": ""})
+    cl = bybit.Client("K", "S", fetch=fake(ex_pages), pause=0)
+    got = cl.executions(0, 15 * day_ms)
+    windows = sorted({int(dict(_up.parse_qsl(_up.urlsplit(u).query))["startTime"])
+                      for u, _ in calls})
+    spans = [int(dict(_up.parse_qsl(_up.urlsplit(u).query))["endTime"])
+             - int(dict(_up.parse_qsl(_up.urlsplit(u).query))["startTime"]) for u, _ in calls]
+    _check("исполнения: 15 дней -> 3 окна ≤ 7 дней, по 2 страницы, дубль execId один раз",
+           windows == [0, 7 * day_ms, 14 * day_ms] and len(calls) == 6
+           and max(spans) < 7 * day_ms and len(got) == 7
+           and sum(1 for g in got if g["execId"] == "dup") == 1, failures)
+
+    # Разбор фикстуры: формат /v5/execution/list (строки), спот, комиссия в базовой монете.
+    t0 = 1759600000.0
+    fx = lambda eid, side, px, qty, fee, cur, dt, sym="LINKUSDT", **kw: {  # noqa: E731
+        "symbol": sym, "side": side, "execId": eid, "orderId": "o" + eid, "execType": "Trade",
+        "execPrice": str(px), "execQty": str(qty), "execValue": str(px * qty),
+        "execFee": str(fee), "feeCurrency": cur, "feeRate": "0.001", "isMaker": False,
+        "execTime": str(int((t0 + dt) * 1000)), **kw}
+    buy1 = fx("e1", "Buy", 20.0, 5.0, 0.005, "LINK", 0)        # комиссия в LINK
+    buy2 = fx("e2", "Buy", 16.0, 2.5, 0.04, "USDT", 3600)      # комиссия в USDT (maker)
+    sell1 = fx("e3", "Sell", 30.0, 3.0, 0.09, "USDT", 7200)
+    sell2 = fx("e4", "Sell", 31.0, 4.495, 0.139345, "USDT", 10800)   # весь остаток
+    p1 = sync.parse_fill(buy1)
+    _check("разбор: покупка с комиссией в базовой монете -> на счёт пришло execQty − execFee",
+           p1["symbol"] == "LINK" and p1["side"] == "buy" and abs(p1["base_delta"] - 4.995) < 1e-12
+           and abs(p1["fee_usdt"] - 0.1) < 1e-12 and abs(p1["ts"] - t0) < 1e-6, failures)
+    p3 = sync.parse_fill(sell1)
+    _check("разбор: продажа с комиссией в USDT -> ставка = fee / value",
+           abs(p3["base_delta"] + 3.0) < 1e-12 and abs(p3["fee_rate"] - 0.001) < 1e-12, failures)
+    _check("разбор: не сделка (Funding), не пара к USDT, мусор -> None",
+           sync.parse_fill({**buy1, "execType": "Funding"}) is None
+           and sync.parse_fill({**buy1, "symbol": "LINKBTC"}) is None
+           and sync.parse_fill({**buy1, "execQty": ""}) is None, failures)
+
+    class FakeClient:
+        def __init__(self, items, wallet):
+            self.items, self.wallet, self.windows = items, wallet, []
+
+        def executions(self, start_ms, end_ms):
+            self.windows.append((start_ms, end_ms))
+            return [it for it in self.items if start_ms <= int(it["execTime"]) <= end_ms]
+
+        def wallet_balance(self):
+            return self.wallet
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = _json.loads(_json.dumps(cfg._d))
+        d["output"] = {"db_path": str(_P(tmp) / "t.db"), "watchlist_json": str(_P(tmp) / "w.json")}
+        d["api_keys"]["bybit_key"] = d["api_keys"]["bybit_secret"] = ""
+        c = Config(d)
+        ps = PositionStore(d["output"]["db_path"])
+        code, lines = sync.run_sync(c, ps, now=t0)
+        _check("без ключа: код 0, «пропуск», в базе ничего",
+               code == 0 and "пропуск" in lines[0] and not ps.all_positions()
+               and not ps.system_flag(sync.FLAG), failures)
+
+        paper = ps.add("LINK", 19.0, 10.0, paper=True)
+        wallet = {"LINK": {"balance": 4.995 + 2.5 - 3.0, "usd": 140.0, "locked": 0.0},
+                  "USDT": {"balance": 500.0, "usd": 500.0, "locked": 0.0},
+                  "ARB": {"balance": 100.0, "usd": 40.0, "locked": 0.0},
+                  "PEPE": {"balance": 1e5, "usd": 0.7, "locked": 0.0}}
+        fc = FakeClient([buy1, buy2, sell1, fx("e9", "Sell", 1.0, 5.0, 0.005, "USDT", 50,
+                                                 sym="OPUSDT")], wallet)
+        look = lambda sym: {"coin_id": "chainlink"} if sym == "LINK" else {}  # noqa: E731
+        code, lines = sync.run_sync(c, ps, client=fc, lookup=look, now=t0 + 8000)
+        real = [p for p in ps.all_positions() if not p["is_paper"]]
+        pos = real[0] if len(real) == 1 else {}
+        avg = (20.0 * 4.995 + 16.0 * 2.5) / 7.495
+        _check("sync: покупка + докупка -> одна реальная позиция, средняя по количеству",
+               len(real) == 1 and pos["symbol"] == "LINK" and pos["coin_id"] == "chainlink"
+               and pos["venue"] == "bybit" and abs(pos["entry_ts"] - t0) < 1e-6
+               and abs(pos["initial_qty"] - 7.495) < 1e-9, failures)
+        _check("sync: продажа 3 -> остаток 4.495, realized по фактической ставке 0.1%",
+               abs(pos.get("qty", 0) - 4.495) < 1e-9
+               and abs(pos["realized_usdt"] - (3 * 30 * 0.999 - 3 * avg * 1.001)) < 1e-9
+               and abs(pos["entry_price"] - avg) < 1e-9, failures)
+        _check("sync: paper-позиция той же монеты не тронута",
+               ps.get(paper)["qty"] == 10.0 and ps.get(paper)["status"] == "open", failures)
+        _check("sync: продажа без позиции записана, позиция не открыта",
+               any("OP: продажа" in x and "позиции нет" in x for x in lines)
+               and not any(p["symbol"] == "OP" for p in ps.all_positions())
+               and len(ps.fills()) == 4, failures)
+        _check("сверка: баланс LINK совпал -> молчим; ARB на счёте без позиции -> строка; "
+               "USDT и пыль PEPE -> молчим",
+               not any("LINK: на счёте" in x for x in lines)
+               and any(x.startswith("ℹ ARB") for x in lines)
+               and not any(x.startswith("ℹ USDT") or "PEPE" in x for x in lines), failures)
+        _check("sync: первый раз — окно backfill_days назад, отметка курсора записана",
+               fc.windows[0][0] == int((t0 + 8000 - d["bybit_sync"]["backfill_days"] * 86400)
+                                       * 1000) and ps.system_flag(sync.FLAG), failures)
+
+        # Повтор: те же исполнения снова в окне -> ничего не задваивается.
+        before = (ps.get(pos["id"])["qty"], ps.get(pos["id"])["entry_price"],
+                  ps.get(pos["id"])["realized_usdt"], len(ps.fills()))
+        fc.items.append(sell2)
+        fc.wallet = {"LINK": {"balance": 0.0, "usd": 0.0, "locked": 0.0}}
+        last = ps.last_event_ts(0, sync.FLAG)
+        code2, lines2 = sync.run_sync(c, ps, client=fc, lookup=look, now=t0 + 20000)
+        after = ps.get(pos["id"])
+        _check("повторный sync: старые 4 исполнения пропущены, новое применено один раз",
+               code2 == 0 and any("новых 1, уже учтённых 4" in x for x in lines2)
+               and len(ps.fills()) == before[3] + 1, failures)
+        _check("повторный sync: окно с прошлого sync − overlap_days",
+               fc.windows[-1][0] == int((last - d["bybit_sync"]["overlap_days"] * 86400) * 1000),
+               failures)
+        _check("продажа всего остатка -> позиция закрыта, realized накоплен",
+               after["status"] == "closed" and after["qty"] == 0
+               and after["realized_usdt"] > before[2], failures)
+        code3, _ = sync.run_sync(c, ps, client=fc, lookup=look, now=t0 + 30000)
+        _check("третий sync без новых исполнений: позиции и журнал не меняются",
+               code3 == 0 and len(ps.fills()) == before[3] + 1
+               and ps.get(pos["id"])["realized_usdt"] == after["realized_usdt"], failures)
+
+        # Пыль: продали почти всё, остаток дешевле dust_usdt — закрывается.
+        b = fx("d1", "Buy", 2.0, 10.0, 0.0, "USDT", 40000, sym="ARBUSDT")
+        s_ = fx("d2", "Sell", 2.2, 9.7, 0.0, "USDT", 40100, sym="ARBUSDT")
+        fc.items += [b, s_]
+        fc.wallet = {}
+        sync.run_sync(c, ps, client=fc, lookup=look, now=t0 + 41000)
+        arb = next(p for p in ps.all_positions() if p["symbol"] == "ARB")
+        _check("пыль: остаток 0.3 ARB (< 1 USDT) после продажи -> позиция закрыта",
+               arb["status"] == "closed" and "bybit_dust" in ps.event_types(arb["id"])
+               and not arb["coin_id"], failures)
+        # Сверка: позиция больше, чем есть на счёте -> предупреждение.
+        fc.items.append(fx("m1", "Buy", 1.0, 50.0, 0.0, "USDT", 42000, sym="OPUSDT"))
+        fc.wallet = {"OP": {"balance": 20.0, "usd": 20.0, "locked": 0.0}}
+        _, lines4 = sync.run_sync(c, ps, client=fc, lookup=look, now=t0 + 43000)
+        _check("сверка: в позиции 50 OP, на счёте 20 -> «сверь вручную»",
+               any(x.startswith("⚠ OP: на счёте 20") for x in lines4), failures)
+        ps.close_db()
+
+        # Сводка дня: код sync ≠ 0 -> пометка в первой строке; 0 или не запускали — молчим.
+        from scanner.db import Store
+        from scanner.notify import telegram as tg
+        from scanner.notify.deliver import brief_state
+        Store(d["output"]["db_path"]).close()
+        s1 = brief_state(c, now=t0, sync_exit=1)
+        s0 = brief_state(c, now=t0, sync_exit=0)
+        sn = brief_state(c, now=t0)
+    _check("brief_state: sync-exit 1 -> sync_fail, 0 и без кода -> нет",
+           s1["sync_fail"] and not s0["sync_fail"] and not sn["sync_fail"], failures)
+    st = {"scan": {"ran": True, "ok": True, "elapsed_min": 20.0, "watchlist": 80},
+          "watch_ok": True, "market": {}, "new": [], "muted": [], "near": [], "positions": [],
+          "signals_today": [], "unavailable": [], "dev_github": None}
+    _check("сводка: sync упал -> «⚠ синхронизация с Bybit не прошла» в первой строке",
+           "⚠ синхронизация с Bybit не прошла" in tg.format_brief(
+               {**st, "sync_fail": True}, cfg, now=t0).split("\n")[0]
+           and "Bybit" not in tg.format_brief(st, cfg, now=t0), failures)
+
+
 def main() -> int:
     cfg = load_config()
     failures: list[str] = []
@@ -1871,6 +2089,8 @@ def main() -> int:
     test_quality_refresh(cfg, failures)
     print()
     test_backup(cfg, failures)
+    print()
+    test_bybit_sync(cfg, failures)
     print()
     test_antirug_evm(cfg, failures)
     print()
