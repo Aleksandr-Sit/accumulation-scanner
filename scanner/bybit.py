@@ -103,6 +103,8 @@ class Client:
         code = data.get("retCode")
         if status != 200 or code != 0:
             hint = HINTS.get(code) if isinstance(code, int) else None
+            if hint is None and status == 401:   # wallet-balance с чужим ключом: 401, тело пустое
+                hint = HINTS[10003]
             raise BybitError(f"{path}: HTTP {status}, retCode {code} {data.get('retMsg', '')!r}"
                              + (f" — {hint}" if hint else ""), code)
         return data.get("result") or {}

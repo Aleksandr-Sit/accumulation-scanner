@@ -1911,6 +1911,16 @@ def test_bybit_sync(cfg, failures: list[str]) -> None:
     _check("клиент: retCode 10004 -> BybitError с кодом и подсказкой, без секрета",
            err is not None and err.code == 10004 and "BYBIT_API_SECRET" in str(err)
            and "SECRET1" not in str(err), failures)
+    unauth = bybit.Client("KEY1", "SECRET1", pause=0,
+                          fetch=lambda url, headers, timeout: (401, b""))
+    try:
+        unauth.wallet_balance()
+        err401 = None
+    except bybit.BybitError as e:
+        err401 = e
+    _check("клиент: HTTP 401 с пустым телом (так отвечает wallet-balance) -> «ключ не принят»",
+           err401 is not None and "HTTP 401" in str(err401) and "ключ не принят" in str(err401),
+           failures)
     try:
         bybit.Client("", "")
         no_key = False
