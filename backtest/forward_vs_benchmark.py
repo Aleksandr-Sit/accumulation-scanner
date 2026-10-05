@@ -18,6 +18,8 @@ CoinGecko: капа в прогоне входа → капа в последн�
     завышен, но меньше: выпавшие считаются до выпадения);
   • эмиссия (разлоки, инфляция) растит капу без роста цены — корзина по капе завышена;
   • книга — net-of-fees (как paper P&L), рынок и корзина — без комиссий.
+«держать %» — та же монета на том же окне по капе: книга против «держать» — цена выходов,
+«держать» против корзины — сам отбор (один прокси у обеих сторон).
 
 БД только читаются (sqlite mode=ro). Запуск из корня проекта:
   py -3 backtest/forward_vs_benchmark.py                          # книга текущей scanner.db
@@ -137,6 +139,20 @@ def basket(uni: dict, start: float, end: float) -> dict | None:
     return out
 
 
+def hold_return(uni: dict, p: dict, start: float, end: float) -> float | None:
+    """«Держать ту же монету» на окне позиции тем же прокси, что корзина: капа в последнем
+    прогоне ≤ входа → капа в последнем прогоне ≤ конца окна, %; монеты нет в капах — None.
+    Книга против «держать» — цена выходов (лестница, трейл, стоп), комиссий и капы ≠ цены
+    (эмиссия); «держать» против корзины — сам отбор при одинаковом способе измерения."""
+    t, v = uni["caps"].get(_coin_key(p.get("coin_id"), p["symbol"], p.get("chain"),
+                                     p.get("address")), ([], []))
+    i0 = bisect_right(t, start) - 1
+    k = bisect_right(t, end) - 1
+    if i0 < 0 or k <= i0:
+        return None
+    return (v[k] / v[i0] - 1) * 100
+
+
 def _weighted(rows: list[dict], key: str) -> tuple[float | None, float]:
     """Взвешенное стоимостью среднее корзины по позициям, где она посчитана; (ret, cost)."""
     rs = [r for r in rows if r["basket"] and r["basket"][key] is not None]
@@ -165,8 +181,9 @@ def report_book(title: str, positions: list[dict], last: dict, mkt: dict,
     by_id = {p["id"]: p for p in positions}
     for r in rows:
         r["basket"] = basket(uni, r["start"], r["end"]) if uni else None
-    print(f"{'символ':<9} {'вход':<9} {'конец':<9} {'книга %':>8} {'альты %':>8} {'BTC %':>7}"
-          f" {'корзина %':>10} {'нашлось':>8}")
+        r["hold"] = hold_return(uni, by_id[r["id"]], r["start"], r["end"]) if uni else None
+    print(f"{'символ':<9} {'вход':<9} {'конец':<9} {'книга %':>8} {'держать %':>10} "
+          f"{'альты %':>8} {'BTC %':>7} {'корзина %':>10} {'нашлось':>8}")
     for r in sorted(rows, key=lambda x: (x["start"], x["id"])):
         b = r["basket"]
         p = by_id[r["id"]]
@@ -176,8 +193,8 @@ def report_book(title: str, positions: list[dict], last: dict, mkt: dict,
             mark = "*"
         cov = f"{b['found']}/{b['n']}" if b else "—"
         print(f"{r['symbol'] + mark:<9} {_d(r['start']):<9} {_d(r['end']):<9} "
-              f"{_f(r['book_pct']):>8} {_f(r['alt_pct']):>8} {_f(r['btc_pct']):>7} "
-              f"{_f(b['ret'] if b else None):>10} {cov:>8}")
+              f"{_f(r['book_pct']):>8} {_f(r['hold']):>10} {_f(r['alt_pct']):>8} "
+              f"{_f(r['btc_pct']):>7} {_f(b['ret'] if b else None):>10} {cov:>8}")
     stale = f" ⚠ рынок на {_d(res['market_day'])}" if res["stale"] else ""
     print(f"итог по стоимости (${res['cost']:.0f}): книга {_f(res['book_pct'], 2)}% · "
           f"альты {_f(res['alt_pct'], 2)}% · BTC {_f(res['btc_pct'], 2)}% → "
@@ -185,6 +202,13 @@ def report_book(title: str, positions: list[dict], last: dict, mkt: dict,
     if not uni:
         print("контрольная корзина: в БД нет таблиц runs/candidates")
         return
+    held = [r for r in rows if r["hold"] is not None]
+    if held:
+        h_cost = sum(r["cost"] for r in held)
+        print(f"держать те же монеты (капа, без выходов и комиссий): "
+              f"{_f(sum(r['cost'] * r['hold'] for r in held) / h_cost, 2)}% против книги "
+              f"{_f(sum(r['pnl'] for r in held) / h_cost * 100, 2)}% на {len(held)} поз. — "
+              f"разница: выходы + комиссии + капа≠цена; «держать» против корзины — сам отбор")
     ret, cost = _weighted(rows, "ret")
     if ret is None:
         print("контрольная корзина: не посчитана (после входа прогонов не было)")
