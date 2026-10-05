@@ -725,6 +725,34 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
 
 # ---------------------------------------------------------------- недельная сводка, сбой
 
+def benchmark_block(books: list[dict]) -> list[str]:
+    """«📊 Против рынка»: книга против альтов и BTC на тех же окнах (scanner/benchmark.py,
+    weekly_books). Позиций нет ни в одной книге — пустой список (блок не выводится)."""
+    books = [b for b in books or [] if b.get("positions")]
+    if not books:
+        return []
+    out = ["📊 <b>Против рынка</b> (те же даты входа и выхода):"]
+    first = True
+    for b in books:
+        head = f"{b.get('emoji', '•')} {_esc(b.get('label', ''))}:"
+        if not b.get("n"):
+            out.append(f"{head} нет цены или рынка на даты позиций ({b['positions']} поз.)")
+            continue
+        cnt = (f"{b['n']} поз." if b["n"] == b["positions"]
+               else f"{b['n']} из {b['positions']} поз.")
+        # разница — из показанных (округлённых) чисел: «+30.7 · альты +36.7 → −6.0», не −5.9
+        shown = [float(f"{b[k]:.1f}") for k in ("book_pct", "alt_pct")]
+        pp = f"{shown[0] - shown[1]:+.1f}".replace("-", "−")
+        line = (f"{head} {_signed(b['book_pct'])} · альты {_signed(b['alt_pct'])} · "
+                f"BTC {_signed(b['btc_pct'])} → {pp} п.п.{' к альтам' if first else ''} ({cnt})")
+        if b.get("stale"):
+            line += f" · ⚠ рынок на {_day_label(b['market_day'])}"
+        out.append(line)
+        first = False
+    out.append("<i>Отбор полезен, только если обгоняет альты: рост рынка — не его заслуга.</i>")
+    return out
+
+
 def format_weekly(stats: dict, cfg) -> str:
     """Недельная сводка форвард-теста + счётчик недели, напоминание, 4-нед. итог."""
     wk = stats.get("week_no", 0)
@@ -756,6 +784,10 @@ def format_weekly(stats: dict, cfg) -> str:
         lines.append(f"💰 real: открыто {stats['real_open']}, unrealized "
                      f"{stats['real_pnl_usdt']:+.2f} · realized "
                      f"{stats.get('real_realized_usdt', 0.0):+.2f} USDT")
+    bench = benchmark_block(stats.get("benchmark") or [])
+    if bench:
+        lines.append("")
+        lines += bench
 
     # Одноразовая итоговая сводка на N-й неделе — с кумулятивом и call-to-decide.
     if stats.get("milestone"):

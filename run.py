@@ -615,6 +615,13 @@ def cmd_report(args) -> int:
         "ab_stop_pct": cfg.get("stage7_positions.paper_ab_stop_pct", 50),
         "stop_pct": cfg.get("stage8_exit.invalidation_below_base_low_pct", 25),
     }
+    # Против рынка (scanner/benchmark.py): книга на тех же окнах, что альты и BTC, — иначе
+    # рост рынка выглядит успехом отбора. Сбой сравнения не должен съесть сводку.
+    try:
+        from scanner import benchmark
+        stats["benchmark"] = benchmark.weekly_books(cfg)
+    except Exception as e:  # noqa: BLE001
+        print(f"[report] сравнение с рынком пропущено: {type(e).__name__}: {e}")
     text = telegram.format_weekly(stats, cfg)
     print(text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
     delivered = True

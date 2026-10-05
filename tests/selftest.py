@@ -1246,6 +1246,152 @@ def test_exit_alert_format(cfg, failures: list[str]) -> None:
     _check("итоговая: call-to-decide про капитал", "capital_usdt" in ms, failures)
 
 
+def test_benchmark(cfg, failures: list[str]) -> None:
+    print("Против рынка — книга vs альты/BTC на тех же окнах (scanner/benchmark.py):")
+    import copy
+    import sqlite3
+    import tempfile
+    from pathlib import Path as _P
+    from scanner import benchmark as bm
+    from scanner.config import Config
+    from scanner.db import Store
+    from scanner.notify import telegram as tg
+    D = bm.DAY
+    d0 = 1783987200                        # 2026-07-14 00:00 UTC
+    # альты = total×(1−BTC.D/100) − стейблы, BTC = total×BTC.D/100; дня 2 нет, у дня 4 нет стейблов
+    rows = [{"day": d0 + i * D, "total_mcap": t, "btc_dominance": dom, "stables_usd": st}
+            for i, t, dom, st in ((0, 1000, 50, 100), (1, 1100, 50, 100), (3, 1300, 40, 100),
+                                  (4, 1500, 40, None))]
+    mkt = bm.market_points(rows)
+    _check("рынок: альты 400 → 450 → 680, BTC 500 → 550 → 520",
+           mkt["alt"] == [400.0, 450.0, 680.0] and mkt["btc"] == [500.0, 550.0, 520.0], failures)
+    _check("ближайший день ≤ даты: на день 2 — день 1",
+           bm.market_at(mkt, d0 + 2 * D + 3600)[:2] == (d0 + D, 450.0), failures)
+    _check("в течение дня — этот день, до начала ряда — None",
+           bm.market_at(mkt, d0 + 5 * 3600)[0] == d0 and bm.market_at(mkt, d0 - 1) is None,
+           failures)
+    _check("день без стейблов пропускается (день 4 → день 3)",
+           bm.market_at(mkt, d0 + 4 * D + 60)[0] == d0 + 3 * D, failures)
+
+    # Книга: закрытая (realized −20 на $100, окно д0→д1) + открытая с частичной продажей
+    # (realized +45, остаток 200 из 300 по 1.0, снапшот 1.5 на д3): нереализованное net-of-fees
+    # (1.5×0.9985 − 1.0×1.0015)×200 = 99.25 → книга (−20 + 45 + 99.25) / 400 = +31.06%.
+    closed = {"id": 1, "symbol": "AAA", "entry_price": 10.0, "qty": 0.0, "initial_qty": 10.0,
+              "entry_ts": d0 + 3600, "status": "closed", "closed_ts": d0 + D + 7200,
+              "realized_usdt": -20.0, "is_paper": 1}
+    part = {"id": 2, "symbol": "BBB", "entry_price": 1.0, "qty": 200.0, "initial_qty": 300.0,
+            "entry_ts": d0 + 3600, "status": "open", "closed_ts": None, "realized_usdt": 45.0,
+            "is_paper": 1}
+    snap = {2: {"ts": d0 + 3 * D + 6 * 3600, "price": 1.5}}
+    res = bm.compare_book([closed, part], snap, mkt)
+    _check("книга: Σ P&L / Σ стоимости net-of-fees = +31.06%",
+           res["n"] == 2 and abs(res["book_pct"] - 31.0625) < 1e-9, failures)
+    _check("рынок взвешен стоимостью: альты (100×12.5 + 300×70)/400 = +55.63%, BTC +5.5%",
+           abs(res["alt_pct"] - 55.625) < 1e-9 and abs(res["btc_pct"] - 5.5) < 1e-9
+           and abs(res["diff_pp"] + 24.5625) < 1e-9, failures)
+    _check("окно: закрытая — до closed_ts, открытая — до последнего снапшота",
+           [r["end"] for r in res["rows"]] == [closed["closed_ts"], snap[2]["ts"]], failures)
+    r2 = bm.compare_book([closed, dict(part, id=3)], snap, mkt)
+    _check("открытая без снапшота — вне итога (1 из 2)",
+           r2["n"] == 1 and r2["positions"] == 2, failures)
+    _check("рынок отстал от снапшота на 3 дня -> stale, на 2 — нет",
+           bm.compare_book([part], {2: {"ts": d0 + 6 * D + 60, "price": 1.5}}, mkt)["stale"]
+           and not bm.compare_book([part], {2: {"ts": d0 + 5 * D + 60, "price": 1.5}},
+                                   mkt)["stale"], failures)
+    _check("близнецы B/S — не основная книга; старая схема без variant — основная",
+           not bm.is_main({"variant": "B", "twin_of": 1}) and not bm.is_main({"variant": "S"})
+           and bm.is_main({"symbol": "OLD"}), failures)
+
+    # weekly_books на файловой БД: близнецы исключены, real — отдельной строкой, архива нет —
+    # молча пропущен; архив старой схемы читается только на чтение (без миграции).
+    with tempfile.TemporaryDirectory() as tmp:
+        d = copy.deepcopy(cfg._d)
+        db = str(_P(tmp) / "t.db")
+        d["output"] = {"db_path": db, "watchlist_json": str(_P(tmp) / "wl.json")}
+        d["benchmark"] = {"enabled": True, "archive_db": str(_P(tmp) / "нет.db"),
+                          "archive_label": "v1"}
+        st = Store(db)
+        st.upsert_market({r["day"]: {k: v for k, v in r.items() if k != "day"} for r in rows})
+        st.close()
+        ps = PositionStore(db)
+        empty = bm.weekly_books(Config(d))
+        a = ps.add("BBB", 1.0, 300, coin_id="bbb", paper=True, entry_ts=d0 + 3600)
+        b = ps.add("BBB", 1.0, 300, paper=True, variant="B", twin_of=a, entry_ts=d0 + 3600)
+        s = ps.add("BBB", 1.0, 300, paper=True, variant="S", twin_of=a, entry_ts=d0 + 3600)
+        for pid, px in ((a, 1.6), (b, 3.0), (s, 3.0)):      # близнецы с другой ценой
+            ps.conn.execute("INSERT INTO position_snapshots(position_id, ts, price, pnl_pct, hwm) "
+                            "VALUES (?,?,?,?,?)", (pid, d0 + 3 * D + 3600, px, 0.0, px))
+        ps.conn.commit()
+        wb = bm.weekly_books(Config(d))
+        r = ps.add("RRR", 2.0, 50, entry_ts=d0 + 3600)
+        ps.conn.execute("INSERT INTO position_snapshots(position_id, ts, price, pnl_pct, hwm) "
+                        "VALUES (?,?,?,?,?)", (r, d0 + D + 3600, 2.4, 0.0, 2.4))
+        ps.conn.commit()
+        ps.close_db()
+        wr = bm.weekly_books(Config(d))
+        old = _P(tmp) / "old.db"
+        con = sqlite3.connect(old)
+        con.executescript(
+            "CREATE TABLE positions (id INTEGER PRIMARY KEY, symbol TEXT, entry_price REAL, "
+            "qty REAL, initial_qty REAL, entry_ts REAL, status TEXT, closed_ts REAL, "
+            "realized_usdt REAL, is_paper INTEGER);"
+            "CREATE TABLE position_snapshots (position_id INTEGER, ts REAL, price REAL, "
+            "pnl_pct REAL, hwm REAL);")
+        con.execute("INSERT INTO positions VALUES (1, 'OLD', 10.0, 0, 10.0, ?, 'closed', ?, "
+                    "20.0, 1)", (d0 + 3600, d0 + 3 * D))
+        con.commit()
+        con.close()
+        before = old.read_bytes()
+        d["benchmark"]["archive_db"] = str(old)
+        wa = bm.weekly_books(Config(d))
+        unchanged = old.read_bytes() == before
+        d["benchmark"]["enabled"] = False
+        off = bm.weekly_books(Config(d))
+    _check("нет позиций -> строк нет", empty == [], failures)
+    _check("книга A без близнецов B/S (их цена 3.0 не влияет): +59.61% на 1 поз.",
+           [x["key"] for x in wb] == ["paper"] and wb[0]["n"] == wb[0]["positions"] == 1
+           and abs(wb[0]["book_pct"] - 59.61) < 1e-9, failures)
+    _check("архивной БД нет -> строка молча пропущена", "archive" not in [x["key"] for x in wb],
+           failures)
+    _check("real — отдельной строкой, только когда есть",
+           [x["key"] for x in wr] == ["paper", "real"] and wr[1]["n"] == 1
+           and abs(wr[1]["alt_pct"] - 12.5) < 1e-9, failures)
+    arch = next((x for x in wa if x["key"] == "archive"), None)
+    _check("архив старой схемы: книга по рынку текущей БД (+20% против альтов +70%)",
+           arch is not None and arch["label"] == "v1" and arch["n"] == 1
+           and abs(arch["book_pct"] - 20.0) < 1e-9 and abs(arch["alt_pct"] - 70.0) < 1e-9,
+           failures)
+    _check("архив открыт только на чтение: файл не изменён", unchanged, failures)
+    _check("benchmark.enabled=false -> блока нет", off == [], failures)
+
+    # Формат строк блока (как в недельной сводке).
+    books = [{"emoji": "📝", "label": "книга A", "positions": 2, "n": 2, "book_pct": 1.2,
+              "alt_pct": 0.8, "btc_pct": 0.5, "diff_pp": 0.4, "stale": False},
+             {"emoji": "🗄", "label": "v1 (старый код, на 03.10)", "positions": 18, "n": 18,
+              "book_pct": 30.73, "alt_pct": 36.68, "btc_pct": 27.97, "diff_pp": -5.95,
+              "stale": True, "market_day": 1790812800}]
+    blk = tg.benchmark_block(books)
+    _check("блок: заголовок и подсказка про альты",
+           blk[0] == "📊 <b>Против рынка</b> (те же даты входа и выхода):"
+           and "обгоняет альты" in blk[-1], failures)
+    _check("строка книги: «+1.2% · альты +0.8% · BTC +0.5% → +0.4 п.п. к альтам (2 поз.)»",
+           "📝 книга A: +1.2% · альты +0.8% · BTC +0.5% → +0.4 п.п. к альтам (2 поз.)" in blk,
+           failures)
+    _check("строка архива: разница из показанных чисел (−6.0, не −5.9) + пометка рынка",
+           "🗄 v1 (старый код, на 03.10): +30.7% · альты +36.7% · BTC +28.0% → −6.0 п.п. "
+           "(18 поз.) · ⚠ рынок на 01.10" in blk, failures)
+    part_b = tg.benchmark_block([dict(books[0], n=1, positions=2)])
+    _check("часть позиций без данных -> «1 из 2 поз.»", "(1 из 2 поз.)" in part_b[1], failures)
+    _check("нет позиций -> блока нет", tg.benchmark_block([]) == []
+           and tg.benchmark_block([dict(books[0], positions=0, n=0)]) == [], failures)
+    base = {"week_no": 2, "milestone": False, "milestone_weeks": 4, "opened": 0, "open_now": 2,
+            "invalidations": 0, "ladder_hits": 0, "trailings": 0, "paper_pnl_usdt": 0.0,
+            "real_open": 0}
+    _check("недельная сводка: блок есть только с книгами",
+           "Против рынка" in format_weekly({**base, "benchmark": books}, cfg)
+           and "Против рынка" not in format_weekly(base, cfg), failures)
+
+
 def test_github_levels(cfg, failures: list[str]) -> None:
     print("GitHub-активность, свечи Bybit, картинка уровней плана:")
     from scanner.sources import github
@@ -1439,6 +1585,8 @@ def main() -> int:
     test_positions_store(cfg, failures)
     print()
     test_exit_alert_format(cfg, failures)
+    print()
+    test_benchmark(cfg, failures)
     print()
     test_ladder(cfg, failures)
     print()
