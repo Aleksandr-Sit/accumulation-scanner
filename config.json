@@ -10,9 +10,12 @@
   },
 
   "track_q": {
-    "_comment": "Трек Q: монеты БЕЗ контракта (BTC, ETH, SOL, XRP, ADA…), прошедшие гейт качества backtest/quality_screen.py (капа ≥$100M, оборот и его ранг ≤150, ≥2 топ-биржи, возраст ≥1 года, FDV/MC ≤3, Bybit без ST, не мем). Иначе Stage 1 режет их как «анти-раг невозможен». Анти-раг пропускается (проверять нечего); safety-блок скора = 10 минус флаги — это НЕ проверка контракта, а замена гейтом. Сопоставление по тикеру + капа CoinGecko/CMC в пределах max_mcap_ratio раз. Срез обновляется руками (~6 мин): py -3 -u backtest/quality_screen.py; старше max_age_days — трек пуст.",
+    "_comment": "Трек Q: монеты БЕЗ контракта (BTC, ETH, SOL, XRP, ADA…), прошедшие гейт качества backtest/quality_screen.py (капа ≥$100M, оборот и его ранг ≤150, ≥2 топ-биржи, возраст ≥1 года, FDV/MC ≤3, Bybit без ST, не мем). Иначе Stage 1 режет их как «анти-раг невозможен». Анти-раг пропускается (проверять нечего); safety-блок скора = 10 минус флаги — это НЕ проверка контракта, а замена гейтом. Сопоставление по тикеру + капа CoinGecko/CMC в пределах max_mcap_ratio раз.",
+    "_slice_note": "Срезов два, берётся свежий по полю date (scanner/quality.fresh_slice): source — закоммиченный ручной (py -3 -u backtest/quality_screen.py, ~6 мин сети); live_source — автообновляемый: ежедневный прогон (run.py quality --refresh-if-due) пересчитывает его, когда срезу ≥ refresh_after_days дней. data/ вне git: на VPS файл обновляется сам, git pull не конфликтует. Старше max_age_days — трек пуст; сводка дня предупреждает с refresh_after_days.",
     "enabled": true,
     "source": "backtest/quality_screen_results.json",
+    "live_source": "data/quality_screen_live.json",
+    "refresh_after_days": 25,
     "max_age_days": 30,
     "max_mcap_ratio": 3.0
   },
@@ -181,7 +184,7 @@
     "paper_reopen_cooldown_days": 30,
     "_paper_ab_note": "A/B выхода: к каждой авто-paper позиции открывается близнец variant=B, у которого при перегреве рынка трейлинг сужается (stage8_exit.market_hot_trailing_pct). report сравнивает книги A и B.",
     "paper_ab": true,
-    "_paper_ab_stop_note": "A/B ширины стопа (ladder_dca_study 29.09.2026: на истории стоп −50% медиана +11.8% против −1.0% у −25%, но p10 −49% — хвост тяжелее; survivorship и in-sample). Монетам из среза фильтра качества (трек Q или тикер+капа в backtest/quality_screen_results.json) к авто-paper A открывается близнец variant=S с инвалидацией −paper_ab_stop_pct% от лоу базы; лестница/трейл как у A. report сравнивает A и S. Прод-стоп (stage8_exit) не меняется, пока paper не покажет 8–12 недель.",
+    "_paper_ab_stop_note": "A/B ширины стопа (ladder_dca_study 29.09.2026: на истории стоп −50% медиана +11.8% против −1.0% у −25%, но p10 −49% — хвост тяжелее; survivorship и in-sample). Монетам из среза фильтра качества (трек Q или тикер+капа в свежем срезе, см. track_q) к авто-paper A открывается близнец variant=S с инвалидацией −paper_ab_stop_pct% от лоу базы; лестница/трейл как у A. report сравнивает A и S. Прод-стоп (stage8_exit) не меняется, пока paper не покажет 8–12 недель.",
     "paper_ab_stop": true,
     "paper_ab_stop_pct": 50
   },

@@ -13,11 +13,15 @@ Binance (кэш backtest/binance_archive.py) или Bybit.
 Монеты сопоставляются с биржами по тикеру: из дублей тикера в топ-500 берётся старший по капе.
 
 Запуск из корня проекта:  py -3 -u backtest/quality_screen.py   (~6 мин: Bybit klines)
-Результат: backtest/quality_screen_results.json
+Результат: --out PATH (по умолчанию backtest/quality_screen_results.json — закоммиченный
+срез); запись атомарная (временный файл → rename): сбой не оставит битый файл. Ежедневный
+прогон пишет data/quality_screen_live.json сам: run.py quality --refresh-if-due.
+Прошли гейт меньше --min-passed — сбой источников, а не рынок: срез не записывается, код 1.
 Дозаполнить «коммит» после сброса лимита GitHub:  py -3 backtest/quality_screen.py --dev-only
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -31,11 +35,16 @@ PROJ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJ))
 sys.path.insert(0, str(PROJ / "backtest"))
 from scanner.config import load_config  # noqa: E402
+from scanner.quality import write_slice  # noqa: E402
 from scanner.stages import zone  # noqa: E402
 from binance_archive import NON_ALTS  # noqa: E402  стейблы/фиат/обёртки — вне вселенной ранга
 
 OUTDIR = Path(__file__).resolve().parent
 RESULT = OUTDIR / "quality_screen_results.json"
+# 29.09.2026 гейт прошли 77 из 500 (34 из них без контракта — трек Q). Единицы — не рынок,
+# а отказ источника (Bybit не ответил — «нет на Bybit spot» у всех): такой срез затёр бы
+# трек Q — резолвер берёт свежий.
+MIN_PASSED = 10
 CG = "https://api.coingecko.com/api/v3"
 UA = {"User-Agent": "quality-screen/0.1"}
 NOW = time.time()
@@ -208,7 +217,7 @@ def closes_for(sym: str) -> tuple[list[float], list[float]]:
     return [float(r[4]) for r in rows], [float(r[6]) for r in rows]
 
 
-def main() -> int:
+def main(out: Path = RESULT, min_passed: int = MIN_PASSED) -> int:
     t0 = time.time()
     cfg = load_config(None)
     mk = cmc_listing(500)
@@ -291,6 +300,10 @@ def main() -> int:
     print("Единственная причина отсева (что отпустит монету, если убрать критерий):")
     for k, v in sorted(sole.items(), key=lambda kv: -kv[1]):
         print(f"  {v:>4}  {k}")
+    if len(passed) < min_passed:
+        print(f"\n⚠ прошли гейт только {len(passed)} (< {min_passed}) — похоже на сбой "
+              f"источников, а не на рынок: срез НЕ записан, прежний остаётся")
+        return 1
 
     # мягкие признаки: dev-активность (CMC + GitHub) и зона (прод-функции)
     for i, x in enumerate(passed):
@@ -303,12 +316,10 @@ def main() -> int:
             x["zone"] = "?"
         if (i + 1) % 20 == 0:
             print(f"  ...dev/зона {i+1}/{len(passed)}  [{time.time()-t0:.0f} с]")
-    RESULT.write_text(
-        json.dumps({"date": time.strftime("%Y-%m-%d"), "gate": GATE, "rows": rows,
-                    "reasons": reasons, "sole": sole}, ensure_ascii=False, indent=1),
-        encoding="utf-8")
+    write_slice(out, {"date": time.strftime("%Y-%m-%d"), "gate": GATE, "rows": rows,
+                      "reasons": reasons, "sole": sole})
     print_table(passed)
-    print(f"\nsaved ->{RESULT.name} ({time.time()-t0:.0f} с)")
+    print(f"\nsaved -> {out} ({time.time()-t0:.0f} с)")
     return 0
 
 
@@ -326,19 +337,36 @@ def print_table(passed: list[dict]) -> None:
               + (f"  ⚠ CMC: {x['notice'][:60]}" if x.get("notice") else ""))
 
 
-def dev_only() -> int:
+def dev_only(out: Path = RESULT) -> int:
     """Дозаполнить «коммит» там, где упёрлись в лимит GitHub API (без повторного скана)."""
-    d = json.loads(RESULT.read_text(encoding="utf-8"))
+    d = json.loads(Path(out).read_text(encoding="utf-8"))
     passed = [x for x in d["rows"] if not x["fails"]]
     todo = [x for x in passed if x.get("repos") and x.get("last_commit_days") is None]
     for x in todo:
         x.update(dev_activity(x["cmc_id"]))
     left = sum(1 for x in todo if x.get("last_commit_days") is None)
-    RESULT.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    write_slice(out, d)
     print_table(passed)
     print(f"\nдозаполнено {len(todo) - left} из {len(todo)}; осталось н/д: {left}")
     return 0
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Срез фильтра качества: топ-500 CMC через жёсткий гейт → JSON для трека Q "
+                    "(~6 мин сети).")
+    ap.add_argument("--out", type=Path, default=RESULT,
+                    help="куда записать срез (по умолчанию backtest/quality_screen_results.json); "
+                         "запись атомарная, каталог создаётся")
+    ap.add_argument("--dev-only", action="store_true",
+                    help="дозаполнить «коммит» в готовом срезе --out (после сброса лимита "
+                         "GitHub), без повторного скана")
+    ap.add_argument("--min-passed", type=int, default=MIN_PASSED,
+                    help=f"прошли гейт меньше — срез не записывается, код 1 (сбой источников); "
+                         f"по умолчанию {MIN_PASSED}")
+    return ap.parse_args(argv)
+
+
 if __name__ == "__main__":
-    sys.exit(dev_only() if "--dev-only" in sys.argv else main())
+    _a = parse_args()
+    sys.exit(dev_only(_a.out) if _a.dev_only else main(_a.out, _a.min_passed))

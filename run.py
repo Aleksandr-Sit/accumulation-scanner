@@ -11,6 +11,8 @@
   python run.py card GRAM [--notify]        # карточка монеты: лестница, стоп, цели, картинка
   python run.py ladder LINK --budget 50      # план лестницы под Bybit spot (без ордеров)
   python run.py market [--backfill]         # история рынка альтов + индекс перегрева
+  python run.py quality [--refresh-if-due]  # срез трека Q: дата, возраст; обновить, если пора
+  python run.py backup [--send-weekly --notify]   # бэкап scanner.db (+ раз в неделю в Telegram)
   python run.py selftest                    # офлайн-проверка логики на фикстурах
 """
 from __future__ import annotations
@@ -266,19 +268,14 @@ def cmd_pos(args) -> int:
     return 1
 
 
-def _quality_note(sym: str) -> str:
-    """Строка о монете из последнего среза backtest/quality_screen.py (если он есть)."""
-    import json as _json
-    from pathlib import Path
-    p = Path(__file__).resolve().parent / "backtest" / "quality_screen_results.json"
-    if not p.exists():
-        return "фильтр качества: среза нет (py -3 -u backtest/quality_screen.py)"
-    try:
-        d = _json.loads(p.read_text(encoding="utf-8"))
-    except ValueError:
-        return "фильтр качества: файл среза повреждён"
-    row = next((r for r in d.get("rows", []) if r.get("sym") == sym), None)
-    day = d.get("date", "?")
+def _quality_note(cfg, sym: str) -> str:
+    """Строка о монете из свежего среза фильтра качества (scanner/quality.fresh_slice)."""
+    from scanner.quality import fresh_slice
+    s = fresh_slice(cfg)
+    if not s["ok"]:
+        return f"фильтр качества: среза нет ({s['note']}; run.py quality --refresh-if-due)"
+    row = next((r for r in s["rows"] if (r.get("sym") or "").upper() == sym), None)
+    day = s["date"]
     if row is None:
         return f"фильтр качества ({day}): нет в топ-500 — вне проверенной зоны"
     if not row["fails"]:
@@ -328,7 +325,7 @@ def cmd_ladder(args) -> int:
     print(f"=== ЛЕСТНИЦА {pair} (Bybit spot) — расчёт, не рекомендация ===")
     if inst["st"] or inst["status"] != "Trading":
         print(f"⚠ Bybit: метка ST (риск делистинга) или статус {inst['status']}")
-    print(f"  {_quality_note(base)}")
+    print(f"  {_quality_note(cfg, base)}")
     print(f"  цена {P(price)} · лоу базы 30д {P(base_low)} · шаг цены {tick:g} · "
           f"шаг кол-ва {qs:g} · мин. ордер биржи ${inst['min_amt']:g}, ваш ${args.min_order:g}")
     confirm = e.get("invalidation_confirm_days", 1)
@@ -455,7 +452,8 @@ def cmd_brief(args) -> int:
     cfg = load_config(args.config)
     from scanner.notify import deliver, telegram
     try:
-        state = deliver.brief_state(cfg, scan_exit=args.scan_exit, watch_exit=args.watch_exit)
+        state = deliver.brief_state(cfg, scan_exit=args.scan_exit, watch_exit=args.watch_exit,
+                                    backup_exit=args.backup_exit)
         text = telegram.format_brief(state, cfg, test=args.test)
     except Exception as e:
         if args.notify:
@@ -674,6 +672,65 @@ def cmd_market(args) -> int:
     return 0
 
 
+def cmd_quality(args) -> int:
+    """Срез фильтра качества (трек Q): какой файл свежий, дата, возраст, число монет.
+    --refresh-if-due (ежедневный прогон): срезу ≥ track_q.refresh_after_days или его нет —
+    backtest/quality_screen.py --out <live_source> подпроцессом (~6 мин сети, таймаут 30 мин).
+    Без флага код 1 — трек Q сейчас пуст (среза нет или старше max_age_days)."""
+    cfg = load_config(args.config)
+    from scanner import quality
+    s = quality.fresh_slice(cfg)
+    max_age = cfg.get("track_q.max_age_days", 30)
+    refresh = cfg.get("track_q.refresh_after_days", 25)
+    label = lambda x: quality.SRC_LABEL.get(x["src"], x["src"])  # noqa: E731
+    alive = False
+    if s["ok"]:
+        n_ok = len(quality.passed(s["rows"]))
+        print(f"Срез трека Q: {s['date']}, возраст {s['age_days']:.1f} дн. · "
+              f"{quality.rel(s['path'])} ({label(s)}) · прошли гейт {n_ok} из {len(s['rows'])}")
+        for t in s["tried"]:                  # второй файл: почему не он
+            if t["path"] != s["path"]:
+                print(f"  {label(t)}: " + (f"срез от {t['date']}" if t["ok"] else t["note"]))
+        day = lambda n: quality.day_after(s["date"], n)  # noqa: E731
+        alive = max_age is None or s["age_days"] <= max_age
+        if alive:
+            tail = ("" if max_age is None else
+                    f", трек выключится {day(max_age)} (max_age_days {max_age:g})")
+            print(f"  автообновление — с {day(refresh)} (refresh_after_days {refresh:g}){tail}")
+        else:
+            print(f"⚠ трек Q выключен: срез старше {max_age:g} дн.")
+    else:
+        print(f"⚠ Среза трека Q нет: {s['note']}")
+    if not args.refresh_if_due:
+        return 0 if alive else 1
+    code, msg = quality.refresh_if_due(cfg)
+    print(f"[quality] {msg}")
+    return code
+
+
+def cmd_backup(args) -> int:
+    """Бэкап scanner.db: sqlite backup API → integrity_check → gzip → ротация. --send-weekly
+    (+ --notify): раз в неделю свежий .gz в Telegram документом без звука. Код ≠ 0 при любом
+    сбое; 3 — копия сделана, но в Telegram не ушла (сводка дня различает)."""
+    cfg = load_config(args.config)
+    from scanner import backup
+    try:
+        info = backup.make_backup(cfg["output"]["db_path"], args.dir or backup.DEFAULT_DIR,
+                                  keep=args.keep)
+    except Exception as e:  # noqa: BLE001 — любой сбой: код 1, сводка дня покажет
+        print(f"backup FAIL: {type(e).__name__}: {e}")
+        return 1
+    print(backup.ok_line(info))
+    if not (args.send_weekly or args.test):
+        return 0
+    try:
+        code, msg = backup.send_weekly(cfg, info, notify=args.notify, test=args.test)
+    except Exception as e:  # noqa: BLE001 — копия уже есть: «не ушла», а не «не сделана»
+        code, msg = backup.EXIT_SEND_FAILED, f"недельная отправка упала: {type(e).__name__}: {e}"
+    print(f"[backup] {msg}")
+    return code
+
+
 def cmd_selftest(args) -> int:
     from tests.selftest import main as selftest_main
     return selftest_main()
@@ -747,6 +804,9 @@ def main() -> int:
     pb.add_argument("--scan-exit", type=int, default=None,
                     help="код выхода scan из daily_run (иначе — по журналу прогонов)")
     pb.add_argument("--watch-exit", type=int, default=None, help="код выхода watch из daily_run")
+    pb.add_argument("--backup-exit", type=int, default=None,
+                    help="код выхода backup из daily_run: ≠ 0 — «⚠ бэкап не сделан» в строке "
+                         "статуса (3 — копия есть, но в Telegram не ушла)")
     pb.add_argument("--config", default=None)
     pb.set_defaults(func=cmd_brief)
 
@@ -763,6 +823,33 @@ def main() -> int:
     pm.add_argument("--backfill", action="store_true", help="полный бэкфилл с backfill_start (~3 мин)")
     pm.add_argument("--config", default=None)
     pm.set_defaults(func=cmd_market)
+
+    pq = sub.add_parser("quality", help="срез трека Q: дата, возраст, источник, число монет")
+    pq.add_argument("--refresh-if-due", action="store_true",
+                    help="срезу ≥ track_q.refresh_after_days (или его нет) — пересчитать "
+                         "track_q.live_source (backtest/quality_screen.py, ~6 мин сети)")
+    pq.add_argument("--config", default=None)
+    pq.set_defaults(func=cmd_quality)
+
+    def _keep(v: str) -> int:
+        n = int(v)
+        if n < 1:
+            raise argparse.ArgumentTypeError("хранить нужно хотя бы одну копию")
+        return n
+
+    pbk = sub.add_parser("backup", help="бэкап scanner.db: копия, integrity_check, gzip, ротация")
+    pbk.add_argument("--dir", default=None, help="каталог копий (по умолчанию backups/ в корне)")
+    pbk.add_argument("--keep", type=_keep, default=14, help="сколько последних копий хранить")
+    pbk.add_argument("--send-weekly", action="store_true",
+                     help="раз в неделю (weekly_report_weekday) свежий .gz в Telegram без звука")
+    pbk.add_argument("--notify", action="store_true",
+                     help="разрешить отправку в Telegram (без него --send-weekly только пишет, "
+                          "что пора)")
+    pbk.add_argument("--test", action="store_true",
+                     help="отправить сейчас с пометкой «🧪 ТЕСТ» (недельная отметка не "
+                          "проверяется и не пишется); с --notify")
+    pbk.add_argument("--config", default=None)
+    pbk.set_defaults(func=cmd_backup)
 
     pt = sub.add_parser("selftest", help="офлайн-проверка на фикстурах")
     pt.set_defaults(func=cmd_selftest)

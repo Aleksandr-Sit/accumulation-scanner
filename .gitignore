@@ -7,3 +7,6 @@ scan_all.log
 __pycache__/
 *.pyc
 logs/
+# живой срез трека Q (на VPS обновляется сам) и бэкапы базы — не в git
+data/
+backups/

@@ -1,4 +1,5 @@
-﻿# Ежедневный прогон сканера: scan -> watch -> report (раз в неделю) -> brief, Telegram, лог в logs/.
+﻿# Ежедневный прогон сканера: quality (срез трека Q, если пора) -> scan -> watch ->
+# report (раз в неделю) -> backup -> brief, Telegram, лог в logs/. Двойник scripts/daily_run.sh.
 # Запускается Планировщиком Windows (задача AccumulationScannerDaily, см. scripts/register_task.ps1).
 # Ручной запуск: powershell -ExecutionPolicy Bypass -File scripts\daily_run.ps1 [-NoNotify]
 param([switch]$NoNotify)
@@ -26,6 +27,9 @@ function Run-Step([string]$name, [string[]]$cmdArgs) {
     return $LASTEXITCODE
 }
 
+# Срез трека Q: старше refresh_after_days — пересчёт (~6 мин сети) в data/. Сбой не блокирует
+# scan: трек живёт на прежнем срезе до max_age_days, сводка дня предупредит.
+$qualityCode = Run-Step "quality" (@("quality", "--refresh-if-due"))
 # watch идёт и при сбое scan: открытые позиции надо проверять независимо от воронки.
 # scan/watch шлют только карточки событий (новая монета у дна, сигнал выхода).
 $scanCode = Run-Step "scan" (@("scan") + $notify)
@@ -33,14 +37,19 @@ $watchCode = Run-Step "watch" (@("watch") + $notify)
 # Недельная сводка: report зовётся каждый день, сам решает, пора ли (--if-due, первый
 # прогон недели); после watch — берёт свежие снапшоты позиций.
 $reportCode = Run-Step "report" (@("report", "--if-due") + $notify)
-# Сводка дня — тихо и последней: рынок, монеты у дна, позиции, статус scan/watch.
+# Бэкап базы — после всех записей дня (каталог по умолчанию: backups\ в корне проекта);
+# раз в неделю копия уходит в Telegram без звука.
+$backupCode = Run-Step "backup" (@("backup", "--send-weekly") + $notify)
+# Сводка дня — тихо и последней: рынок, монеты у дна, позиции, статус scan/watch/backup.
 # Пришла сводка — прогон дошёл до конца; коды выхода передаём, чтобы сбой был виден в ней.
-$briefCode = Run-Step "brief" (@("brief", "--scan-exit", "$scanCode", "--watch-exit", "$watchCode") + $notify)
+$briefCode = Run-Step "brief" (@("brief", "--scan-exit", "$scanCode", "--watch-exit", "$watchCode",
+                                 "--backup-exit", "$backupCode") + $notify)
 
 # Логи старше 30 дней не нужны.
 Get-ChildItem $logDir -Filter "daily_*.log" |
     Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
     Remove-Item -Force -ErrorAction SilentlyContinue
 
-if ($scanCode -ne 0 -or $watchCode -ne 0 -or $reportCode -ne 0 -or $briefCode -ne 0) { exit 1 }
+if ($qualityCode -ne 0 -or $scanCode -ne 0 -or $watchCode -ne 0 -or $reportCode -ne 0 -or
+    $backupCode -ne 0 -or $briefCode -ne 0) { exit 1 }
 exit 0

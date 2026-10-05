@@ -29,11 +29,12 @@ TEXT_MAX = 4096
 
 # ---------------------------------------------------------------- транспорт
 
-def _post(token: str, method: str, data: bytes, content_type: str) -> dict | None:
+def _post(token: str, method: str, data: bytes, content_type: str,
+          timeout: float = 30) -> dict | None:
     req = urllib.request.Request(f"{_API}{token}/{method}", data=data,
                                  headers={"Content-Type": content_type})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:      # 400 и т.п.: тело с description нужно вызывающему
         try:
@@ -133,6 +134,30 @@ def send_photo(token: str, chat_id: str, png: bytes, caption: str, silent: bool 
     return send_message(token, chat_id, caption, silent, buttons)
 
 
+def send_document(token: str, chat_id: str, data: bytes, filename: str, caption: str = "",
+                  silent: bool = False, mime: str = "application/gzip") -> bool:
+    """Файл документом (бэкап базы; лимит Bot API — 50 МБ). Битая разметка подписи — та же
+    подпись без тегов. Таймаут больше обычного: sendall считает его на всю загрузку."""
+    if not token or not chat_id:
+        print("[telegram] нет token/chat_id — пропуск отправки")
+        return False
+    fields = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+    if silent:
+        fields["disable_notification"] = "true"
+    files = {"document": (filename, data, mime)}
+    boundary = uuid.uuid4().hex
+    ctype = f"multipart/form-data; boundary={boundary}"
+    resp = _post(token, "sendDocument", multipart_body(fields, files, boundary), ctype, 300)
+    if _parse_error(resp):
+        print(f"[telegram] HTML не принят ({resp.get('description')}) — подпись без разметки")
+        fields = {k: v for k, v in fields.items() if k != "parse_mode"}
+        fields["caption"] = strip_html(caption)
+        resp = _post(token, "sendDocument", multipart_body(fields, files, boundary), ctype, 300)
+    if resp and not resp.get("ok"):
+        print(f"[telegram] sendDocument: {resp.get('description')}")
+    return bool(resp and resp.get("ok"))
+
+
 def get_chat_ids(token: str) -> list[dict]:
     """Достаёт chat_id из истории бота (getUpdates). Пусто = никто не писал боту."""
     try:
@@ -172,6 +197,11 @@ def fmt_score(x) -> str:
 
 def fmt_usd(x: float) -> str:
     return f"{'−' if x < 0 else '+'}${abs(x):.2f}"
+
+
+def fmt_size(n: int) -> str:
+    """Размер файла: «512 КБ» / «4.2 МБ»."""
+    return f"{n / 1024:.0f} КБ" if n < 1024 * 1024 else f"{n / 1024 / 1024:.1f} МБ"
 
 
 def _signed(x: float, digits: int = 1) -> str:
@@ -657,6 +687,10 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
     head.append(f"🔔 сигналов: {len(sigs)}" if sigs else "сигналов нет")
     if state.get("watch_ok") is False:
         head.append("⚠ позиции не обновлены")
+    if state.get("backup") == "fail":
+        head.append("⚠ бэкап не сделан")
+    elif state.get("backup") == "send_fail":
+        head.append("⚠ бэкап не ушёл в Telegram")
     lines = ["<b>" + " · ".join(head) + "</b>", ""]
     lines += market_block(state.get("market") or {}, cfg, now)
     lines.append("")
@@ -720,7 +754,36 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
         foot.append("on-chain недоступен")
     if foot:
         lines.append("<i>" + _esc(" · ".join(foot)) + "</i>")
+    note = track_q_note(state.get("track_q"), cfg)
+    if note:                              # служебная пометка о данных — отдельной строкой
+        lines.append(_esc(note))
     return "\n".join(lines).strip()
+
+
+def track_q_note(tq: dict | None, cfg) -> str:
+    """Пометка сводки о срезе трека Q (tq — quality.fresh_slice: ok, date, age_days; None —
+    трек выключен в конфиге). Свежий — пусто; старше refresh_after_days — автообновление
+    не прошло (и когда трек выключится); старше max_age_days или среза нет — трек выключен."""
+    if tq is None:
+        return ""
+    max_age = cfg.get("track_q.max_age_days", 30)
+    refresh = cfg.get("track_q.refresh_after_days", 25)
+    age = tq.get("age_days")
+    try:
+        d = datetime.strptime(tq.get("date") or "", "%Y-%m-%d")
+    except ValueError:
+        d = None
+    if not tq.get("ok") or age is None or d is None:
+        return "⚠ трек Q выключен: среза нет (run.py quality)"
+    day = d.strftime("%d.%m")
+    if max_age is not None and age > max_age:
+        return f"⚠ трек Q выключен: срез от {day} старше {max_age:g} дн."
+    if age > refresh:
+        tail = ""
+        if max_age is not None:
+            tail = f", трек выключится {(d + timedelta(days=max_age)).strftime('%d.%m')}"
+        return f"⚠ срез трека Q от {day}: автообновление не прошло{tail}"
+    return ""
 
 
 # ---------------------------------------------------------------- недельная сводка, сбой
@@ -818,6 +881,26 @@ def format_failure(step: str, error: str) -> str:
     return (f"<b>⚠ Accumulation {html.escape(step)}</b> — {datetime.now().date().isoformat()} · "
             f"прогон упал\n<code>{html.escape(error[:500])}</code>\n"
             f"<i>Подробности — logs/daily_*.log.</i>")
+
+
+def format_backup_caption(info: dict, *, test: bool = False) -> str:
+    """Подпись к недельной копии базы (scanner/backup.py): дата, размер, как восстановить."""
+    name = _esc(info["path"].name)
+    when = datetime.fromtimestamp(info["ts"]).strftime("%d.%m.%Y %H:%M")
+    return (f"{'🧪 ТЕСТ · ' if test else ''}💾 <b>Бэкап базы сканера</b> · {when}\n"
+            f"{name} — {fmt_size(info['size'])} (база {fmt_size(info['db_size'])}), "
+            f"integrity_check ok\n"
+            f"Восстановить (таймер остановлен, файл — в каталоге проекта):\n"
+            f"<code>gunzip -c {name} &gt; scanner.db</code>\n"
+            f"<i>Копия раз в неделю, без звука; на сервере — последние {info['keep']}.</i>")
+
+
+def format_backup_too_big(info: dict, limit: int, *, test: bool = False) -> str:
+    """Копия больше лимита Bot API — файл не шлём, предупреждаем: копии только на сервере."""
+    return (f"{'🧪 ТЕСТ · ' if test else ''}⚠ <b>Бэкап базы не отправлен</b>: "
+            f"{_esc(info['path'].name)} — {fmt_size(info['size'])}, больше "
+            f"{fmt_size(limit)} (у ботов лимит 50 МБ).\nКопии есть только на сервере: "
+            f"<code>{_esc(info['path'].parent)}</code> — забрать вручную (scp).")
 
 
 def weekly_due(last_ts: float | None, now: float, weekday: int = 0) -> bool:

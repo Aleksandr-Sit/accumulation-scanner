@@ -110,19 +110,24 @@ def test_track_q(cfg, failures: list[str]) -> None:
     _check("скор Q считается (safety 10 — гейт вместо контракта)",
            brk["safety"]["sub"] == 10.0 and s > 0, failures)
 
+    import copy
+    from scanner.config import Config
     tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
     day = _t.strftime("%Y-%m-%d", _t.localtime())
     _json.dump({"date": day, "rows": [{"sym": "BTC", "mcap": 1, "fails": []},
                                       {"sym": "DOGE", "mcap": 1, "fails": ["мем"]}]}, tmp)
     tmp.close()
-    fresh = load_quality(tmp.name, 30)
-    stale = load_quality(tmp.name, 30, now=_t.time() + 60 * 86400)
+    d = copy.deepcopy(cfg._d)
+    d["track_q"].update(source=tmp.name, live_source="nope/none_live.json", max_age_days=30)
+    fresh = load_quality(Config(d))
+    stale = load_quality(Config(d), now=_t.time() + 60 * 86400)
     os.unlink(tmp.name)
     _check("срез: берутся только прошедшие (BTC, не DOGE)",
            fresh["ok"] and list(fresh["by_sym"]) == ["BTC"], failures)
     _check("срез старше max_age_days -> пусто + подсказка обновить",
            not stale["ok"] and not stale["by_sym"] and "обнови" in stale["note"], failures)
-    _check("нет файла -> пусто, без падения", not load_quality("nope/none.json")["ok"], failures)
+    d["track_q"]["source"] = "nope/none.json"
+    _check("нет файла -> пусто, без падения", not load_quality(Config(d))["ok"], failures)
 
     # Авто-paper: близнец S (стоп −50%) — только монетам фильтра качества.
     from scanner.pipeline import _open_paper_positions
@@ -150,6 +155,321 @@ def test_track_q(cfg, failures: list[str]) -> None:
            and len(by.get("B", [])) == 4, failures)
     _check("paper: близнецы S — только BTC (трек Q) и LINK (срез + капа)",
            sorted(by.get("S", [])) == ["BTC", "LINK"], failures)
+
+
+def test_quality_refresh(cfg, failures: list[str]) -> None:
+    print("Трек Q — свежий срез, автообновление, пометки сводки:")
+    import copy
+    import json as _json
+    import subprocess
+    import tempfile
+    import types
+    from datetime import datetime as _dt
+    from pathlib import Path as _P
+    from scanner import quality as q
+    from scanner.config import Config
+    from scanner.notify import telegram as tg
+    rows = [{"sym": "BTC", "mcap": 1, "fails": []}, {"sym": "DOGE", "mcap": 1, "fails": ["мем"]}]
+    # возраст — от локальной полуночи даты среза: смещения в секундах не зависят от пояса/DST
+    at = lambda days: _dt(2026, 9, 29).timestamp() + days * 86400  # noqa: E731
+    now = at(26.4)                                       # срезу от 29.09 — 26.4 дн. (25.10)
+    with tempfile.TemporaryDirectory() as tmp:
+        live, src = _P(tmp) / "data" / "live.json", _P(tmp) / "src.json"
+        d = copy.deepcopy(cfg._d)
+        d["track_q"].update(source=str(src), live_source=str(live), max_age_days=30,
+                            refresh_after_days=25)
+        c = Config(d)
+
+        def put(p, date, rows_=rows):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(_json.dumps({"date": date, "rows": rows_}), encoding="utf-8")
+
+        put(src, "2026-09-29")
+        s1 = q.fresh_slice(c, now)
+        put(live, "2026-10-20")
+        s2 = q.fresh_slice(c, now)
+        put(live, "2026-09-29")
+        s3 = q.fresh_slice(c, now)
+        live.write_text("{битый", encoding="utf-8")
+        s4 = q.fresh_slice(c, now)
+        put(live, "")
+        s5 = q.fresh_slice(c, now)
+        _check("резолвер: live нет -> закоммиченный (src source, 26.4 дн.)",
+               s1["ok"] and s1["src"] == "source" and abs(s1["age_days"] - 26.4) < 1e-6, failures)
+        _check("резолвер: live свежее -> live", s2["src"] == "live_source"
+               and s2["date"] == "2026-10-20", failures)
+        _check("резолвер: даты равны -> live", s3["src"] == "live_source", failures)
+        _check("резолвер: live битый или без даты -> закоммиченный, причина видна",
+               s4["src"] == "source" and s5["src"] == "source"
+               and any("повреждён" in t["note"] for t in s4["tried"])
+               and any("без даты" in t["note"] for t in s5["tried"]), failures)
+        src.unlink()
+        live.unlink()
+        s6 = q.fresh_slice(c, now)
+        _check("резолвер: обоих нет -> ok False, в причине оба файла",
+               not s6["ok"] and s6["note"].count("нет файла") == 2, failures)
+
+        # Пороги: обновление с refresh_after_days (≥), трек пуст после max_age_days (>).
+        put(src, "2026-09-29")
+        due = [q.refresh_due(q.fresh_slice(c, at(x)), c) for x in (24.9, 25.0)]
+        _check("обновлять: 24.9 дн. — рано, 25 — пора, среза нет — пора",
+               due == [False, True] and q.refresh_due(s6, c), failures)
+        lq = [q.load_quality(c, at(x)) for x in (30.0, 30.1)]
+        _check("трек: 30 дн. ещё жив (BTC), 30.1 — пуст + «обнови»",
+               lq[0]["ok"] and list(lq[0]["by_sym"]) == ["BTC"] and not lq[1]["ok"]
+               and "обнови" in lq[1]["note"], failures)
+
+        # Автообновление: подпроцесс подменён — сети нет.
+        calls = []
+
+        def runner(write=None, rc=0, exc=None):
+            def _run(cmd, **kw):
+                calls.append((cmd, kw))
+                if exc:
+                    raise exc
+                if write:
+                    put(live, write)
+                return types.SimpleNamespace(returncode=rc)
+            return _run
+
+        early = q.refresh_if_due(c, now=at(10), runner=runner("2026-10-09"))
+        _check("не пора (10 дн.) -> код 0, подпроцесс не запускался, дата следующего",
+               early[0] == 0 and not calls and "рано" in early[1] and "24.10" in early[1],
+               failures)
+        bad = q.refresh_if_due(c, now=now, runner=runner(rc=1))
+        _check("пора, quality_screen упал -> код 1, остаётся прежний срез",
+               bad[0] == 1 and "кодом 1" in bad[1] and q.fresh_slice(c, now)["src"] == "source",
+               failures)
+        cmd, kw = calls[-1]
+        _check("подпроцесс: quality_screen.py --out <live_source>, таймаут 30 мин, UTF-8",
+               cmd[-3].endswith("quality_screen.py") and cmd[-2:] == ["--out", str(live)]
+               and kw["timeout"] == 1800 and kw["env"].get("PYTHONIOENCODING") == "utf-8",
+               failures)
+        hung = q.refresh_if_due(c, now=now, runner=runner(
+            exc=subprocess.TimeoutExpired("quality_screen.py", 1800)))
+        _check("подпроцесс завис -> код 1 «не уложился в 30 мин»",
+               hung[0] == 1 and "не уложился в 30 мин" in hung[1], failures)
+        silent = q.refresh_if_due(c, now=now, runner=runner())
+        _check("код 0, но файл не появился -> код 1 «не обновился»",
+               silent[0] == 1 and "не обновился" in silent[1], failures)
+        good = q.refresh_if_due(c, now=now, runner=runner("2026-10-25"))
+        after = q.fresh_slice(c, now)
+        _check("обновил -> код 0, дальше читается live от сегодня",
+               good[0] == 0 and after["src"] == "live_source" and after["date"] == "2026-10-25",
+               failures)
+
+        # Атомарная запись: сбой посреди записи не портит прежний срез и не оставляет хвост.
+        before = live.read_text(encoding="utf-8")
+        try:
+            q.write_slice(live, {"date": "2026-10-26", "rows": [object()]})
+            raised = False
+        except TypeError:
+            raised = True
+        _check("write_slice: сбой -> прежний файл цел, .tmp нет",
+               raised and live.read_text(encoding="utf-8") == before
+               and not list(live.parent.glob("*.tmp")), failures)
+        q.write_slice(_P(tmp) / "new" / "x.json", {"date": "2026-10-26", "rows": rows})
+        _check("write_slice: каталог создаётся, срез читается",
+               q.read_slice(_P(tmp) / "new" / "x.json", now)["ok"], failures)
+
+        # brief_state: срез трека Q и код бэкапа — без сети.
+        from scanner.db import Store
+        from scanner.notify.deliver import brief_state
+        put(live, "2026-09-29")
+        d["output"] = {"db_path": str(_P(tmp) / "t.db"), "watchlist_json": str(_P(tmp) / "w.json")}
+        Store(d["output"]["db_path"]).close()
+        b0 = brief_state(Config(d), now=now)
+        b1 = brief_state(Config(d), now=now, backup_exit=1)
+        b3 = brief_state(Config(d), now=now, backup_exit=3)
+        d["track_q"]["enabled"] = False
+        boff = brief_state(Config(d), now=now, backup_exit=0)
+    _check("brief_state: срез трека Q (дата, возраст), бэкап не запускали -> молчим",
+           b0["track_q"]["date"] == "2026-09-29" and abs(b0["track_q"]["age_days"] - 26.4) < 1e-6
+           and b0["backup"] is None, failures)
+    _check("brief_state: backup-exit 1 -> fail, 3 -> send_fail, 0 -> нет пометки",
+           b1["backup"] == "fail" and b3["backup"] == "send_fail" and boff["backup"] is None,
+           failures)
+    _check("brief_state: трек Q выключен в конфиге -> пометки о срезе нет",
+           boff["track_q"] is None, failures)
+
+    # Тексты пометок (DD.MM — по дате среза).
+    tq = lambda age, ok=True: {"ok": ok, "date": "2026-09-29", "age_days": age}  # noqa: E731
+    _check("пометка: свежий (10 дн.) или трек выключен в конфиге -> пусто",
+           tg.track_q_note(tq(10), cfg) == "" and tg.track_q_note(None, cfg) == "", failures)
+    _check("пометка: 26 дн. -> автообновление не прошло, выключится 29.10",
+           tg.track_q_note(tq(26.4), cfg)
+           == "⚠ срез трека Q от 29.09: автообновление не прошло, трек выключится 29.10", failures)
+    _check("пометка: 31 дн. -> трек Q выключен, старше 30 дн.",
+           tg.track_q_note(tq(31), cfg) == "⚠ трек Q выключен: срез от 29.09 старше 30 дн.",
+           failures)
+    _check("пометка: среза нет -> трек Q выключен",
+           tg.track_q_note({"ok": False, "date": "", "age_days": None}, cfg)
+           .startswith("⚠ трек Q выключен: среза нет"), failures)
+
+    # Сводка: бэкап — в строке статуса, срез — служебной строкой после подвала.
+    st = {"scan": {"ran": True, "ok": True, "elapsed_min": 20.0, "watchlist": 80},
+          "watch_ok": True, "market": {}, "new": [], "muted": [], "near": [], "positions": [],
+          "signals_today": [], "unavailable": ["onchain"], "dev_github": "59 из 80"}
+    day = _dt(2026, 10, 25, 10, 0).timestamp()
+    ok_b = tg.format_brief({**st, "track_q": tq(10)}, cfg, now=day)
+    fail_b = tg.format_brief({**st, "backup": "fail", "track_q": tq(26.4)}, cfg, now=day)
+    send_b = tg.format_brief({**st, "backup": "send_fail"}, cfg, now=day)
+    _check("сводка: всё в порядке -> ни «бэкап», ни «трек Q»",
+           "бэкап" not in ok_b and "трек Q" not in ok_b, failures)
+    _check("сводка: бэкап упал -> «⚠ бэкап не сделан» в первой строке",
+           "⚠ бэкап не сделан" in fail_b.split("\n")[0], failures)
+    _check("сводка: копия не ушла -> «⚠ бэкап не ушёл в Telegram» в первой строке",
+           "⚠ бэкап не ушёл в Telegram" in send_b.split("\n")[0]
+           and "не сделан" not in send_b, failures)
+    _check("сводка: старый срез -> строка после подвала с on-chain",
+           fail_b.split("\n")[-2].endswith("on-chain недоступен</i>")
+           and fail_b.split("\n")[-1].startswith("⚠ срез трека Q от 29.09"), failures)
+
+
+def test_backup(cfg, failures: list[str]) -> None:
+    print("Бэкап базы — копия, gzip, integrity, восстановление, ротация, неделя в Telegram:")
+    import copy
+    import gzip
+    import sqlite3
+    import tempfile
+    from pathlib import Path as _P
+    from scanner import backup as bk
+    from scanner.config import Config
+    from scanner.db import Store
+    from scanner.notify import telegram as tg
+    t0 = 1791180000.0                                    # 2026-10-05 ~10:00 по Самаре
+    with tempfile.TemporaryDirectory() as tmp:
+        db, out = _P(tmp) / "scanner.db", _P(tmp) / "backups"
+        st = Store(str(db))
+        st.finish_run(st.new_run("x"), 10, 5, 3, {"elapsed_sec": 60})
+        st.close()
+        ps = PositionStore(str(db))
+        for sym in ("GRAM", "LUNC"):
+            ps.add(sym, 1.0, 100, coin_id=sym.lower(), paper=True)
+        ps.close_db()
+        info = bk.make_backup(db, out, keep=3, now=t0)
+        name = info["path"].name
+        restored = _P(tmp) / "restored.db"
+        with gzip.open(info["path"], "rb") as fi:
+            restored.write_bytes(fi.read())
+        con = sqlite3.connect(restored)
+        integ = con.execute("PRAGMA integrity_check").fetchone()[0]
+        n_pos = con.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+        con.close()
+        _check("копия: scanner-YYYYMMDD-HHMM.db.gz, без временных файлов рядом",
+               bk.NAME_RE.match(name) is not None and name.startswith("scanner-2026100")
+               and [p.name for p in out.iterdir()] == [name], failures)
+        _check("восстановление: gunzip -> integrity ok, 2 позиции, размер как у базы",
+               integ == "ok" and n_pos == 2 and restored.stat().st_size == info["db_size"],
+               failures)
+        _check("строка лога: backup ok, размер, сколько хранится",
+               bk.ok_line(info).startswith("backup ok: ") and "хранится 1 из 3" in bk.ok_line(info),
+               failures)
+
+        # Ротация: 5 копий при keep=3 -> 3 самые новые; чужие файлы не трогаются.
+        (out / "notes.txt").write_text("x", encoding="utf-8")
+        (out / "scanner-manual.db.gz").write_bytes(b"x")
+        infos = [bk.make_backup(db, out, keep=3, now=t0 + i * 3600) for i in range(1, 5)]
+        left = [p.name for p in bk.list_backups(out)]
+        _check("ротация: осталось 3 самых новых",
+               left == [i["path"].name for i in reversed(infos[-3:])]
+               and infos[-1]["kept"] == 3 and len(infos[-1]["removed"]) == 1, failures)
+        _check("ротация: чужие файлы в каталоге целы",
+               (out / "notes.txt").exists() and (out / "scanner-manual.db.gz").exists(), failures)
+
+        # Сбои: код ≠ 0 (исключение), старые копии и каталог не портятся.
+        errs = []
+        broken = _P(tmp) / "broken.db"
+        broken.write_bytes(b"not a database " * 100)
+        for args, kw in (((_P(tmp) / "none.db", out), {"keep": 3}), ((broken, out), {"keep": 3}),
+                         ((db, out), {"keep": 0})):
+            try:
+                bk.make_backup(*args, now=t0 + 9 * 3600, **kw)
+                errs.append(None)
+            except Exception as e:  # noqa: BLE001
+                errs.append(type(e).__name__)
+        _check("сбой: нет базы / не база / keep=0 -> исключение",
+               errs[0] == "BackupError" and errs[1] == "DatabaseError"
+               and errs[2] == "BackupError", failures)
+        _check("сбой: битая копия не записана, ротация не тронула прежние 3, хвостов нет",
+               [p.name for p in bk.list_backups(out)] == left
+               and not [p for p in out.iterdir() if p.name.startswith(".")], failures)
+
+        # Недельная отправка: отправитель подменён — сети нет.
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {"db_path": str(db), "watchlist_json": str(_P(tmp) / "w.json")}
+        d["api_keys"].update(telegram_token="T", telegram_chat_id="C")
+        c = Config(d)
+        sent, msgs = [], []
+
+        def doc(ok=True):
+            def _send(token, chat, data, filename, caption, silent=False):
+                sent.append({"data": data, "filename": filename, "caption": caption,
+                             "silent": silent})
+                return ok
+            return _send
+
+        def msg(token, chat, text, silent=False):
+            msgs.append({"text": text, "silent": silent})
+            return True
+
+        def flags():
+            p = PositionStore(str(db))
+            n = p.conn.execute("SELECT COUNT(*) FROM position_events WHERE position_id=0 "
+                               "AND type=?", (bk.FLAG,)).fetchone()[0]
+            p.close_db()
+            return n
+
+        last = infos[-1]
+        now = time.time()
+        r1 = bk.send_weekly(c, last, notify=True, now=now, send_document=doc())
+        _check("неделя: первая отправка -> документом, без звука, отметка записана",
+               r1[0] == 0 and len(sent) == 1 and sent[0]["silent"] is True
+               and sent[0]["filename"] == last["path"].name
+               and sent[0]["data"] == last["path"].read_bytes() and flags() == 1, failures)
+        cap = sent[0]["caption"]
+        _check("подпись: дата, размер, как восстановить (gunzip → scanner.db)",
+               "Бэкап базы сканера" in cap and last["path"].name in cap and " КБ" in cap
+               and "gunzip -c" in cap and "scanner.db" in cap and not cap.startswith("🧪"),
+               failures)
+        r2 = bk.send_weekly(c, last, notify=True, now=now, send_document=doc())
+        _check("неделя: уже отправляли на этой неделе -> пропуск",
+               r2[0] == 0 and len(sent) == 1 and "уже" in r2[1], failures)
+        r3 = bk.send_weekly(c, last, notify=True, test=True, now=now, send_document=doc())
+        _check("--test: шлёт несмотря на отметку, «🧪 ТЕСТ», отметку не пишет",
+               r3[0] == 0 and len(sent) == 2 and sent[1]["caption"].startswith("🧪 ТЕСТ")
+               and flags() == 1, failures)
+        week = now + 7 * 86400
+        r4 = bk.send_weekly(c, last, notify=False, now=week, send_document=doc())
+        _check("новая неделя без --notify -> «пора», ничего не шлёт и не отмечает",
+               r4[0] == 0 and len(sent) == 2 and "без --notify" in r4[1] and flags() == 1,
+               failures)
+        r5 = bk.send_weekly(c, last, notify=True, now=week, send_document=doc(ok=False))
+        _check("Telegram не принял -> код 3 (сводка: «не ушёл»), отметки нет — повтор завтра",
+               r5[0] == bk.EXIT_SEND_FAILED == 3 and flags() == 1, failures)
+        r6 = bk.send_weekly(c, last, notify=True, now=week, max_bytes=10,
+                            send_document=doc(), send_message=msg)
+        _check("больше лимита -> файл не шлём, предупреждение текстом без звука",
+               r6[0] == 0 and len(sent) == 3 and len(msgs) == 1 and msgs[0]["silent"]
+               and "не отправлен" in msgs[0]["text"] and flags() == 2, failures)
+
+    # Транспорт sendDocument: multipart с файлом и disable_notification (сеть подменена).
+    posts = []
+    real_post = tg._post
+    tg._post = lambda token, method, data, ctype, timeout=30: (
+        posts.append((method, data, ctype, timeout)) or {"ok": True})
+    try:
+        ok = tg.send_document("T", "C", b"\x1f\x8bGZ", "scanner-x.db.gz", "<b>cap</b>",
+                              silent=True)
+        no_token = tg.send_document("", "C", b"x", "a.gz", "cap")
+    finally:
+        tg._post = real_post
+    method, body, ctype, tmo = posts[0]
+    _check("sendDocument: файл, подпись, без звука, длинный таймаут",
+           ok and method == "sendDocument" and b'name="document"; filename="scanner-x.db.gz"'
+           in body and b"\x1f\x8bGZ" in body and b'name="disable_notification"' in body
+           and ctype.startswith("multipart/form-data") and tmo >= 300, failures)
+    _check("sendDocument: нет token -> не шлёт", no_token is False and len(posts) == 1, failures)
 
 
 def test_antirug_evm(cfg, failures: list[str]) -> None:
@@ -1547,6 +1867,10 @@ def main() -> int:
     test_filters(cfg, failures)
     print()
     test_track_q(cfg, failures)
+    print()
+    test_quality_refresh(cfg, failures)
+    print()
+    test_backup(cfg, failures)
     print()
     test_antirug_evm(cfg, failures)
     print()

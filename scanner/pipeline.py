@@ -137,11 +137,12 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
     if limit:
         ingested = ingested[:limit]
 
-    # Трек Q: срез фильтра качества (монеты без контракта вместо анти-рага).
+    # Трек Q: срез фильтра качества (монеты без контракта вместо анти-рага) — свежий из
+    # track_q.live_source / source (quality.fresh_slice).
     qual = {"ok": False, "by_sym": {}, "note": "выключен"}
     if cfg.get("track_q.enabled", False):
         from .quality import load_quality
-        qual = load_quality(cfg.get("track_q.source"), cfg.get("track_q.max_age_days", 30))
+        qual = load_quality(cfg)
         if not qual["ok"]:
             print(f"[scan] трек Q пуст: {qual['note']}")
 
@@ -288,8 +289,7 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
         if not q_by_sym and cfg.get("stage7_positions.paper_ab_stop", False):
             # трек Q выключен, но A/B стопа тоже опирается на срез качества
             from .quality import load_quality
-            q_by_sym = load_quality(cfg.get("track_q.source"),
-                                    cfg.get("track_q.max_age_days", 30))["by_sym"]
+            q_by_sym = load_quality(cfg)["by_sym"]
         n_paper = _open_paper_positions(cfg, watchlist, q_by_sym)
 
     _write_watchlist(cfg, watchlist)
@@ -302,7 +302,8 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
         "rejected_filters": len(rejected1),
         "watchlist": len(watchlist),
         "track_q": (f"{sum(1 for c in watchlist if c.track == 'Q')} без контракта "
-                    f"(срез {qual.get('date') or '—'})" if qual["ok"] else qual["note"]),
+                    f"(срез {qual.get('date') or '—'}, {Path(qual['path']).name})"
+                    if qual["ok"] else qual["note"]),
         "rejected_antirug": len(rejected2),
         "manual_review": sum(1 for c in rejected2 if c.manual_review),
         "stage3_enriched": n_fund,

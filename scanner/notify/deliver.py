@@ -146,12 +146,14 @@ def send_exit_card(cfg, card: dict) -> bool:
 # ---------------------------------------------------------------- сводка дня
 
 def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
-                watch_exit: int | None = None) -> dict:
-    """Всё для сводки дня — из scanner.db и watchlist.json, без сети."""
+                watch_exit: int | None = None, backup_exit: int | None = None) -> dict:
+    """Всё для сводки дня — из scanner.db, watchlist.json и среза трека Q, без сети."""
     from .. import regime
+    from ..backup import EXIT_SEND_FAILED
     from ..db import Store
     from ..pipeline import load_watchlist
     from ..positions import PositionStore
+    from ..quality import fresh_slice
     from ..stages.exit import held_days, position_pnl
 
     now = now if now is not None else time.time()
@@ -235,6 +237,15 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
         watch_ok = watch_exit == 0
     else:
         watch_ok = (all((r.get("snap_ts") or 0) >= t0 for r in open_rows) if open_rows else None)
+    # бэкап: код шага из daily_run (нет кода — шаг не запускали, молчим)
+    backup = None
+    if backup_exit:
+        backup = "send_fail" if backup_exit == EXIT_SEND_FAILED else "fail"
+    track_q = None
+    if cfg.get("track_q.enabled", False):
+        s = fresh_slice(cfg, now)
+        track_q = {"ok": s["ok"], "date": s["date"], "age_days": s["age_days"]}
     return {"scan": scan, "watch_ok": watch_ok, "market": ctx, "new": new, "muted": muted,
             "near": near, "positions": rows, "signals_today": sigs,
-            "unavailable": summ.get("unavailable") or [], "dev_github": summ.get("dev_github")}
+            "unavailable": summ.get("unavailable") or [], "dev_github": summ.get("dev_github"),
+            "backup": backup, "track_q": track_q}
