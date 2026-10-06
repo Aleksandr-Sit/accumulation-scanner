@@ -41,7 +41,7 @@ sys.path.insert(0, str(ROOT))
 from scanner import benchmark  # noqa: E402
 
 DAY = 86400
-DROP_DAYS = 2   # монеты нет в прогонах последних DROP_DAYS дней окна — выпала из топа
+DROP_DAYS = benchmark.DROP_DAYS
 
 
 def _d(ts) -> str:
@@ -52,91 +52,10 @@ def _f(x, digits: int = 1) -> str:
     return "—" if x is None else f"{x:+.{digits}f}"
 
 
-def _coin_key(coin_id, symbol, chain, address) -> str:
-    return coin_id or f"{symbol}|{chain or ''}|{address or ''}"
-
-
-# ---------------------------------------------------------------- контрольная корзина
-
-def load_universe(path) -> dict | None:
-    """Прогоны и капы монет из candidates БД path (только чтение); нет таблиц — None.
-
-    -> {"runs": [(ts, run_id, монет в прогоне)] по времени — только прогоны с кандидатами,
-        "wl_runs": те же, но только с непустым watchlist,
-        "watch": {run_id: {ключ: (тикер, капа)}} — дошедшие до watchlist (с капой),
-        "caps": {ключ: ([ts], [капа])} — капа монеты в каждом прогоне, где она есть,
-        "no_cap": сколько монет watchlist было без капы (в корзину не входят)}.
-    Ключ монеты — coin_id CoinGecko, без него — тикер|сеть|адрес."""
-    con = benchmark.connect_ro(path)
-    if con is None:
-        return None
-    runs_n: dict[int, list] = {}
-    watch: dict[int, dict] = {}
-    caps: dict[str, tuple[list, list]] = {}
-    no_cap = 0
-    try:
-        names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if not {"runs", "candidates"} <= names:
-            return None
-        q = ("SELECT c.run_id, r.ts, c.coin_id, c.symbol, c.chain, c.address, c.stage, "
-             "c.market_cap FROM candidates c JOIN runs r ON r.id=c.run_id ORDER BY r.ts")
-        for rid, ts, cid, sym, chain, addr, stage, cap in con.execute(q):
-            runs_n.setdefault(rid, [ts, 0])[1] += 1
-            key = _coin_key(cid, sym, chain, addr)
-            ok = isinstance(cap, (int, float)) and cap > 0
-            if stage == "watchlist":
-                if ok:
-                    watch.setdefault(rid, {}).setdefault(key, (sym, cap))
-                else:
-                    no_cap += 1
-            if ok:
-                t, v = caps.setdefault(key, ([], []))
-                if not t or t[-1] != ts:          # одна точка на прогон
-                    t.append(ts)
-                    v.append(cap)
-    finally:
-        con.close()
-    runs = sorted((ts, rid, n) for rid, (ts, n) in runs_n.items())
-    return {"runs": runs, "wl_runs": [r for r in runs if r[1] in watch],
-            "watch": watch, "caps": caps, "no_cap": no_cap}
-
-
-def basket(uni: dict, start: float, end: float) -> dict | None:
-    """Корзина на окне позиции [start, end]: монеты watchlist прогона входа (последний
-    прогон с watchlist не позже входа), доходность монеты = капа в последнем прогоне
-    ≤ конца окна, где она есть, / капа в прогоне входа − 1; среднее — равновзвешенно.
-
-    -> {run, run_ts, run_n, n, found, ret, seen, ret_seen}; None — прогона входа нет.
-    found/ret — монеты, которые есть в прогонах последних DROP_DAYS дней окна (от последнего
-    прогона ≤ конца); seen/ret_seen — все, что встречались после входа (выпавшие из топа —
-    по последнему появлению). ret — в процентах; None — после входа прогонов не было."""
-    wl = uni["wl_runs"]
-    i = bisect_right([r[0] for r in wl], start) - 1
-    if i < 0:
-        return None
-    ts0, rid0, n0 = wl[i]
-    coins = uni["watch"][rid0]
-    out = {"run": rid0, "run_ts": ts0, "run_n": n0, "n": len(coins),
-           "found": 0, "ret": None, "seen": 0, "ret_seen": None}
-    all_ts = [r[0] for r in uni["runs"]]
-    j = bisect_right(all_ts, end) - 1
-    if j < 0 or all_ts[j] <= ts0:
-        return out
-    ref = all_ts[j] - DROP_DAYS * DAY
-    found, seen = [], []
-    for key, (_sym, cap0) in coins.items():
-        t, v = uni["caps"].get(key, ([], []))
-        k = bisect_right(t, end) - 1
-        if k < 0 or t[k] <= ts0:
-            continue
-        r = v[k] / cap0 - 1
-        seen.append(r)
-        if t[k] >= ref:
-            found.append(r)
-    out.update(found=len(found), seen=len(seen),
-               ret=statistics.fmean(found) * 100 if found else None,
-               ret_seen=statistics.fmean(seen) * 100 if seen else None)
-    return out
+_coin_key = benchmark.coin_key
+# Корзина живёт в scanner/benchmark.py (её же берёт недельная сводка пробного исполнителя).
+load_universe = benchmark.load_universe
+basket = benchmark.basket
 
 
 def hold_return(uni: dict, p: dict, start: float, end: float) -> float | None:

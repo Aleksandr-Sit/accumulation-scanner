@@ -147,7 +147,7 @@ def send_exit_card(cfg, card: dict) -> bool:
 
 def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
                 watch_exit: int | None = None, backup_exit: int | None = None,
-                sync_exit: int | None = None) -> dict:
+                sync_exit: int | None = None, exec_exit: int | None = None) -> dict:
     """Всё для сводки дня — из scanner.db, watchlist.json и среза трека Q, без сети."""
     from .. import regime
     from ..backup import EXIT_SEND_FAILED
@@ -251,4 +251,15 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
             "unavailable": summ.get("unavailable") or [], "dev_github": summ.get("dev_github"),
             "backup": backup, "track_q": track_q,
             # sync с Bybit: код шага из daily_run; ключа нет — шаг выходит с 0, пометки нет
-            "sync_fail": bool(sync_exit)}
+            "sync_fail": bool(sync_exit),
+            # пробный исполнитель: книги R/H и действия за сегодня (таблиц нет — None)
+            "executor": _executor_state(cfg, now), "exec_fail": bool(exec_exit)}
+
+
+def _executor_state(cfg, now: float) -> dict | None:
+    try:
+        from .. import executor
+        return executor.brief_state(cfg, now)
+    except Exception as e:  # noqa: BLE001 — сбой блока не должен съесть сводку дня
+        print(f"[brief] блок пробного исполнителя пропущен: {type(e).__name__}: {e}")
+        return None

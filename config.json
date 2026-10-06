@@ -207,6 +207,24 @@
     "recv_window_ms": 5000
   },
 
+  "executor": {
+    "_comment": "Шаг 2: пробный исполнитель `run.py execute --dry-run` (scanner/executor.py) — ордеров НЕ отправляет. По сегодняшним карточкам ставит лестницу ladder.plan_ladder (steps × budget, ступень 1 рынком, остальные лимитками до пола стопа) парно в книги books; лимитки исполняются по часовым свечам Bybit, если low строго ниже цены (fill_on_touch: касание), и живут buy_valid_days; выходы — по дневным закрытиям. Отказы: лимит max_coins, свободный USDT виртуального счёта capital_usdt, risk_check по нему (30% просадки при worst_case 60% → 15×$50 при $1500). Реальный USDT (ключ Read-Only) — справка в лог. Журнал: таблицы dry_positions / dry_orders (orderLinkId dry-<книга><позиция>-B<n>|S-<сигнал>).",
+    "enabled": true,
+    "steps": 5,
+    "budget_usdt": 50,
+    "min_order_usdt": 10,
+    "max_coins": 15,
+    "capital_usdt": 1500,
+    "buy_valid_days": 120,
+    "fill_on_touch": false,
+    "skip_st": true,
+    "_books_note": "R — stage8_exit целиком; H — без частичных продаж и трейла, только аварийный стоп. stop_pct — буфер под лоу базы. H −25% выбран по backtest/hold_stop_study.py 06.10.2026: шире стоп — медиана не лучше, хвост тяжелее (портфель 10 монет p10 −26% при −25 против −47% при −50).",
+    "books": {
+      "R": {"label": "правила", "emoji": "📏", "exits": "rules", "stop_pct": 25},
+      "H": {"label": "держать", "emoji": "✋", "exits": "stop_only", "stop_pct": 25}
+    }
+  },
+
   "stage8_exit": {
     "_comment": "ОТКАЛИБРОВАНО history_calibration 16.07.2026 (Binance 2017-2026, 105 монет, 692 эпизода, ВЕРХНЯЯ граница из-за survivorship). Инвалидация 5%->25%: 59-70% пружин прокалывают базу перед ростом (shakeout), буфер 25% даёт win 31->50%, 2022 -6.5->-1.9%; 'без инвалидации' лучше на бумаге (+914%) но отвергнуто - survivorship скрывает делистинги. Лестница +100/+300 подтверждена: P(+100)=52-68%, P(+300)=23-31% по полным циклам. Трейлинг 30 после arm 60: p50 отката от HWM после +100% = 74% - без трейлинга отдаёшь почти всё.",
     "enabled": true,

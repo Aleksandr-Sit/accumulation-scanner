@@ -14,6 +14,7 @@
   python run.py quality [--refresh-if-due]  # срез трека Q: дата, возраст; обновить, если пора
   python run.py backup [--send-weekly --notify]   # бэкап scanner.db (+ раз в неделю в Telegram)
   python run.py sync                        # реальные позиции из исполнений Bybit (Read-Only)
+  python run.py execute --dry-run           # пробный исполнитель: «поставил бы», без ордеров
   python run.py selftest                    # офлайн-проверка логики на фикстурах
 """
 from __future__ import annotations
@@ -454,7 +455,8 @@ def cmd_brief(args) -> int:
     from scanner.notify import deliver, telegram
     try:
         state = deliver.brief_state(cfg, scan_exit=args.scan_exit, watch_exit=args.watch_exit,
-                                    backup_exit=args.backup_exit, sync_exit=args.sync_exit)
+                                    backup_exit=args.backup_exit, sync_exit=args.sync_exit,
+                                    exec_exit=args.exec_exit)
         text = telegram.format_brief(state, cfg, test=args.test)
     except Exception as e:
         if args.notify:
@@ -621,6 +623,12 @@ def cmd_report(args) -> int:
         stats["benchmark"] = benchmark.weekly_books(cfg)
     except Exception as e:  # noqa: BLE001
         print(f"[report] сравнение с рынком пропущено: {type(e).__name__}: {e}")
+    # Пробный исполнитель (scanner/executor.py): книги R/H против альтов и контрольной корзины.
+    try:
+        from scanner import executor
+        stats["executor"] = executor.weekly_books(cfg)
+    except Exception as e:  # noqa: BLE001
+        print(f"[report] блок пробного исполнителя пропущен: {type(e).__name__}: {e}")
     text = telegram.format_weekly(stats, cfg)
     print(text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
     delivered = True
@@ -750,6 +758,38 @@ def cmd_sync(args) -> int:
     return code
 
 
+def cmd_execute(args) -> int:
+    """Пробный исполнитель (scanner/executor.py): лестницы по сегодняшним карточкам в книги
+    R «правила» и H «держать», исполнения по свечам Bybit, журнал «поставил бы». Ордеров нет.
+    Код 1 — сбой (сводка дня: «⚠ пробный исполнитель упал»), 2 — запуск без --dry-run."""
+    if not args.dry_run:
+        print("реальный режим не реализован (шаги 3–4 плана) — запускай с --dry-run")
+        return 2
+    cfg = load_config(args.config)
+    from scanner import bybit, executor
+    from scanner.pipeline import _make_http
+    wallet, note = None, ""
+    key, secret = cfg.get("api_keys.bybit_key", ""), cfg.get("api_keys.bybit_secret", "")
+    if key and secret:              # справка: хватило бы реального USDT (ключ Read-Only)
+        try:
+            c = bybit.Client(key, secret, cfg.get("bybit_sync.base_url", bybit.BASE_URL),
+                             recv_window=cfg.get("bybit_sync.recv_window_ms", 5000))
+            u = c.wallet_balance().get("USDT") or {}
+            wallet = max(0.0, u.get("balance", 0.0) - u.get("locked", 0.0))
+        except (bybit.BybitError, OSError) as e:
+            note = f"реальный баланс не прочитан: {e}"
+    else:
+        note = "реальный баланс: ключа Bybit нет — справки нет"
+    try:
+        code, lines = executor.run_dry(cfg, executor.BybitMarket(_make_http(cfg)),
+                                       wallet_usdt=wallet, wallet_note=note)
+    except Exception as e:  # noqa: BLE001 — код 1 и текст в лог, сводка дня покажет
+        code, lines = 1, [f"FAIL: {type(e).__name__}: {e}"]
+    for line in lines:
+        print(f"[execute] {line}")
+    return code
+
+
 def cmd_selftest(args) -> int:
     from tests.selftest import main as selftest_main
     return selftest_main()
@@ -829,6 +869,8 @@ def main() -> int:
     pb.add_argument("--sync-exit", type=int, default=None,
                     help="код выхода sync из daily_run: ≠ 0 — «⚠ синхронизация с Bybit не "
                          "прошла» в строке статуса")
+    pb.add_argument("--exec-exit", type=int, default=None,
+                    help="код выхода execute из daily_run: ≠ 0 — «⚠ пробный исполнитель упал»")
     pb.add_argument("--config", default=None)
     pb.set_defaults(func=cmd_brief)
 
@@ -877,6 +919,13 @@ def main() -> int:
                                       "Read-Only в .env; нет ключа — пропуск)")
     psy.add_argument("--config", default=None)
     psy.set_defaults(func=cmd_sync)
+
+    pex = sub.add_parser("execute", help="пробный исполнитель: лестницы по сегодняшним "
+                                         "карточкам в книги R/H, без ордеров (--dry-run)")
+    pex.add_argument("--dry-run", action="store_true",
+                     help="обязателен: реального режима пока нет (шаги 3–4)")
+    pex.add_argument("--config", default=None)
+    pex.set_defaults(func=cmd_execute)
 
     pt = sub.add_parser("selftest", help="офлайн-проверка на фикстурах")
     pt.set_defaults(func=cmd_selftest)

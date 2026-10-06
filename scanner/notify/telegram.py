@@ -693,6 +693,8 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
         head.append("⚠ бэкап не ушёл в Telegram")
     if state.get("sync_fail"):
         head.append("⚠ синхронизация с Bybit не прошла")
+    if state.get("exec_fail"):
+        head.append("⚠ пробный исполнитель упал")
     lines = ["<b>" + " · ".join(head) + "</b>", ""]
     lines += market_block(state.get("market") or {}, cfg, now)
     lines.append("")
@@ -744,6 +746,9 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
         lines.append(", ".join(f"{'📝' if s.get('is_paper') else '💰'}{_esc(s['symbol'])} "
                                f"{_esc(s['label'])}" for s in sigs))
         lines.append("")
+    ex = executor_brief_lines(state.get("executor"), cfg)
+    if ex:
+        lines += ex + [""]
 
     foot = []
     if scan.get("elapsed_min") is not None:
@@ -760,6 +765,65 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
     if note:                              # служебная пометка о данных — отдельной строкой
         lines.append(_esc(note))
     return "\n".join(lines).strip()
+
+
+def _signal_text(stype: str, cfg) -> str:
+    if stype.startswith("ladder_"):
+        i = int(stype.split("_")[1])
+        lad = cfg["stage8_exit"]["ladder"]
+        return f"фикс {lad[i][1] * 100:.0f}%" if i < len(lad) else stype
+    return {"invalidation": "стоп", "trailing": "трейл"}.get(stype, stype)
+
+
+def executor_brief_lines(ex: dict | None, cfg) -> list[str]:
+    """Блок сводки дня «🤖 Пробный исполнитель» (scanner/executor.brief_state): что поставил бы
+    сегодня, отказы, исполнения и продажи за сутки, P&L книг. Пусто — блока нет."""
+    if not ex:
+        return []
+    books = ex.get("books") or {}
+    active = any(b.get("open") or b.get("closed") for b in books.values())
+    if not (active or ex.get("opened") or ex.get("rejected")):
+        return []
+    out = ["🤖 <b>Пробный исполнитель</b> <i>(ордера не отправлялись)</i>"]
+    if ex.get("opened"):
+        out.append("поставил бы лестницу: " + ", ".join(_esc(s) for s in ex["opened"]))
+    for sym, why in ex.get("rejected") or []:
+        out.append(f"отказ {_esc(sym)}: {_esc(why)}")
+    acts = []
+    if ex.get("fills"):
+        acts.append(f"исполнилось лимиток {ex['fills']}")
+    if ex.get("sells"):
+        acts.append("продажи: " + ", ".join(f"{_esc(b)} {_esc(s)} {_signal_text(t, cfg)}"
+                                            for b, s, t in ex["sells"]))
+    if acts:
+        out.append("за сутки: " + "; ".join(acts))
+    if active:
+        out.append(" · ".join(f"{b.get('emoji', '•')} {_esc(b.get('label', k))}: {b['open']} поз., "
+                              f"{fmt_usd(b['pnl'])}" for k, b in books.items()))
+    return out
+
+
+def executor_weekly_block(books: list[dict]) -> list[str]:
+    """«🤖 Пробный исполнитель» недельной сводки: книги R/H против альтов и контрольной корзины
+    на тех же окнах (scanner/executor.weekly_books). Позиций нет — пусто."""
+    books = [b for b in books or [] if b.get("positions")]
+    if not books:
+        return []
+    out = ["🤖 <b>Пробный исполнитель</b> (5×$10 на монету, ордера не отправлялись):"]
+    for b in books:
+        head = f"{b.get('emoji', '•')} {_esc(b.get('label', ''))}:"
+        if not b.get("n"):
+            out.append(f"{head} нет рынка на даты позиций ({b['positions']} поз.)")
+            continue
+        shown = [float(f"{b[k]:.1f}") for k in ("book_pct", "alt_pct")]
+        pp = f"{shown[0] - shown[1]:+.1f}".replace("-", "−")
+        bask = (f" · корзина {_signed(b['basket_pct'])}" if b.get("basket_pct") is not None
+                else "")
+        out.append(f"{head} {_signed(b['book_pct'])} · альты {_signed(b['alt_pct'])}{bask} → "
+                   f"{pp} п.п. к альтам ({b['n']} поз.)")
+    out.append("<i>Обе книги входят одинаково, разница — только выходы. Корзина — все монеты "
+               "watchlist того же прогона поровну (по капе, без комиссий).</i>")
+    return out
 
 
 def track_q_note(tq: dict | None, cfg) -> str:
@@ -853,6 +917,10 @@ def format_weekly(stats: dict, cfg) -> str:
     if bench:
         lines.append("")
         lines += bench
+    exb = executor_weekly_block(stats.get("executor") or [])
+    if exb:
+        lines.append("")
+        lines += exb
 
     # Одноразовая итоговая сводка на N-й неделе — с кумулятивом и call-to-decide.
     if stats.get("milestone"):

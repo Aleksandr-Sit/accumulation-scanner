@@ -1,5 +1,5 @@
 ﻿# Ежедневный прогон сканера: quality (срез трека Q, если пора) -> scan -> sync (позиции из
-# Bybit) -> watch -> report (раз в неделю) -> backup -> brief, Telegram, лог в logs/.
+# Bybit) -> watch -> execute (пробный исполнитель) -> report (раз в неделю) -> backup -> brief, Telegram, лог в logs/.
 # Двойник scripts/daily_run.sh.
 # Запускается Планировщиком Windows (задача AccumulationScannerDaily, см. scripts/register_task.ps1).
 # Ручной запуск: powershell -ExecutionPolicy Bypass -File scripts\daily_run.ps1 [-NoNotify]
@@ -38,6 +38,9 @@ $scanCode = Run-Step "scan" (@("scan") + $notify)
 # до watch, чтобы сегодняшние покупки сразу получили цену и сигналы. Сбой не блокирует watch.
 $syncCode = Run-Step "sync" (@("sync"))
 $watchCode = Run-Step "watch" (@("watch") + $notify)
+# Пробный исполнитель: лестницы по сегодняшним карточкам в книги R/H, без ордеров. Сбой не
+# блокирует остальные шаги — код уходит в сводку дня.
+$execCode = Run-Step "execute" (@("execute", "--dry-run"))
 # Недельная сводка: report зовётся каждый день, сам решает, пора ли (--if-due, первый
 # прогон недели); после watch — берёт свежие снапшоты позиций.
 $reportCode = Run-Step "report" (@("report", "--if-due") + $notify)
@@ -47,14 +50,15 @@ $backupCode = Run-Step "backup" (@("backup", "--send-weekly") + $notify)
 # Сводка дня — тихо и последней: рынок, монеты у дна, позиции, статус scan/sync/watch/backup.
 # Пришла сводка — прогон дошёл до конца; коды выхода передаём, чтобы сбой был виден в ней.
 $briefCode = Run-Step "brief" (@("brief", "--scan-exit", "$scanCode", "--watch-exit", "$watchCode",
-                                 "--backup-exit", "$backupCode", "--sync-exit", "$syncCode") + $notify)
+                                 "--backup-exit", "$backupCode", "--sync-exit", "$syncCode",
+                                 "--exec-exit", "$execCode") + $notify)
 
 # Логи старше 30 дней не нужны.
 Get-ChildItem $logDir -Filter "daily_*.log" |
     Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
     Remove-Item -Force -ErrorAction SilentlyContinue
 
-if ($qualityCode -ne 0 -or $scanCode -ne 0 -or $syncCode -ne 0 -or $watchCode -ne 0 -or
+if ($qualityCode -ne 0 -or $scanCode -ne 0 -or $syncCode -ne 0 -or $watchCode -ne 0 -or $execCode -ne 0 -or
     $reportCode -ne 0 -or
     $backupCode -ne 0 -or $briefCode -ne 0) { exit 1 }
 exit 0

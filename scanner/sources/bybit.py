@@ -69,12 +69,52 @@ def fetch_daily_ohlcv(http: HttpClient, symbol: str, limit: int = 400) -> dict:
 
 def parse_daily_ohlcv(data, now_ms: int) -> dict:
     """Ответ /v5/market/kline (D) -> {ts (сек), o, h, l, c, v, qv}; незакрытая свеча отброшена."""
+    return parse_klines(data, now_ms, _DAY_MS)
+
+
+def fetch_klines(http: HttpClient, symbol: str, interval: str, start_ms: int,
+                 now_ms: int | None = None, max_pages: int = 20) -> dict:
+    """Закрытые свечи спот-пары с start_ms до сейчас (oldest→newest): {ts (сек), o, h, l, c,
+    v, qv}. interval — как в API ("60" — час). Запрос отдаёт не больше 1000 свечей, newest-
+    first, поэтому страницы идут назад по end, пока не дойдём до start_ms. Без кэша."""
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    step = int(interval) * 60_000 if interval.isdigit() else _DAY_MS
+    chunks: list[dict] = []
+    end = now_ms
+    for _ in range(max_pages):
+        data = http.get_json(f"{_BASE}/v5/market/kline",
+                             params={"category": "spot", "symbol": symbol, "interval": interval,
+                                     "start": int(start_ms), "end": int(end), "limit": 1000},
+                             use_cache=False)
+        part = parse_klines(data, now_ms, step)
+        if not part["ts"]:
+            break
+        chunks.append(part)
+        first_ms = part["ts"][0] * 1000
+        if first_ms <= start_ms or len(part["ts"]) < 999:
+            break
+        end = first_ms - 1
+    out: dict[str, list] = {k: [] for k in ("ts", "o", "h", "l", "c", "v", "qv")}
+    seen: set[int] = set()
+    for part in reversed(chunks):           # страницы шли от новых к старым
+        for i, t in enumerate(part["ts"]):
+            if t in seen:
+                continue
+            seen.add(t)
+            for k in out:
+                out[k].append(part[k][i])
+    return out
+
+
+def parse_klines(data, now_ms: int, interval_ms: int) -> dict:
+    """Ответ /v5/market/kline -> {ts (сек), o, h, l, c, v, qv} oldest→newest; свеча, которая
+    ещё не закрылась (start + интервал > now), отброшена. Чистая, офлайн-тест."""
     out: dict[str, list] = {k: [] for k in ("ts", "o", "h", "l", "c", "v", "qv")}
     rows = ((data.get("result") or {}).get("list") or []) if isinstance(data, dict) else []
     for r in reversed(rows):     # Bybit отдаёт newest-first
         try:
             start = int(r[0])
-            if start + _DAY_MS > now_ms:
+            if start + interval_ms > now_ms:
                 continue
             vals = [float(x) for x in r[1:7]]
         except (ValueError, IndexError, TypeError):

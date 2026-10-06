@@ -2088,6 +2088,402 @@ def test_bybit_sync(cfg, failures: list[str]) -> None:
            and "Bybit" not in tg.format_brief(st, cfg, now=t0), failures)
 
 
+class _FakeMarket:
+    """Рынок для пробного исполнителя: те же методы, что executor.BybitMarket. Свечи отдаются
+    только закрытые к self.now (как Bybit); hourly — все с start, фильтр по постановке — в коде."""
+
+    def __init__(self, now: float):
+        self.now = now
+        self.inst: dict = {}          # пара -> instrument | None (нет на Bybit)
+        self.price: dict = {}         # пара -> последняя цена
+        self.days: dict = {}          # пара -> [(ts дня, close)]
+        self.hours: dict = {}         # пара -> [(ts часа, low)]
+        self.fail: set = set()        # пары, на которых daily бросает исключение
+
+    def instrument(self, pair):
+        return self.inst.get(pair)
+
+    def last_price(self, pair):
+        return self.price.get(pair)
+
+    def daily(self, pair):
+        if pair in self.fail:
+            raise RuntimeError("биржа не ответила")
+        rows = [(t, c) for t, c in self.days.get(pair, []) if t + 86400 <= self.now]
+        return {"ts": [t for t, _ in rows], "c": [c for _, c in rows],
+                "o": [c for _, c in rows], "h": [c for _, c in rows], "l": [c for _, c in rows]}
+
+    def hourly(self, pair, start_ts):
+        rows = [(t, lo) for t, lo in self.hours.get(pair, []) if t + 3600 <= self.now]
+        return {"ts": [t for t, _ in rows], "l": [lo for _, lo in rows]}
+
+
+def test_executor(cfg, failures: list[str]) -> None:
+    print("Пробный исполнитель (dry-run): лестница, исполнения, выходы R/H, отказы, сводки:")
+    import copy
+    import json as _json
+    import sqlite3
+    import tempfile
+    from pathlib import Path as _P
+    from scanner import executor as ex
+    from scanner.config import Config
+    from scanner.db import Store
+    from scanner.ladder import LIMIT_FEE, MARKET_FEE, round_step
+    from scanner.notify import telegram as tg
+    from scanner.notify.deliver import brief_state as deliver_brief
+    from scanner.sources import bybit
+    D, H = ex.DAY, ex.HOUR
+    d0 = 1790812800                        # 2026-10-01 00:00 UTC
+    now0 = d0 + 6 * H + 1800               # постановка в 06:30 UTC — не на границе часа
+    inst = {"symbol": "", "status": "Trading", "st": False, "tick": 0.01, "qty_step": 0.1,
+            "min_qty": 0.1, "min_amt": 5.0}
+    # история: 40 дней по 1.0, за 10 дней до карточки — 0.95 → лоу базы 0.95, пол −25% 0.7125
+    hist = [(d0 - k * D, 0.95 if k == 10 else 1.0) for k in range(40, 0, -1)]
+
+    def make_cfg(tmp: str, **exe) -> Config:
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {**d.get("output", {}), "db_path": str(_P(tmp) / "t.db"),
+                       "watchlist_json": str(_P(tmp) / "wl.json")}
+        d["executor"] = {**d.get("executor", {}), **exe}
+        (_P(tmp) / "wl.json").write_text(_json.dumps([{"symbol": "AAA", "coin_id": "aaa-coin"}]),
+                                         encoding="utf-8")
+        Store(d["output"]["db_path"]).close()          # схема сканера: alert_log, market_daily
+        return Config(d)
+
+    def card(c: Config, sym: str, ts: float, score: float = 72.0) -> None:
+        con = sqlite3.connect(c["output"]["db_path"])
+        con.execute("INSERT INTO alert_log(symbol, ts, score) VALUES (?,?,?)", (sym, ts, score))
+        con.commit()
+        con.close()
+
+    def q(c: Config, sql: str, args=()) -> list[dict]:
+        con = sqlite3.connect(c["output"]["db_path"])
+        con.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in con.execute(sql, args).fetchall()]
+        finally:
+            con.close()
+
+    def add_pair(m: _FakeMarket, pair: str, after: list, hours: list) -> None:
+        m.inst[pair] = {**inst, "symbol": pair}
+        m.price[pair] = 1.0
+        m.days[pair] = hist + after
+        m.hours[pair] = hours
+
+    with tempfile.TemporaryDirectory() as tmp:
+        c = make_cfg(tmp)
+        m = _FakeMarket(now0)
+        # AAA: рост 1.5 (+50%) → 2.6 (+150%) → 1.7 (откат 35% от пика — трейл)
+        add_pair(m, "AAAUSDT", [(d0, 1.0), (d0 + D, 1.5), (d0 + 2 * D, 2.6), (d0 + 3 * D, 1.7)],
+                 [(d0 + 6 * H, 0.90),     # началась ДО постановки — не в счёт, хотя ниже 0.93
+                  (d0 + 7 * H, 0.93),     # касание: low == цене лимитки — не исполнена
+                  (d0 + 8 * H, 0.929)])   # прошла сквозь — исполнена ступень 2
+        # BBB: падение; лимитки исполнятся все, два закрытия ниже пола 0.7125 — стоп обеим книгам
+        add_pair(m, "BBBUSDT", [(d0, 0.80), (d0 + D, 0.70), (d0 + 2 * D, 0.70)],
+                 [(d0 + 7 * H, 0.92), (d0 + D + 5 * H, 0.69)])
+        card(c, "AAA", now0 - 60)         # раньше BBB: позиции AAA получат id 1 (R) и 2 (H)
+        card(c, "BBB", now0)
+        code0, lines0 = ex.run_dry(c, m, now=now0, wallet_usdt=30.0)
+        pos0 = q(c, "SELECT * FROM dry_positions ORDER BY id")
+        ord0 = q(c, "SELECT * FROM dry_orders ORDER BY link_id")
+        bs0 = deliver_brief(c, now=now0, exec_exit=0)
+        code1, lines1 = ex.run_dry(c, m, now=now0)
+        n_pos1 = len(q(c, "SELECT id FROM dry_positions"))
+        n_ord1 = len(q(c, "SELECT link_id FROM dry_orders"))
+        aaa_r = next(p for p in pos0 if p["symbol"] == "AAA" and p["book"] == "R")
+        aaa_h = next(p for p in pos0 if p["symbol"] == "AAA" and p["book"] == "H")
+        buys = [o for o in ord0 if o["position_id"] == aaa_r["id"]]
+        buys.sort(key=lambda o: o["step"])
+
+        # (а) размер и цены ступеней
+        _check("лестница: 5 ступеней по ~$10, ступень 1 рынком, 2–5 лимитками",
+               code0 == 0 and len(buys) == 5 and buys[0]["kind"] == "Market"
+               and all(o["kind"] == "Limit" for o in buys[1:])
+               and all(10 - 1e-9 <= o["usd"] < 10.2 for o in buys), failures)
+        _check("цены лимиток вниз к tick 0.01: 0.93/0.87/0.81/0.74 (не 0.94/…/0.75)",
+               [o["price"] for o in buys[1:]] == [0.93, 0.87, 0.81, 0.74], failures)
+        _check("нижняя лимитка ≥ пола стопа 0.7125 и ≤ 1.05 × пола",
+               0.7125 < buys[-1]["price"] <= round_step(0.95 * 0.75 * 1.05, 0.01), failures)
+        _check("количества кратны qty_step 0.1",
+               all(abs(o["qty"] / 0.1 - round(o["qty"] / 0.1)) < 1e-9 for o in buys), failures)
+        _check("ступень 1 исполнена по цене запуска, 0.15% в монете",
+               buys[0]["status"] == "filled" and abs(aaa_r["qty"] - 10.0 * (1 - MARKET_FEE)) < 1e-9
+               and abs(aaa_r["spent_usdt"] - 10.0) < 1e-9
+               and abs(buys[0]["fee_usdt"] - 10.0 * MARKET_FEE) < 1e-12, failures)
+        _check("лоу базы 0.95, стоп 25%, минимум биржи и coin_id из watchlist",
+               aaa_r["base_low"] == 0.95 and aaa_r["stop_pct"] == 25 and aaa_r["min_amt"] == 5.0
+               and aaa_r["coin_id"] == "aaa-coin", failures)
+        _check("лог: «поставил бы в книги R/H» и справка реального счёта «НЕ хватило бы»",
+               any("AAA: поставил бы в книги R/H — 5 ступ." in x for x in lines0)
+               and any("свободно 30.00 USDT" in x and "НЕ хватило бы" in x for x in lines0),
+               failures)
+
+        # (б) идемпотентность и orderLinkId
+        _check("повтор run_dry в тот же день: позиций и ордеров не прибавилось",
+               code1 == 0 and n_pos1 == len(pos0) == 4 and n_ord1 == len(ord0) == 20
+               and any("уже обработана" in x for x in lines1), failures)
+        _check("orderLinkId: dry-R1-B1 … dry-R1-B5, dry-H2-B1; все ≤ 36 символов",
+               [o["link_id"] for o in buys] == [f"dry-R{aaa_r['id']}-B{n}" for n in range(1, 6)]
+               and aaa_r["id"] == 1 and aaa_h["id"] == 2
+               and any(o["link_id"] == "dry-H2-B1" for o in ord0)
+               and all(len(o["link_id"]) <= 36 for o in ord0), failures)
+        try:
+            ex.link_id("R", 1, "X" * 40)
+            long_ok = False
+        except ValueError:
+            long_ok = True
+        _check("link_id длиннее 36 -> ValueError", long_ok, failures)
+        _check("signal_tail: ladder_0 → S-L0, trailing → S-TR, invalidation → S-INV",
+               ex.signal_tail("ladder_0") == "S-L0" and ex.signal_tail("trailing") == "S-TR"
+               and ex.signal_tail("invalidation") == "S-INV", failures)
+
+        # (з) сводка дня после постановки
+        exl0 = tg.executor_brief_lines(bs0.get("executor"), c)
+        _check("сводка дня: «🤖 Пробный исполнитель», поставил бы AAA и BBB, P&L книг",
+               bool(exl0) and exl0[0].startswith("🤖 <b>Пробный исполнитель</b>")
+               and any(x.startswith("поставил бы лестницу:") and "AAA" in x and "BBB" in x
+                       for x in exl0)
+               and any("📏 правила: 2 поз." in x and "✋ держать: 2 поз." in x for x in exl0),
+               failures)
+
+        # (в) исполнение лимиток по часовым свечам
+        m.now = d0 + 8 * H
+        ex.run_dry(c, m, now=m.now)
+        st2a = q(c, "SELECT status FROM dry_orders WHERE link_id='dry-R1-B2'")[0]["status"]
+        m.now = d0 + 9 * H
+        _, lines_b = ex.run_dry(c, m, now=m.now)
+        o2 = q(c, "SELECT * FROM dry_orders WHERE link_id='dry-R1-B2'")[0]
+        o3 = q(c, "SELECT status FROM dry_orders WHERE link_id='dry-R1-B3'")[0]["status"]
+        _check("лимитка 0.93: свеча до постановки (low 0.90) и касание (low 0.93) — не исполнена",
+               st2a == "new", failures)
+        _check("low 0.929 < 0.93 — исполнена по цене лимитки, комиссия 0.1%; ступень 3 ждёт",
+               o2["status"] == "filled" and o2["price"] == 0.93 and o2["filled_ts"] == d0 + 9 * H
+               and abs(o2["fee_usdt"] - o2["usd"] * LIMIT_FEE) < 1e-12 and o3 == "new"
+               and any("R AAA: исполнилась бы ступень 2 по 0.93" in x for x in lines_b), failures)
+
+        # (г) выходы: дни d0, d0+1 закрыты → R фиксирует 1/3 на +50%; BBB одно закрытие ниже пола
+        m.now = d0 + 2 * D + H
+        ex.run_dry(c, m, now=m.now)
+        r_mid = q(c, "SELECT * FROM dry_positions WHERE id=1")[0]
+        sells_mid = q(c, "SELECT * FROM dry_orders WHERE side='Sell' ORDER BY link_id")
+        bbb_mid = q(c, "SELECT status, qty FROM dry_positions WHERE symbol='BBB'")
+        m.now = d0 + 4 * D + H
+        _, lines_d = ex.run_dry(c, m, now=m.now)
+        pos = {(p["symbol"], p["book"]): p for p in q(c, "SELECT * FROM dry_positions")}
+        sells = q(c, "SELECT * FROM dry_orders WHERE side='Sell' ORDER BY created_ts, link_id")
+        _check("R: на +50% (закрытие 1.5) продана 1/3 купленного, ордер dry-R1-S-L0",
+               [s["link_id"] for s in sells_mid] == ["dry-R1-S-L0"]
+               and abs(sells_mid[0]["qty"] - 0.33 * r_mid["bought_qty"]) < 1e-9
+               and sells_mid[0]["price"] == 1.5, failures)
+        _check("BBB: одно закрытие ниже пола — ещё не стоп (нужно 2 подряд), лимитки исполнены",
+               all(p["status"] == "open" for p in bbb_mid) and len(bbb_mid) == 2
+               and len(q(c, "SELECT 1 FROM dry_orders o JOIN dry_positions p ON p.id=o.position_id"
+                            " WHERE p.symbol='BBB' AND o.side='Buy' AND o.status='filled'")) == 10,
+               failures)
+        r_sig = [s["signal"] for s in sells if s["position_id"] == pos[("AAA", "R")]["id"]]
+        _check("R AAA: 1/3 на +50%, 1/3 на +150%, остаток по трейлу — позиция закрыта",
+               r_sig == ["ladder_0", "ladder_1", "trailing"]
+               and pos[("AAA", "R")]["status"] == "closed" and pos[("AAA", "R")]["qty"] == 0
+               and pos[("AAA", "R")]["reason"] == "трейл", failures)
+        r_c = q(c, "SELECT status FROM dry_orders WHERE position_id=? AND side='Buy' ORDER BY "
+                   "step", (pos[("AAA", "R")]["id"],))
+        h_c = q(c, "SELECT status FROM dry_orders WHERE position_id=? AND side='Buy' ORDER BY "
+                   "step", (pos[("AAA", "H")]["id"],))
+        _check("R закрыта → лимитки 3–5 сняты; у H они живы",
+               [o["status"] for o in r_c] == ["filled", "filled"] + ["cancelled"] * 3
+               and [o["status"] for o in h_c] == ["filled", "filled"] + ["new"] * 3
+               and any("R AAA: снял бы неисполненные лимитки (3)" in x for x in lines_d), failures)
+        _check("H AAA «держать»: ни одной продажи на +50/+150 и откате, позиция открыта",
+               not any(s["position_id"] == pos[("AAA", "H")]["id"] for s in sells)
+               and pos[("AAA", "H")]["status"] == "open" and pos[("AAA", "H")]["last_price"] == 1.7,
+               failures)
+        bbb = [s for s in sells if s["pair"] == "BBBUSDT"]
+        _check("BBB: два закрытия ниже лоу базы −25% — обе книги вышли полностью по стопу",
+               sorted(s["book"] for s in bbb) == ["H", "R"]
+               and all(s["signal"] == "invalidation" and s["price"] == 0.70 for s in bbb)
+               and all(pos[("BBB", b)]["status"] == "closed" and pos[("BBB", b)]["qty"] == 0
+                       and pos[("BBB", b)]["reason"] == "стоп" for b in "RH"), failures)
+
+        # (ж) P&L с комиссиями — пересчёт руками
+        bought = 10.0 * (1 - MARKET_FEE) + 10.8 * (1 - LIMIT_FEE)
+        spent = 10.0 * 1.0 + 10.8 * 0.93
+        q1 = q2 = 0.33 * bought
+        proceeds = (q1 * 1.5 + q2 * 2.6 + (bought - q1 - q2) * 1.7) * (1 - MARKET_FEE)
+        pr = pos[("AAA", "R")]
+        ph = pos[("AAA", "H")]
+        _check("P&L R AAA: Σ продаж × (1 − 0.15%) − (10 + 10.8 × 0.93)",
+               abs(pr["spent_usdt"] - spent) < 1e-9 and abs(pr["bought_qty"] - bought) < 1e-9
+               and abs(ex.pnl_usdt(pr) - (proceeds - spent)) < 1e-9, failures)
+        _check("P&L H AAA: остаток × последнее закрытие 1.7 × (1 − 0.15%) − потрачено",
+               abs(ex.pnl_usdt(ph) - (bought * 1.7 * (1 - MARKET_FEE) - spent)) < 1e-9, failures)
+        fees = q(c, "SELECT kind, side, usd, fee_usdt FROM dry_orders WHERE status='filled'")
+        _check("комиссии в журнале: рынок 0.15%, лимит 0.1%, продажа 0.15%",
+               all(abs(f["fee_usdt"] - f["usd"] * (LIMIT_FEE if f["kind"] == "Limit"
+                                                    else MARKET_FEE)) < 1e-12 for f in fees),
+               failures)
+        con_ = sqlite3.connect(c["output"]["db_path"])
+        free_r = ex.free_usdt(con_, "R", 1500.0)
+        con_.close()
+        res_r = 0.0                                          # у R лимиток не осталось
+        _check("свободный USDT книги R = 1500 + Σ(выручка − траты) − резерв лимиток",
+               abs(free_r - (1500 + sum(p["proceeds_usdt"] - p["spent_usdt"]
+                                        for (_, b), p in pos.items() if b == "R") - res_r))
+               < 1e-9, failures)
+
+        # (е) парность: монета в обеих книгах или ни в одной
+        by_pair: dict = {}
+        for p in q(c, "SELECT pair, book, card_day FROM dry_positions"):
+            by_pair.setdefault((p["pair"], p["card_day"]), set()).add(p["book"])
+        _check("парность: каждая (пара, день карточки) — в обеих книгах",
+               all(v == {"R", "H"} for v in by_pair.values()), failures)
+
+        # (з) сводка дня после выходов и недельный блок по той же БД
+        bs = deliver_brief(c, now=m.now, exec_exit=1)
+        exl = tg.executor_brief_lines(bs["executor"], c)
+        _check("сводка дня: продажи за сутки «R AAA трейл», «H BBB стоп»; H — 1 поз.",
+               bs["exec_fail"] and any("продажи:" in x and "R AAA трейл" in x and "H BBB стоп" in x
+                                       for x in exl)
+               and any("✋ держать: 1 поз." in x for x in exl), failures)
+        st_ = Store(c["output"]["db_path"])
+        st_.upsert_market(
+            {d0 + k * D: {"total_mcap": 1000 + 100 * k, "btc_dominance": 50, "stables_usd": 100}
+             for k in range(0, 6)})
+        st_.close()
+        wb = ex.weekly_books(c)
+        wr = next((b for b in wb if b["key"] == "R"), {})
+        exp_r = sum(ex.pnl_usdt(p) for (_, b), p in pos.items() if b == "R") / \
+            sum(p["spent_usdt"] for (_, b), p in pos.items() if b == "R") * 100
+        _check("недельный: книги R и H, R = Σ P&L / Σ потрачено на тех же окнах",
+               [b["key"] for b in wb] == ["R", "H"] and wr.get("n") == 2
+               and abs(wr.get("book_pct", 0) - exp_r) < 1e-9 and wr.get("alt_pct", 0) > 0,
+               failures)
+
+    # (д) отказы — каждый в своей БД, обеим книгам с причиной
+    def reject_case(label: str, setup, want: str, **exe) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            c = make_cfg(tmp, **exe)
+            m = _FakeMarket(now0)
+            add_pair(m, "AAAUSDT", [], [])
+            setup(c, m)
+            card(c, "AAA", now0)
+            code, lines = ex.run_dry(c, m, now=now0)
+            ps = q(c, "SELECT book, status, reason FROM dry_positions WHERE pair='AAAUSDT'")
+            no = q(c, "SELECT 1 FROM dry_orders WHERE pair='AAAUSDT'")
+        _check(f"отказ: {label} -> rejected обеим книгам, ордеров нет",
+               code == 0 and sorted(p["book"] for p in ps) == ["H", "R"]
+               and all(p["status"] == "rejected" and want in p["reason"] for p in ps) and not no
+               and any("AAA: ОТКАЗ" in x for x in lines), failures)
+
+    def two_open(c, m):
+        con = ex.connect(c["output"]["db_path"])
+        for i, b in enumerate(("R", "H", "R", "H")):
+            con.execute("INSERT INTO dry_positions(book, pair, symbol, card_day, status, "
+                        "created_ts, qty, bought_qty, spent_usdt, last_price) VALUES "
+                        "(?,?,?,?,?,?,?,?,?,?)", (b, f"X{i // 2}USDT", f"X{i // 2}", d0 - D,
+                                                  "open", now0 - D, 10.0, 10.0, 10.0, 1.0))
+        con.commit()
+        con.close()
+
+    def only_h_full(c, m):
+        con = ex.connect(c["output"]["db_path"])
+        con.execute("INSERT INTO dry_positions(book, pair, symbol, card_day, status, created_ts, "
+                    "qty, bought_qty, spent_usdt, last_price) VALUES "
+                    "('H','XUSDT','X',?,'open',?,10,10,10,1)", (d0 - D, now0 - D))
+        con.commit()
+        con.close()
+
+    reject_case("лимит max_coins 2", two_open, "лимит 2 монет", max_coins=2)
+    reject_case("нехватка USDT (capital 40)", lambda c, m: None, "нехватка USDT", capital_usdt=40)
+    reject_case("парность: лимит монет только у H — отказ и R",
+                only_h_full, "H: лимит 1 монет", max_coins=1)
+    reject_case("пара не на Bybit", lambda c, m: m.inst.update({"AAAUSDT": None}),
+                "нет на Bybit spot")
+    reject_case("метка ST", lambda c, m: m.inst["AAAUSDT"].update(st=True), "метка ST")
+    reject_case("статус не Trading", lambda c, m: m.inst["AAAUSDT"].update(status="PreLaunch"),
+                "статус PreLaunch")
+    with tempfile.TemporaryDirectory() as tmp:
+        c = make_cfg(tmp)
+        c._d["stage7_positions"] = {**c._d.get("stage7_positions", {}),
+                                    "max_position_pct_of_capital": 2}
+        m = _FakeMarket(now0)
+        add_pair(m, "AAAUSDT", [], [])
+        card(c, "AAA", now0)
+        ex.run_dry(c, m, now=now0)
+        ps = q(c, "SELECT status, reason FROM dry_positions")
+    _check("отказ risk_check: позиция $50 > лимита 2% от $1500 -> rejected обеим",
+           len(ps) == 2 and all(p["status"] == "rejected" and "> лимита 30" in p["reason"]
+                                for p in ps), failures)
+
+    # Сбой одной позиции не валит остальные, код 1; без карточек — строка «новых лестниц нет».
+    with tempfile.TemporaryDirectory() as tmp:
+        c = make_cfg(tmp)
+        m = _FakeMarket(now0)
+        add_pair(m, "AAAUSDT", [], [])
+        add_pair(m, "BBBUSDT", [(d0, 1.0)], [])
+        card(c, "AAA", now0)
+        card(c, "BBB", now0)
+        ex.run_dry(c, m, now=now0)
+        m.fail.add("AAAUSDT")
+        m.now = now0 + D
+        code_f, lines_f = ex.run_dry(c, m, now=m.now)
+        last_b = q(c, "SELECT last_day FROM dry_positions WHERE symbol='BBB'")
+        m.fail.clear()
+        empty_code, empty_lines = ex.run_dry(c, m, now=m.now)
+        off = ex.run_dry(make_cfg(tmp, enabled=False), m, now=m.now)
+    _check("сбой daily по AAA: код 1, «⚠ R AAA: RuntimeError», BBB обработана",
+           code_f == 1 and any(x.startswith("⚠ R AAA: RuntimeError") for x in lines_f)
+           and all(r["last_day"] == d0 for r in last_b), failures)
+    _check("сегодня карточек нет -> «новых лестниц нет», код 0",
+           empty_code == 0 and any("новых лестниц нет" in x for x in empty_lines), failures)
+    _check("executor.enabled=false -> пропуск", off == (0, ["executor.enabled = false — пропуск"]),
+           failures)
+    _check("settings: книги из конфига R/H со стопом 25%, _-ключи отброшены",
+           list(ex.settings(Config({"executor": {"books": {
+               "_note": "x", **cfg["executor"]["books"]}}}))["books"]) == ["R", "H"]
+           and all(b["stop_pct"] == 25 for b in ex.settings(cfg)["books"].values()), failures)
+
+    # (з) недельный блок и пометка падения в сводке
+    books = [{"emoji": "📏", "label": "правила", "positions": 2, "n": 2, "book_pct": 12.34,
+              "alt_pct": 5.0, "basket_pct": 3.0},
+             {"emoji": "✋", "label": "держать", "positions": 1, "n": 0}]
+    blk = tg.executor_weekly_block(books)
+    _check("недельный блок: «📏 правила: +12.3% · альты +5.0% · корзина +3.0% → +7.3 п.п.»",
+           blk[0].startswith("🤖 <b>Пробный исполнитель</b>")
+           and "📏 правила: +12.3% · альты +5.0% · корзина +3.0% → +7.3 п.п. к альтам (2 поз.)"
+           in blk and "✋ держать: нет рынка на даты позиций (1 поз.)" in blk, failures)
+    _check("недельный блок: позиций нет -> пусто; в format_weekly — только с книгами",
+           tg.executor_weekly_block([]) == []
+           and tg.executor_weekly_block([dict(books[0], positions=0)]) == [], failures)
+    base = {"week_no": 2, "milestone": False, "milestone_weeks": 4, "opened": 0, "open_now": 2,
+            "invalidations": 0, "ladder_hits": 0, "trailings": 0, "paper_pnl_usdt": 0.0,
+            "real_open": 0}
+    _check("format_weekly: блок исполнителя есть только с книгами",
+           "Пробный исполнитель" in format_weekly({**base, "executor": books}, cfg)
+           and "Пробный исполнитель" not in format_weekly(base, cfg), failures)
+    _check("сводка дня: нет таблиц/позиций -> блока нет",
+           tg.executor_brief_lines(None, cfg) == []
+           and tg.executor_brief_lines({"books": {"R": {"open": 0, "closed": 0}}, "opened": [],
+                                        "rejected": []}, cfg) == [], failures)
+    st = {"scan": {"ran": True, "ok": True, "elapsed_min": 20.0, "watchlist": 80},
+          "watch_ok": True, "market": {}, "new": [], "muted": [], "near": [], "positions": [],
+          "signals_today": [], "unavailable": [], "dev_github": None}
+    _check("сводка: исполнитель упал -> «⚠ пробный исполнитель упал» в первой строке",
+           "⚠ пробный исполнитель упал" in tg.format_brief(
+               {**st, "exec_fail": True}, cfg, now=now0).split("\n")[0]
+           and "исполнитель" not in tg.format_brief(st, cfg, now=now0), failures)
+
+    # (и) часовые свечи: незакрытая отброшена, порядок oldest→newest
+    t = (d0 + 5 * H) * 1000
+    raw = {"result": {"list": [[str(t), "1", "1", "0.5", "1", "1", "1"],
+                               [str(t - 3_600_000), "1", "1", "0.6", "1", "1", "1"],
+                               [str(t - 7_200_000), "1", "1", "0.7", "1", "1", "1"]]}}
+    hk = bybit.parse_klines(raw, t + 1_800_000, 3_600_000)
+    _check("parse_klines: свеча 05:00 ещё идёт — отброшена; 03:00, 04:00 по порядку",
+           hk["ts"] == [d0 + 3 * H, d0 + 4 * H] and hk["l"] == [0.7, 0.6], failures)
+    _check("parse_klines: ровно на закрытии свеча уже закрыта",
+           bybit.parse_klines(raw, t + 3_600_000, 3_600_000)["ts"][-1] == d0 + 5 * H, failures)
+
+
 def main() -> int:
     cfg = load_config()
     failures: list[str] = []
@@ -2143,6 +2539,8 @@ def main() -> int:
     test_benchmark(cfg, failures)
     print()
     test_ladder(cfg, failures)
+    print()
+    test_executor(cfg, failures)
     print()
     test_github_levels(cfg, failures)
     print()
