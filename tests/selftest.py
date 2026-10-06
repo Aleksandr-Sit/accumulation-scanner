@@ -2099,6 +2099,15 @@ class _FakeMarket:
         self.days: dict = {}          # пара -> [(ts дня, close)]
         self.hours: dict = {}         # пара -> [(ts часа, low)]
         self.fail: set = set()        # пары, на которых daily бросает исключение
+        self.ranks: dict = {}         # места по обороту (liquidity.ensure_ranks)
+        self.ranks_fail = False       # vol_ranks бросает исключение
+        self.ranks_calls = 0
+
+    def vol_ranks(self, now):
+        self.ranks_calls += 1
+        if self.ranks_fail:
+            raise RuntimeError("Bybit не ответил")
+        return self.ranks
 
     def instrument(self, pair):
         return self.inst.get(pair)
@@ -2139,6 +2148,11 @@ def test_executor(cfg, failures: list[str]) -> None:
             "min_qty": 0.1, "min_amt": 5.0}
     # история: 40 дней по 1.0, за 10 дней до карточки — 0.95 → лоу базы 0.95, пол −25% 0.7125
     hist = [(d0 - k * D, 0.95 if k == 10 else 1.0) for k in range(40, 0, -1)]
+    # холодный рынок: 0 флагов из 8, день данных свежий для всех шагов теста
+    cold = {"day": d0 + 4 * D, "hot": {"lit": [], "near": [], "avail": 8, "n_lit": 0}}
+
+    def run(c: Config, m, **kw):
+        return ex.run_dry(c, m, mctx=cold, **kw)
 
     def make_cfg(tmp: str, **exe) -> Config:
         d = copy.deepcopy(cfg._d)
@@ -2183,11 +2197,11 @@ def test_executor(cfg, failures: list[str]) -> None:
                  [(d0 + 7 * H, 0.92), (d0 + D + 5 * H, 0.69)])
         card(c, "AAA", now0 - 60)         # раньше BBB: позиции AAA получат id 1 (R) и 2 (H)
         card(c, "BBB", now0)
-        code0, lines0 = ex.run_dry(c, m, now=now0, wallet_usdt=30.0)
+        code0, lines0 = run(c, m, now=now0, wallet_usdt=30.0)
         pos0 = q(c, "SELECT * FROM dry_positions ORDER BY id")
         ord0 = q(c, "SELECT * FROM dry_orders ORDER BY link_id")
         bs0 = deliver_brief(c, now=now0, exec_exit=0)
-        code1, lines1 = ex.run_dry(c, m, now=now0)
+        code1, lines1 = run(c, m, now=now0)
         n_pos1 = len(q(c, "SELECT id FROM dry_positions"))
         n_ord1 = len(q(c, "SELECT link_id FROM dry_orders"))
         aaa_r = next(p for p in pos0 if p["symbol"] == "AAA" and p["book"] == "R")
@@ -2248,10 +2262,10 @@ def test_executor(cfg, failures: list[str]) -> None:
 
         # (в) исполнение лимиток по часовым свечам
         m.now = d0 + 8 * H
-        ex.run_dry(c, m, now=m.now)
+        run(c, m, now=m.now)
         st2a = q(c, "SELECT status FROM dry_orders WHERE link_id='dry-R1-B2'")[0]["status"]
         m.now = d0 + 9 * H
-        _, lines_b = ex.run_dry(c, m, now=m.now)
+        _, lines_b = run(c, m, now=m.now)
         o2 = q(c, "SELECT * FROM dry_orders WHERE link_id='dry-R1-B2'")[0]
         o3 = q(c, "SELECT status FROM dry_orders WHERE link_id='dry-R1-B3'")[0]["status"]
         _check("лимитка 0.93: свеча до постановки (low 0.90) и касание (low 0.93) — не исполнена",
@@ -2263,12 +2277,12 @@ def test_executor(cfg, failures: list[str]) -> None:
 
         # (г) выходы: дни d0, d0+1 закрыты → R фиксирует 1/3 на +50%; BBB одно закрытие ниже пола
         m.now = d0 + 2 * D + H
-        ex.run_dry(c, m, now=m.now)
+        run(c, m, now=m.now)
         r_mid = q(c, "SELECT * FROM dry_positions WHERE id=1")[0]
         sells_mid = q(c, "SELECT * FROM dry_orders WHERE side='Sell' ORDER BY link_id")
         bbb_mid = q(c, "SELECT status, qty FROM dry_positions WHERE symbol='BBB'")
         m.now = d0 + 4 * D + H
-        _, lines_d = ex.run_dry(c, m, now=m.now)
+        _, lines_d = run(c, m, now=m.now)
         pos = {(p["symbol"], p["book"]): p for p in q(c, "SELECT * FROM dry_positions")}
         sells = q(c, "SELECT * FROM dry_orders WHERE side='Sell' ORDER BY created_ts, link_id")
         _check("R: на +50% (закрытие 1.5) продана 1/3 купленного, ордер dry-R1-S-L0",
@@ -2366,7 +2380,7 @@ def test_executor(cfg, failures: list[str]) -> None:
             add_pair(m, "AAAUSDT", [], [])
             setup(c, m)
             card(c, "AAA", now0)
-            code, lines = ex.run_dry(c, m, now=now0)
+            code, lines = run(c, m, now=now0)
             ps = q(c, "SELECT book, status, reason FROM dry_positions WHERE pair='AAAUSDT'")
             no = q(c, "SELECT 1 FROM dry_orders WHERE pair='AAAUSDT'")
         _check(f"отказ: {label} -> rejected обеим книгам, ордеров нет",
@@ -2408,7 +2422,7 @@ def test_executor(cfg, failures: list[str]) -> None:
         m = _FakeMarket(now0)
         add_pair(m, "AAAUSDT", [], [])
         card(c, "AAA", now0)
-        ex.run_dry(c, m, now=now0)
+        run(c, m, now=now0)
         ps = q(c, "SELECT status, reason FROM dry_positions")
     _check("отказ risk_check: позиция $50 > лимита 2% от $1500 -> rejected обеим",
            len(ps) == 2 and all(p["status"] == "rejected" and "> лимита 30" in p["reason"]
@@ -2422,14 +2436,14 @@ def test_executor(cfg, failures: list[str]) -> None:
         add_pair(m, "BBBUSDT", [(d0, 1.0)], [])
         card(c, "AAA", now0)
         card(c, "BBB", now0)
-        ex.run_dry(c, m, now=now0)
+        run(c, m, now=now0)
         m.fail.add("AAAUSDT")
         m.now = now0 + D
-        code_f, lines_f = ex.run_dry(c, m, now=m.now)
+        code_f, lines_f = run(c, m, now=m.now)
         last_b = q(c, "SELECT last_day FROM dry_positions WHERE symbol='BBB'")
         m.fail.clear()
-        empty_code, empty_lines = ex.run_dry(c, m, now=m.now)
-        off = ex.run_dry(make_cfg(tmp, enabled=False), m, now=m.now)
+        empty_code, empty_lines = run(c, m, now=m.now)
+        off = run(make_cfg(tmp, enabled=False), m, now=m.now)
     _check("сбой daily по AAA: код 1, «⚠ R AAA: RuntimeError», BBB обработана",
            code_f == 1 and any(x.startswith("⚠ R AAA: RuntimeError") for x in lines_f)
            and all(r["last_day"] == d0 for r in last_b), failures)
@@ -2482,6 +2496,587 @@ def test_executor(cfg, failures: list[str]) -> None:
            hk["ts"] == [d0 + 3 * H, d0 + 4 * H] and hk["l"] == [0.7, 0.6], failures)
     _check("parse_klines: ровно на закрытии свеча уже закрыта",
            bybit.parse_klines(raw, t + 3_600_000, 3_600_000)["ts"][-1] == d0 + 5 * H, failures)
+
+
+def test_liquidity(cfg, failures: list[str]) -> None:
+    print("Место по обороту (scanner/liquidity.py): вселенная, средний оборот, места, кэш в БД:")
+    import sqlite3
+    import tempfile
+    from pathlib import Path as _P
+    from scanner import liquidity as L
+    d0 = 1790812800                        # 2026-10-01 00:00 UTC
+    now = d0 + 6 * 3600
+    inst = {"result": {"list": [
+        {"symbol": "AAAUSDT", "baseCoin": "AAA", "quoteCoin": "USDT", "status": "Trading",
+         "symbolType": ""},
+        {"symbol": "AAAUSDC", "baseCoin": "AAA", "quoteCoin": "USDC", "status": "Trading"},
+        {"symbol": "USDCUSDT", "baseCoin": "USDC", "quoteCoin": "USDT", "status": "Trading"},
+        {"symbol": "BTC3LUSDT", "baseCoin": "BTC3L", "quoteCoin": "USDT", "status": "Trading"},
+        {"symbol": "AAPLXUSDT", "baseCoin": "AAPLX", "quoteCoin": "USDT", "status": "Trading",
+         "symbolType": "xstocks"},
+        {"symbol": "NYMUSDT", "baseCoin": "NYM", "quoteCoin": "USDT", "status": "Trading",
+         "symbolType": "adventure"},
+        {"symbol": "OLDUSDT", "baseCoin": "OLD", "quoteCoin": "USDT", "status": "Closed"}]}}
+    _check("вселенная: USDT + Trading, без стейблов, плечевых и xstocks; adventure — в счёт",
+           L.universe(inst) == [("AAAUSDT", "AAA"), ("NYMUSDT", "NYM")], failures)
+
+    def kl(n_closed: int, val, live: bool = True) -> dict:
+        rows = [[str(d0 * 1000), "1", "1", "1", "1", "1", "999999"]] if live else []
+        rows += [[str((d0 - k * 86400) * 1000), "1", "1", "1", "1", "1", str(val(k))]
+                 for k in range(1, n_closed + 1)]           # newest-first, как отдаёт Bybit
+        return {"retCode": 0, "result": {"list": rows}}
+    _check("средний оборот: живая свеча отброшена, 30 последних закрытых, поле [6]",
+           L.avg_turnover(kl(35, lambda k: 100.0 if k <= 30 else 1e9), now) == 100.0, failures)
+    _check("средний оборот: 20 закрытых — среднее по ним; 19 — нет данных (свежий листинг)",
+           L.avg_turnover(kl(20, lambda k: k), now) == 10.5
+           and L.avg_turnover(kl(19, lambda k: 1.0), now) is None, failures)
+    t = L.rank_table({"A": 300.0, "B": 100.0, "C": 200.0, "D": 100.0})
+    _check("места: 1 — самый большой оборот, равные — по тикеру; доля = место / число пар",
+           [t[s]["rank"] for s in "ACBD"] == [1, 2, 3, 4] and t["A"]["share"] == 0.25
+           and t["D"]["share"] == 1.0 and t["B"]["n"] == 4, failures)
+
+    class FakeHttp:
+        def __init__(self, inst_, klines, fail=()):
+            self.inst, self.klines, self.fail, self.calls = inst_, klines, set(fail), 0
+
+        def get_json(self, url, params=None, use_cache=True, **kw):
+            self.calls += 1
+            if "instruments-info" in url:
+                return self.inst
+            return None if params["symbol"] in self.fail else self.klines.get(params["symbol"])
+
+    class Boom:
+        def get_json(self, *a, **k):
+            raise OSError("сеть упала")
+
+    def count(db: str) -> int:
+        con = sqlite3.connect(db)
+        try:
+            return con.execute("SELECT COUNT(*) FROM vol_ranks").fetchone()[0]
+        finally:
+            con.close()
+    many = {"result": {"list": [{"symbol": f"C{i:03d}USDT", "baseCoin": f"C{i:03d}",
+                                 "quoteCoin": "USDT", "status": "Trading"} for i in range(1, 121)]}}
+    kls = {f"C{i:03d}USDT": kl(30, lambda k, i=i: float(i)) for i in range(1, 121)}
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(_P(tmp) / "t.db")
+        h = FakeHttp(many, kls)
+        r1 = L.ensure_ranks(db, h, now)
+        calls1 = h.calls
+        r2 = L.ensure_ranks(db, h, now + 3600)
+        r3 = L.load_ranks(db, now + 86400)
+        n1 = count(db)
+        dbf = str(_P(tmp) / "f.db")
+        rf = L.ensure_ranks(dbf, FakeHttp(many, kls, {f"C{i:03d}USDT" for i in range(1, 14)}), now)
+        nf = count(dbf)
+        rb = L.ensure_ranks(str(_P(tmp) / "b.db"), Boom(), now)
+    _check("подсчёт: 120 пар, C120 — 1-е место, C001 — 120-е; 121 запрос; в БД 120 строк",
+           r1["ok"] and r1["n"] == 120 and L.lookup(r1, "c120")["rank"] == 1
+           and L.lookup(r1, "C001")["rank"] == 120 and calls1 == 121 and n1 == 120, failures)
+    _check("тот же UTC-день — из БД без сети, те же места и доли",
+           r2["ok"] and h.calls == calls1 and r2["by_sym"]["C001"]["rank"] == 120
+           and abs(r2["by_sym"]["C060"]["share"] - r1["by_sym"]["C060"]["share"]) < 1e-12,
+           failures)
+    _check("следующий UTC-день — данных ещё нет (пересчитает первый, кому нужно)",
+           not r3["ok"] and r3["by_sym"] == {} and r3["note"] == "нет данных оборота", failures)
+    _check("не ответили 13 из 120 пар (> 10%) — сбой: ok False, в БД пусто",
+           not rf["ok"] and "не ответили 13" in rf["note"] and nf == 0, failures)
+    _check("сеть бросила исключение — не падает: ok False, причина в note",
+           not rb["ok"] and "OSError" in rb["note"], failures)
+    _check("lookup: нет монеты или нет данных — None",
+           L.lookup(r1, "ZZZ") is None and L.lookup({}, "C001") is None
+           and L.lookup(None, "C001") is None, failures)
+
+
+def test_executor_filters(cfg, failures: list[str]) -> None:
+    print("Отсев перед покупкой: нижняя четверть, квота, перегрев, теневая книга, метки:")
+    import copy
+    import json as _json
+    import sqlite3
+    import tempfile
+    from pathlib import Path as _P
+    from scanner import executor as ex
+    from scanner.config import Config
+    from scanner.db import Store
+    from scanner.ladder import plan_ladder
+    from scanner.notify import telegram as tg
+    from scanner.notify.deliver import brief_state as deliver_brief
+    D, H = ex.DAY, ex.HOUR
+    d0 = 1790812800                        # 2026-10-01 00:00 UTC
+    now0 = d0 + 6 * H + 1800
+    inst = {"symbol": "", "status": "Trading", "st": False, "tick": 0.01, "qty_step": 0.1,
+            "min_qty": 0.1, "min_amt": 5.0}
+    hist = [(d0 - k * D, 0.95 if k == 10 else 1.0) for k in range(40, 0, -1)]
+    cold = {"day": d0 + 4 * D, "hot": {"lit": [], "near": ["fng30"], "avail": 8}}
+    hot = {"day": d0, "hot": {"lit": ["mvrv_eth"], "near": [], "avail": 8}}
+    s0 = ex.settings(cfg)
+
+    def mk(tmp: str, wl: list | None = None, **exe) -> Config:
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {**d.get("output", {}), "db_path": str(_P(tmp) / "t.db"),
+                       "watchlist_json": str(_P(tmp) / "wl.json")}
+        d["executor"] = {**d.get("executor", {}), **exe}
+        (_P(tmp) / "wl.json").write_text(_json.dumps(wl or []), encoding="utf-8")
+        Store(d["output"]["db_path"]).close()
+        return Config(d)
+
+    def rk(places: dict, n: int) -> dict:
+        return {"ok": True, "day": ex.utc_day(now0), "n": n, "note": "",
+                "by_sym": {s: {"rank": r, "n": n, "share": r / n, "usd": 1e6 / r}
+                           for s, r in places.items()}}
+
+    def pair(m, sym: str, after=(), hours=()) -> None:
+        p = f"{sym}USDT"
+        m.inst[p] = {**inst, "symbol": p}
+        m.price[p] = 1.0
+        m.days[p] = hist + list(after)
+        m.hours[p] = list(hours)
+
+    def card(c: Config, sym: str, ts: float) -> None:
+        con = sqlite3.connect(c["output"]["db_path"])
+        con.execute("INSERT INTO alert_log(symbol, ts, score) VALUES (?,?,72)", (sym, ts))
+        con.commit()
+        con.close()
+
+    def q(c: Config, sql: str, args=()) -> list[dict]:
+        con = sqlite3.connect(c["output"]["db_path"])
+        con.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in con.execute(sql, args).fetchall()]
+        finally:
+            con.close()
+
+    def seed(c: Config, sym: str, share, shadow: int = 0, why: str = "") -> None:
+        """Открытая позиция в обе книги с меткой доли оборота на входе (без ордеров)."""
+        con = ex.connect(c["output"]["db_path"])
+        for b in ("R", "H"):
+            con.execute("INSERT INTO dry_positions(book, pair, symbol, card_day, status, "
+                        "created_ts, qty, bought_qty, spent_usdt, last_price, shadow, shadow_why, "
+                        "vol_share) VALUES (?,?,?,?,'open',?,10,10,10,1,?,?,?)",
+                        (b, f"{sym}USDT", sym, d0 - D, now0 - D, shadow, why, share))
+        con.commit()
+        con.close()
+
+    def money(c: Config, book: str) -> dict:
+        con = ex.connect(c["output"]["db_path"])
+        try:
+            return {"free": ex.free_usdt(con, book, 1500.0), "res": ex.reserved_usdt(con, book),
+                    "main": ex.book_summary(con, book),
+                    "shadow": ex.book_summary(con, book, shadow=True)}
+        finally:
+            con.close()
+
+    # --- чистые функции: перегрев и места
+    g = {k: ex.market_gate(cfg, s0, v, now0) for k, v in {
+        "cold": cold, "hot": hot, "none": {}, "stale": {**cold, "day": d0 - 4 * D},
+        "edge": {**cold, "day": d0 - 3 * D},
+        "few": {"day": d0, "hot": {"lit": [], "near": [], "avail": 3}}}.items()}
+    _check("перегрев: 0 флагов («близко» не в счёт) — cold; 1 флаг — hot, «горят: MVRV ETH»",
+           g["cold"]["status"] == "cold" and g["hot"]["status"] == "hot"
+           and g["hot"]["note"] == "перегрев 1/8, горят: MVRV ETH", failures)
+    _check("перегрев: данных нет, день данных старше 3 дн., флагов с данными < 4 — nodata",
+           g["none"]["status"] == g["stale"]["status"] == g["few"]["status"] == "nodata"
+           and "старше 3 дн." in g["stale"]["note"] and g["none"]["note"] == "данных рынка нет",
+           failures)
+    _check("перегрев: данным 3 дня — ещё верим (cold)", g["edge"]["status"] == "cold", failures)
+    r8 = rk({"Q6": 6, "Q7": 7, "M3": 3, "M4": 4, "TOP": 1}, 8)
+
+    def eg(sym: str, heat=None, s=None) -> dict:
+        return ex.entry_gates(s or s0, sym, r8, heat or g["cold"])
+    _check("нижняя четверть: доля > 0.75 строго (7/8 — да, 6/8 — нет)",
+           eg("Q7")["why"] == ["bottom"] and eg("Q6")["why"] == [], failures)
+    _check("вне топ-39%: 4/8 — да, 3/8 — нет (квота проверяется позже)",
+           eg("M4")["illiquid"] and not eg("M3")["illiquid"] and eg("M4")["why"] == [], failures)
+    _check("нет данных оборота — не отсекается, метки оборота пустые",
+           eg("NONE")["why"] == [] and not eg("NONE")["illiquid"]
+           and eg("NONE")["labels"]["vol_rank"] is None, failures)
+    _check("перегрев → hot, нет данных → nodata; hot_block false — не отсекает",
+           eg("TOP", g["hot"])["why"] == ["hot"] and eg("TOP", g["none"])["why"] == ["nodata"]
+           and eg("TOP", g["hot"], {**s0, "hot_block": False})["why"] == [], failures)
+    _check("метки: место, пары, доля, оборот, флаги, день данных; без данных рынка hot_n None",
+           eg("Q7", g["hot"])["labels"] == {"vol_rank": 7, "vol_pairs": 8, "vol_share": 7 / 8,
+                                             "vol_usd": 1e6 / 7, "hot_n": 1,
+                                             "hot_flags": "mvrv_eth", "hot_day": d0}
+           and eg("TOP", g["none"])["labels"]["hot_n"] is None, failures)
+
+    # --- (1) нижняя четверть -> тень; основная книга не тронута
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        m = _FakeMarket(now0)
+        pair(m, "LOW")
+        m.ranks = rk({"LOW": 7, "TOP": 1}, 8)
+        card(c, "LOW", now0)
+        code1, lines1 = ex.run_dry(c, m, now=now0, mctx=cold)
+        ps1 = q(c, "SELECT * FROM dry_positions ORDER BY id")
+        os1 = q(c, "SELECT * FROM dry_orders ORDER BY link_id")
+        mo1 = money(c, "R")
+        bs1 = deliver_brief(c, now=now0, exec_exit=0)
+    _check("нижняя четверть (7/8): обе книги — в тень, shadow_why bottom, позиции открыты",
+           code1 == 0 and sorted(p["book"] for p in ps1) == ["H", "R"]
+           and all(p["shadow"] == 1 and p["status"] == "open" and p["shadow_why"] == "bottom"
+                   for p in ps1), failures)
+    _check("тень: та же лестница (5 ступеней), ордера shd-…, ступень 1 исполнена рынком",
+           len(os1) == 10 and all(o["link_id"].startswith("shd-") for o in os1)
+           and sorted(o["link_id"] for o in os1 if o["status"] == "filled")
+           == [f"shd-H{ps1[1]['id']}-B1", f"shd-R{ps1[0]['id']}-B1"], failures)
+    _check("метки входа в тени: место 7 из 8, доля 0.875, оборот, 0 флагов, день данных",
+           all(p["vol_rank"] == 7 and p["vol_pairs"] == 8 and abs(p["vol_share"] - 0.875) < 1e-12
+               and p["vol_usd"] > 0 and p["hot_n"] == 0 and p["hot_flags"] == ""
+               and p["hot_day"] == cold["day"] for p in ps1), failures)
+    _check("тень мест и денег не занимает: основная — 0 позиций, свободно 1500, резерв 0",
+           mo1["main"]["open"] == 0 and abs(mo1["free"] - 1500.0) < 1e-9 and mo1["res"] == 0
+           and mo1["shadow"]["open"] == 1 and mo1["shadow"]["spent"] > 0, failures)
+    _check("P&L в день входа (закрытий ещё нет) — по средней цене: −$0.015 комиссии, не −$10",
+           abs(mo1["shadow"]["pnl"] + 10.0 * ex.MARKET_FEE) < 1e-9, failures)
+    _check("лог: «LOW: НЕ покупаю — нижняя четверть по обороту (7-е место из 8) → в тень R/H»",
+           any(x.startswith("LOW: НЕ покупаю — нижняя четверть по обороту (7-е место из 8) → "
+                            "в тень R/H: 5 ступ.") for x in lines1)
+           and any(x.startswith("оборот: 8 пар Bybit, нижняя четверть — место > 6")
+                   for x in lines1)
+           and any(x.startswith("тень (мест и денег не занимает): R открыто 1") for x in lines1)
+           and m.ranks_calls == 1, failures)
+    exl1 = tg.executor_brief_lines(bs1["executor"], c)
+    _check("сводка дня: «не купил бы, ушло в тень: LOW — нижняя четверть…», строка тени",
+           any(x == "не купил бы, ушло в тень: LOW — нижняя четверть по обороту (7-е место из 8)"
+               for x in exl1)
+           and any(x.startswith("👥 тень: 📏 1 поз.") for x in exl1)
+           and not any(x.startswith("поставил бы") for x in exl1), failures)
+
+    # --- нет данных оборота: не отсекать, метки пустые, в логе причина
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        m = _FakeMarket(now0)
+        pair(m, "LOW")
+        m.ranks_fail = True
+        card(c, "LOW", now0)
+        code2, lines2 = ex.run_dry(c, m, now=now0, mctx=cold)
+        ps2 = q(c, "SELECT * FROM dry_positions")
+    _check("нет данных оборота (сбой Bybit): покупка в основную, метки оборота пустые, код 0",
+           code2 == 0 and len(ps2) == 2 and all(p["shadow"] == 0 and p["status"] == "open"
+                                                and p["vol_rank"] is None and p["hot_n"] == 0
+                                                for p in ps2), failures)
+    _check("лог: «нет данных оборота: RuntimeError … — фильтры по обороту не отсекают», метки",
+           any(x.startswith("нет данных оборота: RuntimeError: Bybit не ответил — фильтры по "
+                            "обороту не отсекают") for x in lines2)
+           and any(x == "  метки: нет данных оборота, рынок перегрев 0/8" for x in lines2),
+           failures)
+
+    # --- (2) квота: переполнение, порядок по месту, метка на день входа
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        m = _FakeMarket(now0)
+        for sym in ("ILA", "ILB", "LIQ"):
+            pair(m, sym)
+        for i in range(4):
+            seed(c, f"OLD{i}", 0.5)                  # 4 места вне топа по метке входа
+        seed(c, "WAS", 0.10)                         # на входе — в топе, сегодня — вне его
+        m.ranks = rk({"ILA": 45, "ILB": 42, "LIQ": 10, "WAS": 60, "OLD0": 50}, 100)
+        card(c, "ILA", now0 - 120)                   # раньше всех по времени, но место хуже
+        card(c, "ILB", now0 - 60)
+        card(c, "LIQ", now0)
+        code3, lines3 = ex.run_dry(c, m, now=now0, mctx=cold)
+        ps3 = {(p["symbol"], p["book"]): p for p in q(c, "SELECT * FROM dry_positions")}
+    _check("квота: 4 из 5 мест вне топа — ILB (42-е) взяла 5-е место, ILA (45-е) — в тень quota",
+           code3 == 0 and all(ps3[("ILB", b)]["shadow"] == 0 and ps3[("ILB", b)]["status"] == "open"
+                              for b in "RH")
+           and all(ps3[("ILA", b)]["shadow"] == 1 and ps3[("ILA", b)]["shadow_why"] == "quota"
+                   for b in "RH"), failures)
+    _check("квота: ликвидная LIQ (10-е) — в основную, квоту не занимает",
+           all(ps3[("LIQ", b)]["shadow"] == 0 and ps3[("LIQ", b)]["status"] == "open"
+               for b in "RH"), failures)
+    _check("порядок дня — по месту: LIQ, ILB, ILA (ILA пришла первой, но место хуже)",
+           ps3[("LIQ", "R")]["id"] < ps3[("ILB", "R")]["id"] < ps3[("ILA", "R")]["id"], failures)
+    _check("квота считает метку входа: WAS (0.10 на входе, сегодня 60-е) — не в квоте",
+           ps3[("ILB", "R")]["shadow"] == 0, failures)
+    _check("лог: «ILA: НЕ покупаю — квота неликвида (45-е место из 100): вне топ-39% уже 5 из 5»",
+           any(x.startswith("ILA: НЕ покупаю — квота неликвида (45-е место из 100): вне топ-39% "
+                            "уже 5 из 5 мест → в тень R/H") for x in lines3), failures)
+
+    # --- (4) перегрев: новые — в тень; открытые позиции, лимитки и выходы работают
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        m = _FakeMarket(now0)
+        pair(m, "AAA", hours=[(d0 + 8 * H, 0.929)])
+        pair(m, "BBB")
+        m.ranks = rk({"AAA": 1, "BBB": 2}, 100)
+        card(c, "AAA", now0)
+        ex.run_dry(c, m, now=now0, mctx=cold)
+        m.now = d0 + D + 7 * H
+        card(c, "BBB", m.now)
+        code4, lines4 = ex.run_dry(c, m, now=m.now, mctx=hot)
+        ps4 = {(p["symbol"], p["book"]): p for p in q(c, "SELECT * FROM dry_positions")}
+        aaa_b2 = q(c, "SELECT status FROM dry_orders WHERE link_id='dry-R1-B2'")[0]["status"]
+        aaa_new = q(c, "SELECT COUNT(*) n FROM dry_orders WHERE pair='AAAUSDT' AND status='new'")
+    _check("перегрев: BBB — в тень hot, метки 1 флаг mvrv_eth",
+           code4 == 0 and all(ps4[("BBB", b)]["shadow"] == 1 and ps4[("BBB", b)]["shadow_why"] == "hot"
+                              and ps4[("BBB", b)]["hot_n"] == 1
+                              and ps4[("BBB", b)]["hot_flags"] == "mvrv_eth" for b in "RH"),
+           failures)
+    _check("перегрев: открытая AAA не тронута — лимитка 0.93 исполнилась, 3 лимитки ждут",
+           aaa_b2 == "filled" and aaa_new[0]["n"] == 6 and ps4[("AAA", "R")]["status"] == "open"
+           and ps4[("AAA", "R")]["shadow"] == 0, failures)
+    _check("лог: «рынок: перегрев 1/8, горят: MVRV ETH — новых лестниц нет…», BBB «перегрев рынка»",
+           "рынок: перегрев 1/8, горят: MVRV ETH — новых лестниц нет, карточки уходят в тень"
+           in lines4
+           and any(x.startswith("BBB: НЕ покупаю — перегрев рынка (MVRV ETH) → в тень")
+                   for x in lines4), failures)
+
+    def one(label: str, ctx, want_shadow: int, want_why: str, **exe) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            c = mk(tmp, **exe)
+            m = _FakeMarket(now0)
+            pair(m, "AAA")
+            card(c, "AAA", now0)
+            kw = {} if ctx is None else {"mctx": ctx}
+            code, lines = ex.run_dry(c, m, now=now0, **kw)
+            ps = q(c, "SELECT shadow, shadow_why, status FROM dry_positions")
+        _check(label, code == 0 and len(ps) == 2
+               and all(p["status"] == "open" and p["shadow"] == want_shadow
+                       and p["shadow_why"] == want_why for p in ps), failures)
+    one("нет данных рынка ({}) — в тень nodata", {}, 1, "nodata")
+    one("данные рынка старше 3 дн. — в тень nodata", {**cold, "day": d0 - 4 * D}, 1, "nodata")
+    one("mctx не передан, market_daily пуст — в тень nodata", None, 1, "nodata")
+    one("данным рынка 3 дня, флагов 0 — покупка в основную", {**cold, "day": d0 - 3 * D}, 0, "")
+    one("hot_block false: перегрев не отсекает — покупка в основную", hot, 0, "",
+        hot_block=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp, shadow=False)
+        m = _FakeMarket(now0)
+        pair(m, "AAA")
+        card(c, "AAA", now0)
+        ex.run_dry(c, m, now=now0, mctx=hot)
+        ps_off = q(c, "SELECT shadow, status, reason FROM dry_positions")
+    _check("теневая книга выключена: отсеянное — отказ с причиной фильтра, тени нет",
+           len(ps_off) == 2 and all(p["shadow"] == 0 and p["status"] == "rejected"
+                                    and p["reason"] == "перегрев рынка (MVRV ETH)"
+                                    for p in ps_off), failures)
+
+    # --- обычные отказы в тень не идут, даже при перегреве
+    def plain(label: str, setup, want: str, ctx=hot, wl=None, **exe) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            c = mk(tmp, wl=wl, **exe)
+            m = _FakeMarket(now0)
+            pair(m, "AAA")
+            setup(c, m)
+            card(c, "AAA", now0)
+            ex.run_dry(c, m, now=now0, mctx=ctx)
+            ps = q(c, "SELECT shadow, status, reason FROM dry_positions WHERE symbol='AAA'")
+            no = q(c, "SELECT 1 FROM dry_orders WHERE pair='AAAUSDT'")
+        _check(label, len(ps) == 2 and not no
+               and all(p["shadow"] == 0 and p["status"] == "rejected" and want in p["reason"]
+                       for p in ps), failures)
+    plain("перегрев + нет на Bybit — обычный отказ, не в тень",
+          lambda c, m: m.inst.update({"AAAUSDT": None}), "нет на Bybit spot")
+    plain("перегрев + метка ST — обычный отказ, не в тень",
+          lambda c, m: m.inst["AAAUSDT"].update(st=True), "метка ST")
+    plain("тикер на Bybit — другая монета (флаг сканера): отказ, не в тень",
+          lambda c, m: None, "на Bybit под тикером AAA другая монета",
+          wl=[{"symbol": "AAA", "coin_id": "aaa", "flags": ["bybit_ticker_mismatch"]}])
+    plain("холодный рынок + лимит монет — обычный отказ, не в тень",
+          lambda c, m: seed(c, "X", 0.1), "лимит 1 монет", ctx=cold, max_coins=1)
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp, max_coins=1)
+        m = _FakeMarket(now0)
+        pair(m, "AAA")
+        seed(c, "X", 0.1)
+        card(c, "AAA", now0)
+        ex.run_dry(c, m, now=now0, mctx=hot)
+        ps_full = q(c, "SELECT shadow, status FROM dry_positions WHERE symbol='AAA'")
+    _check("перегрев + полная книга — в тень (перегрев — свойство рынка, проверяется до лимитов)",
+           len(ps_full) == 2 and all(p["shadow"] == 1 and p["status"] == "open"
+                                     for p in ps_full), failures)
+
+    # --- тень: лимит, не занимает мест/денег, повтор, независимость от основной
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp, shadow_max_coins=1, max_coins=1)
+        m = _FakeMarket(now0)
+        for sym in ("LOW", "LOW2", "LIQ"):
+            pair(m, sym)
+        m.ranks = rk({"LOW": 7, "LOW2": 8, "LIQ": 1}, 8)
+        card(c, "LOW", now0)
+        card(c, "LOW2", now0)
+        _, lines_a = ex.run_dry(c, m, now=now0, mctx=cold)
+        bs_a = deliver_brief(c, now=now0, exec_exit=0)
+        m.now = now0 + D                              # день 2: ликвидная при max_coins 1
+        card(c, "LIQ", m.now)
+        ex.run_dry(c, m, now=m.now, mctx=cold)
+        mo_b = money(c, "R")
+        liq_res = sum(o["usd"] for o in q(
+            c, "SELECT o.usd FROM dry_orders o JOIN dry_positions p ON p.id=o.position_id "
+               "WHERE p.symbol='LIQ' AND o.book='R' AND o.status='new'"))
+        liq_spent = q(c, "SELECT spent_usdt FROM dry_positions WHERE symbol='LIQ' AND "
+                         "book='R'")[0]["spent_usdt"]
+        m.now = now0 + 2 * D                          # день 3: LOW снова в нижней четверти
+        card(c, "LOW", m.now)
+        _, lines_c = ex.run_dry(c, m, now=m.now, mctx=cold)
+        n_low = len(q(c, "SELECT id FROM dry_positions WHERE symbol='LOW'"))
+        m.now = now0 + 3 * D                          # день 4: LOW поднялась в топ
+        c._d["executor"]["max_coins"] = 2
+        m.ranks = rk({"LOW": 1, "LOW2": 8, "LIQ": 2}, 8)
+        card(c, "LOW", m.now)
+        ex.run_dry(c, m, now=m.now, mctx=cold)
+        low = q(c, "SELECT shadow, status FROM dry_positions WHERE symbol='LOW' ORDER BY id")
+    _check("тень заполнена (1 монета): LOW2 — отказ «теневая книга заполнена», shadow=1",
+           any(x.startswith("LOW2: ОТКАЗ — нижняя четверть по обороту (8-е место из 8); "
+                            "теневая книга заполнена (1 монет)") for x in lines_a), failures)
+    _check("сводка дня: отказ LOW2 с причиной, LOW — в тени",
+           ("LOW2", "нижняя четверть по обороту (8-е место из 8); теневая книга заполнена "
+                    "(1 монет)") in bs_a["executor"]["rejected"]
+           and bs_a["executor"]["shadowed"] == [("LOW", "нижняя четверть по обороту "
+                                                        "(7-е место из 8)")], failures)
+    _check("тень не занимает мест: при max_coins 1 и монете в тени LIQ куплена в основную",
+           mo_b["main"]["open"] == 1 and mo_b["shadow"]["open"] == 1, failures)
+    _check("деньги основной — без тени: резерв = лимитки LIQ, свободно = 1500 − LIQ − резерв",
+           abs(mo_b["res"] - liq_res) < 1e-9
+           and abs(mo_b["free"] - (1500.0 - liq_spent - liq_res)) < 1e-9, failures)
+    _check("повторная карточка LOW (всё ещё внизу) — «в тени уже с …», новых позиций нет",
+           any(x.startswith("LOW: НЕ покупаю — нижняя четверть") and "в тени уже с" in x
+               for x in lines_c) and n_low == 2, failures)
+    _check("LOW поднялась в топ — покупка в основную, теневая позиция живёт отдельно",
+           [(p["shadow"], p["status"]) for p in low] == [(1, "open"), (1, "open"), (0, "open"),
+                                                         (0, "open")], failures)
+
+    # --- тень по тем же правилам: R фиксирует 1/3 на +50%, H держит; продажи — не в сводке
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        m = _FakeMarket(now0)
+        pair(m, "LOW", after=[(d0, 1.0), (d0 + D, 1.6)])
+        m.ranks = rk({"LOW": 7}, 8)
+        card(c, "LOW", now0)
+        ex.run_dry(c, m, now=now0, mctx=cold)
+        m.now = d0 + 2 * D + H
+        _, lines_e = ex.run_dry(c, m, now=m.now, mctx=cold)
+        sells = q(c, "SELECT link_id, book, signal FROM dry_orders WHERE side='Sell'")
+        pe = {p["book"]: p for p in q(c, "SELECT * FROM dry_positions")}
+        bs_e = deliver_brief(c, now=m.now, exec_exit=0)
+        st_ = Store(c["output"]["db_path"])
+        st_.upsert_market({d0 + k * D: {"total_mcap": 1000 + 100 * k, "btc_dominance": 50,
+                                        "stables_usd": 100} for k in range(0, 4)})
+        st_.close()
+        ws = ex.weekly_shadow(c)
+        wm = ex.weekly_books(c)
+    _check("тень R: 1/3 на +50% — ордер shd-R…-S-L0; тень H держит; позиции парные",
+           sells == [{"link_id": f"shd-R{pe['R']['id']}-S-L0", "book": "R", "signal": "ladder_0"}]
+           and pe["R"]["shadow"] == pe["H"]["shadow"] == 1 and pe["H"]["status"] == "open"
+           and any(x.startswith("тень R LOW: продал бы") for x in lines_e), failures)
+    _check("сводка дня: продажи и исполнения тени в «за сутки» основной не попадают",
+           bs_e["executor"]["sells"] == [] and bs_e["executor"]["fills"] == 0, failures)
+    wr = next((b for b in ws if b["key"] == "R"), {})
+    _check("недельная тень: R и H, разбивка по причинам bottom, P&L = Σ позиций; основных нет",
+           [b["key"] for b in ws] == ["R", "H"] and wm == []
+           and wr.get("by_why", {}).get("bottom", {}).get("n") == 1
+           and abs(wr.get("pnl_usd", 0) - ex.pnl_usdt(pe["R"])) < 1e-9 and wr.get("n") == 1,
+           failures)
+    wblk = tg.executor_weekly_block(wm, ws)
+    _check("недельный блок: «👥 Тень», строка книги и «нижняя четверть 1 поз.»",
+           any(x.startswith("👥 <b>Тень</b>") for x in wblk)
+           and any(x.startswith("   нижняя четверть 1 поз. +") for x in wblk), failures)
+
+    # --- миграция БД ec02fc7 и сводка по немигрированной БД (только чтение)
+    old = ("CREATE TABLE dry_positions (id INTEGER PRIMARY KEY AUTOINCREMENT, book TEXT NOT NULL, "
+           "pair TEXT NOT NULL, symbol TEXT NOT NULL, coin_id TEXT DEFAULT '', card_day INTEGER "
+           "NOT NULL, status TEXT NOT NULL, reason TEXT DEFAULT '', created_ts REAL NOT NULL, "
+           "base_low REAL, stop_pct REAL, min_amt REAL DEFAULT 5, qty REAL DEFAULT 0, bought_qty "
+           "REAL DEFAULT 0, spent_usdt REAL DEFAULT 0, proceeds_usdt REAL DEFAULT 0, hwm REAL, "
+           "last_price REAL, last_day INTEGER, fills_until REAL DEFAULT 0, first_fill_ts REAL, "
+           "closed_ts REAL, UNIQUE(book, pair, card_day));"
+           "CREATE TABLE dry_orders (link_id TEXT PRIMARY KEY, position_id INTEGER NOT NULL, "
+           "book TEXT NOT NULL, pair TEXT NOT NULL, side TEXT NOT NULL, kind TEXT NOT NULL, "
+           "step INTEGER, signal TEXT DEFAULT '', price REAL, qty REAL, usd REAL, status TEXT "
+           "NOT NULL, created_ts REAL NOT NULL, filled_ts REAL, fee_usdt REAL DEFAULT 0, note "
+           "TEXT DEFAULT '');")
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        con = sqlite3.connect(c["output"]["db_path"])
+        con.executescript(old)
+        con.execute("INSERT INTO dry_positions(book, pair, symbol, card_day, status, created_ts, "
+                    "qty, bought_qty, spent_usdt, last_price) VALUES "
+                    "('R','XUSDT','X',?,'open',?,10,10,10,1)", (d0, now0))
+        con.commit()
+        con.close()
+        bs_old = ex.brief_state(c, now=now0)
+        wk_old = ex.weekly_shadow(c)
+        con = ex.connect(c["output"]["db_path"])
+        cols = {r[1] for r in con.execute("PRAGMA table_info(dry_positions)")}
+        row = dict(con.execute("SELECT * FROM dry_positions").fetchone())
+        con.close()
+    _check("сводка по БД до миграции: позиция основная, тени нет, не падает",
+           bs_old["books"]["R"]["open"] == 1 and bs_old["shadow"]["R"]["open"] == 0
+           and bs_old["shadowed"] == [] and wk_old == [], failures)
+    _check("миграция: ADD COLUMN shadow…hot_day; старая позиция — основная, меток нет",
+           {n for n, _ in ex._MIGRATIONS} <= cols and row["shadow"] == 0
+           and row["shadow_why"] == "" and row["vol_rank"] is None and row["hot_n"] is None,
+           failures)
+
+    # --- строки карточки (scan --notify) и сводок
+    from scanner.models import Candidate
+
+    def cn(sym: str, ctx, c_=cfg, venue: str = "Bybit spot", flags=None) -> list[str]:
+        cand = Candidate(source="t", track="A", symbol=sym, zone="ПРУЖИНА/ДНО", score=72.0,
+                         confidence=0.9, rf_venue=venue, flags=list(flags or []))
+        return ex.card_notes(c_, cand, rk({"LOW": 7, "TOP": 1}, 8), ctx, now0)
+    off_cfg = Config({**cfg._d, "executor": {**cfg._d["executor"], "enabled": False}})
+    _check("карточка: «⚠ нижняя четверть по обороту — исполнитель не покупает (7-е место из 8 "
+           "пар Bybit)»",
+           cn("LOW", cold) == ["⚠ нижняя четверть по обороту — исполнитель не покупает "
+                               "(7-е место из 8 пар Bybit)"], failures)
+    _check("карточка: «🔥 перегрев — исполнитель пропускает (перегрев 1/8, горят: MVRV ETH)»",
+           cn("TOP", hot) == ["🔥 перегрев — исполнитель пропускает (перегрев 1/8, горят: "
+                              "MVRV ETH)"], failures)
+    _check("карточка: нет данных рынка — «⚠ нет свежих данных рынка — исполнитель пропускает»",
+           cn("TOP", {}) == ["⚠ нет свежих данных рынка — исполнитель пропускает (данных рынка "
+                             "нет)"], failures)
+    _check("карточка: обе причины — две строки; ликвидная в холодном рынке — ничего",
+           len(cn("LOW", hot)) == 2 and cn("TOP", cold) == [], failures)
+    _check("карточка: DEX, тёзка под тикером, исполнитель выключен — строк нет",
+           cn("LOW", hot, venue="DEX only") == []
+           and cn("LOW", hot, flags=["bybit_ticker_mismatch"]) == []
+           and cn("LOW", hot, c_=off_cfg) == [], failures)
+    plan = plan_ladder(1.0, 0.95, 50, steps=5, min_order=10, tick=0.01, qty_step=0.1,
+                       exch_min_amt=5, floor_pct=25, sell="prod",
+                       prod_levels=cfg["stage8_exit"]["ladder"])
+    notes = cn("LOW", {**hot, "hot": {"lit": ["fng30"], "avail": 8}})
+    noisy = Candidate(source="t", track="A", symbol="LOW", zone="ПРУЖИНА/ДНО", score=72.0,
+                      confidence=0.9, rf_venue="Bybit spot", flags=list(_FLAG_KEYS),
+                      liveness_notes=[f"⚠ заметка {i} " + "x" * 60 for i in range(6)])
+    cap = tg.card_caption(noisy, plan, cfg, price=1.0, P=lambda x: f"{x:.2f}", exec_notes=notes)
+    txt = tg.format_coin_card(noisy, plan, cfg, price=1.0, exec_notes=notes)
+    _check("карточка: строки исполнителя в тексте (экранированы: F&amp;G) и в подписи ≤ 1024",
+           "горят: F&amp;G" in txt and all(n in tg.strip_html(cap) for n in notes)
+           and len(tg.strip_html(cap)) <= tg.CAPTION_MAX and len(notes) == 2, failures)
+    shb = [{"emoji": "📏", "label": "правила", "positions": 3, "n": 3, "book_pct": -4.0,
+            "alt_pct": 2.0, "pnl_usd": -1.2,
+            "by_why": {"hot": {"n": 2, "cost": 100.0, "pnl": 4.0},
+                       "bottom": {"n": 1, "cost": 50.0, "pnl": -10.0}}}]
+    mb = [{"emoji": "📏", "label": "правила", "positions": 2, "n": 2, "book_pct": 12.34,
+           "alt_pct": 5.0, "basket_pct": 3.0, "pnl_usd": 1.23}]
+    blk = tg.executor_weekly_block(mb, shb)
+    _check("недельный блок: основная с $, тень «−4.0% · альты +2.0% → −6.0 п.п.», по причинам",
+           "📏 правила: +12.3% · альты +5.0% · корзина +3.0% → +7.3 п.п. к альтам (2 поз., "
+           "+$1.23)" in blk
+           and "📏 правила: −4.0% · альты +2.0% → −6.0 п.п. к альтам (3 поз., −$1.20)" in blk
+           and "   перегрев 2 поз. +4.0% · нижняя четверть 1 поз. −20.0%" in blk
+           and any("Тень хуже основной книги" in x for x in blk)
+           and not any("считается в обеих" in x for x in blk), failures)
+    shb2 = [dict(shb[0], positions=2)]                # 2 позиции, причин 3 — одна в обеих
+    _check("недельный блок: причины пересекаются — «Монета с двумя причинами считается в обеих»",
+           any("Монета с двумя причинами считается в обеих" in x
+               for x in tg.executor_weekly_block([], shb2)), failures)
+    _check("недельный блок: только тень — блок есть; format_weekly показывает «Тень»",
+           tg.executor_weekly_block([], shb)[0].startswith("🤖")
+           and "Тень" in format_weekly({"week_no": 2, "milestone": False, "milestone_weeks": 4,
+                                        "opened": 0, "open_now": 0, "invalidations": 0,
+                                        "ladder_hits": 0, "trailings": 0,
+                                        "paper_pnl_usdt": 0.0, "real_open": 0,
+                                        "executor": [], "executor_shadow": shb}, cfg), failures)
+    exb = tg.executor_brief_lines(
+        {"books": {"R": {"open": 0, "closed": 0, "pnl": 0.0, "label": "правила", "emoji": "📏"}},
+         "shadow": {"R": {"open": 0, "closed": 0, "pnl": 0.0, "emoji": "📏"}},
+         "opened": [], "rejected": [], "shadowed": [("HYPER", "нижняя четверть по обороту "
+                                                              "(302-е место из 370)")]}, cfg)
+    _check("сводка дня: только отсеянное сегодня — блок есть, причина понятна",
+           exb[0].startswith("🤖") and "не купил бы, ушло в тень: HYPER — нижняя четверть по "
+                                      "обороту (302-е место из 370)" in exb, failures)
 
 
 def main() -> int:
@@ -2541,6 +3136,10 @@ def main() -> int:
     test_ladder(cfg, failures)
     print()
     test_executor(cfg, failures)
+    print()
+    test_liquidity(cfg, failures)
+    print()
+    test_executor_filters(cfg, failures)
     print()
     test_github_levels(cfg, failures)
     print()

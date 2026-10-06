@@ -63,8 +63,11 @@ def cmd_scan(args) -> int:
         picks = telegram.select_picks(fresh, cfg)
         papers = _papers_opened_since(cfg, t_start)
         http = _make_http(cfg)
+        ranks = _card_ranks(cfg, http) if picks else {}
         for c in picks:
-            card = deliver.coin_card(cfg, http, c, paper=papers.get(c.symbol.upper()))
+            notes = _exec_notes(cfg, c, ranks, summary.get("market_ctx") or {})
+            card = deliver.coin_card(cfg, http, c, paper=papers.get(c.symbol.upper()),
+                                     exec_notes=notes)
             ok = deliver.send_card(cfg, card)
             print(f"[telegram] карточка {c.symbol}: {'ok' if ok else 'fail'}"
                   f"{' (с картинкой)' if card.get('png') else ''}")
@@ -75,6 +78,31 @@ def cmd_scan(args) -> int:
             print("[telegram] новых монет у дна нет — карточек нет (итог дня — run.py brief)")
         st.close()
     return 0
+
+
+def _card_ranks(cfg, http, network: bool = True) -> dict:
+    """Места по 30-дн. обороту Bybit на сегодня для строк исполнителя в карточке
+    (scanner/liquidity.py): из БД, а если их ещё нет — подсчёт (network) и запись, тогда
+    execute возьмёт те же. Сбой — {}: карточка уходит без строки о нижней четверти."""
+    try:
+        from scanner import liquidity
+        db = cfg["output"]["db_path"]
+        r = liquidity.ensure_ranks(db, http) if network else liquidity.load_ranks(db)
+    except Exception as e:  # noqa: BLE001 — оборот не должен ронять скан
+        print(f"[liquidity] места по обороту не получены: {type(e).__name__}: {e}")
+        return {}
+    print(f"[liquidity] {r['n']} пар Bybit на сегодня" if r.get("ok") else f"[liquidity] {r['note']}")
+    return r
+
+
+def _exec_notes(cfg, c, ranks: dict, mctx: dict) -> list[str]:
+    """Строки карточки «что сделает пробный исполнитель» (executor.card_notes); сбой — без них."""
+    try:
+        from scanner import executor
+        return executor.card_notes(cfg, c, ranks, mctx)
+    except Exception as e:  # noqa: BLE001
+        print(f"[telegram] строки исполнителя для {c.symbol} пропущены: {type(e).__name__}: {e}")
+        return []
 
 
 def _papers_opened_since(cfg, ts: float) -> dict[str, dict]:
@@ -497,7 +525,15 @@ def cmd_card(args) -> int:
     ps.close_db()
     paper = ({"entry_price": pp["entry_price"],
               "stake": pp["entry_price"] * (pp.get("initial_qty") or pp["qty"])} if pp else None)
-    card = deliver.coin_card(cfg, _make_http(cfg), c, paper=paper, test=args.test)
+    # строки исполнителя — по уже посчитанным за сегодня местам и рынку из БД (без 390 запросов)
+    from scanner import regime
+    from scanner.db import Store
+    st = Store(cfg["output"]["db_path"])
+    mctx = regime.market_context(st.market_rows(), cfg)
+    st.close()
+    http = _make_http(cfg)
+    notes = _exec_notes(cfg, c, _card_ranks(cfg, http, network=False), mctx)
+    card = deliver.coin_card(cfg, http, c, paper=paper, test=args.test, exec_notes=notes)
     print(telegram.strip_html(card["caption"] if card.get("png") else card["text"]))
     if card.get("png"):
         out = Path(__file__).resolve().parent / "logs" / f"card_{sym}.png"
@@ -623,10 +659,12 @@ def cmd_report(args) -> int:
         stats["benchmark"] = benchmark.weekly_books(cfg)
     except Exception as e:  # noqa: BLE001
         print(f"[report] сравнение с рынком пропущено: {type(e).__name__}: {e}")
-    # Пробный исполнитель (scanner/executor.py): книги R/H против альтов и контрольной корзины.
+    # Пробный исполнитель (scanner/executor.py): книги R/H против альтов и контрольной корзины,
+    # теневые книги (отсеянное фильтрами) — против альтов и по причинам.
     try:
         from scanner import executor
         stats["executor"] = executor.weekly_books(cfg)
+        stats["executor_shadow"] = executor.weekly_shadow(cfg)
     except Exception as e:  # noqa: BLE001
         print(f"[report] блок пробного исполнителя пропущен: {type(e).__name__}: {e}")
     text = telegram.format_weekly(stats, cfg)
@@ -780,9 +818,24 @@ def cmd_execute(args) -> int:
             note = f"реальный баланс не прочитан: {e}"
     else:
         note = "реальный баланс: ключа Bybit нет — справки нет"
+    http = _make_http(cfg)
+    db = cfg["output"]["db_path"]
+    # Перегрев (фильтр 4) — тот же контекст, что видел скан: market_daily, обновление не чаще
+    # update_min_interval_hours. Сбой — None: run_dry возьмёт рынок из БД.
+    mctx = None
     try:
-        code, lines = executor.run_dry(cfg, executor.BybitMarket(_make_http(cfg)),
-                                       wallet_usdt=wallet, wallet_note=note)
+        from scanner.db import Store
+        from scanner.sources import market
+        st = Store(db)
+        try:
+            mctx = market.load_context(cfg, http, st)
+        finally:
+            st.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[execute] контекст рынка не обновлён ({type(e).__name__}: {e}) — беру из БД")
+    try:
+        code, lines = executor.run_dry(cfg, executor.BybitMarket(http, db),
+                                       wallet_usdt=wallet, wallet_note=note, mctx=mctx)
     except Exception as e:  # noqa: BLE001 — код 1 и текст в лог, сводка дня покажет
         code, lines = 1, [f"FAIL: {type(e).__name__}: {e}"]
     for line in lines:

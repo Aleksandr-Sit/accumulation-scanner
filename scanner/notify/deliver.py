@@ -54,8 +54,10 @@ def market_data(cfg, http, symbol: str, venue: str, coin_id: str, ref_price: flo
     return out
 
 
-def coin_card(cfg, http, c, *, paper: dict | None = None, test: bool = False) -> dict:
-    """Карточка новой монеты у дна: {caption, text, png, buttons, plan}."""
+def coin_card(cfg, http, c, *, paper: dict | None = None, test: bool = False,
+              exec_notes: list[str] | None = None) -> dict:
+    """Карточка новой монеты у дна: {caption, text, png, buttons, plan}. exec_notes — строки
+    «что сделает пробный исполнитель» (executor.card_notes)."""
     t = cfg.get("stage6_telegram", {}) or {}
     e = cfg["stage8_exit"]
     md = market_data(cfg, http, c.symbol, c.rf_venue, c.coin_id, getattr(c, "price_usd", None))
@@ -73,7 +75,8 @@ def coin_card(cfg, http, c, *, paper: dict | None = None, test: bool = False) ->
                            floor_pct=e["invalidation_below_base_low_pct"], sell="prod",
                            prod_levels=e["ladder"],
                            worst_case_pct=cfg.get("stage7_positions.worst_case_loss_pct", 60))
-    kw = dict(price=price, price_src=md["src"], P=P, paper=paper, test=test)
+    kw = dict(price=price, price_src=md["src"], P=P, paper=paper, test=test,
+              exec_notes=exec_notes)
     links = telegram.coin_links(c.symbol, c.rf_venue if md["bybit"] or c.rf_venue != "Bybit spot"
                                 else "", c.coin_id, c.chain, c.address)
     png = None

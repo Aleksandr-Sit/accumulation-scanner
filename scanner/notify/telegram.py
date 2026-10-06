@@ -484,11 +484,14 @@ _SECTIONS = ("why", "risks")
 def format_coin_card(c, plan: dict | None, cfg, *, price: float | None = None,
                      price_src: str = "", P=None, paper: dict | None = None,
                      with_links: bool = False, test: bool = False,
-                     sections: tuple[str, ...] = _SECTIONS) -> str:
+                     sections: tuple[str, ...] = _SECTIONS,
+                     exec_notes: list[str] | None = None) -> str:
     """Карточка новой монеты у дна: суть → лестница/стоп/цели → свёрнутые «почему/риски»
-    → paper-пометка. sections — какие свёрнутые блоки включать (подпись к фото ограничена
-    1024 символами: лишнее снимается по одному, см. card_caption). Уровней графика (узлы
-    объёма, VWAP, SMA200, хаи) нет намеренно: backtest/levels_study.py — не лучше placebo."""
+    → paper-пометка → что сделает пробный исполнитель (exec_notes, executor.card_notes:
+    нижняя четверть по обороту, перегрев — не сворачиваются и из подписи не снимаются).
+    sections — какие свёрнутые блоки включать (подпись к фото ограничена 1024 символами:
+    лишнее снимается по одному, см. card_caption). Уровней графика (узлы объёма, VWAP,
+    SMA200, хаи) нет намеренно: backtest/levels_study.py — не лучше placebo."""
     P = P or fmt_price
     sym = _esc(c.symbol or c.name or "?")
     venue = {"Bybit spot": "Bybit", "DEX only": "DEX"}.get(c.rf_venue, c.rf_venue or "")
@@ -533,6 +536,7 @@ def format_coin_card(c, plan: dict | None, cfg, *, price: float | None = None,
     if paper:
         lines.append(f"📝 paper-позиция ${paper.get('stake', 100):.0f} по "
                      f"{P(paper['entry_price'])} — тест правил, без действий")
+    lines += [_esc(x) for x in exec_notes or []]
     if with_links:
         links = coin_links(c.symbol, c.rf_venue, c.coin_id, c.chain, c.address)
         if links:
@@ -777,16 +781,22 @@ def _signal_text(stype: str, cfg) -> str:
 
 def executor_brief_lines(ex: dict | None, cfg) -> list[str]:
     """Блок сводки дня «🤖 Пробный исполнитель» (scanner/executor.brief_state): что поставил бы
-    сегодня, отказы, исполнения и продажи за сутки, P&L книг. Пусто — блока нет."""
+    сегодня, что отсеяли фильтры (в тени) и почему, отказы, исполнения и продажи основной книги
+    за сутки, P&L книг и тени. Пусто — блока нет."""
     if not ex:
         return []
     books = ex.get("books") or {}
-    active = any(b.get("open") or b.get("closed") for b in books.values())
-    if not (active or ex.get("opened") or ex.get("rejected")):
+    shadow = ex.get("shadow") or {}
+    active_sh = any(b.get("open") or b.get("closed") for b in shadow.values())
+    active = active_sh or any(b.get("open") or b.get("closed") for b in books.values())
+    if not (active or ex.get("opened") or ex.get("rejected") or ex.get("shadowed")):
         return []
     out = ["🤖 <b>Пробный исполнитель</b> <i>(ордера не отправлялись)</i>"]
     if ex.get("opened"):
         out.append("поставил бы лестницу: " + ", ".join(_esc(s) for s in ex["opened"]))
+    if ex.get("shadowed"):
+        out.append("не купил бы, ушло в тень: " + "; ".join(
+            f"{_esc(sym)} — {_esc(why)}" for sym, why in ex["shadowed"]))
     for sym, why in ex.get("rejected") or []:
         out.append(f"отказ {_esc(sym)}: {_esc(why)}")
     acts = []
@@ -800,29 +810,58 @@ def executor_brief_lines(ex: dict | None, cfg) -> list[str]:
     if active:
         out.append(" · ".join(f"{b.get('emoji', '•')} {_esc(b.get('label', k))}: {b['open']} поз., "
                               f"{fmt_usd(b['pnl'])}" for k, b in books.items()))
+    if active_sh:
+        out.append("👥 тень: " + " · ".join(f"{b.get('emoji', '•')} {b['open']} поз., "
+                                           f"{fmt_usd(b['pnl'])}" for b in shadow.values()))
     return out
 
 
-def executor_weekly_block(books: list[dict]) -> list[str]:
+_WHY_SHORT = {"bottom": "нижняя четверть", "quota": "квота неликвида", "hot": "перегрев",
+              "nodata": "нет данных рынка"}
+
+
+def _exec_book_line(b: dict) -> str:
+    """Строка книги исполнителя: P&L против альтов (и корзины) на тех же окнах, позиции, $."""
+    head = f"{b.get('emoji', '•')} {_esc(b.get('label', ''))}:"
+    usd = f", {fmt_usd(b['pnl_usd'])}" if isinstance(b.get("pnl_usd"), (int, float)) else ""
+    if not b.get("n"):
+        return f"{head} нет рынка на даты позиций ({b['positions']} поз.{usd})"
+    shown = [float(f"{b[k]:.1f}") for k in ("book_pct", "alt_pct")]
+    pp = f"{shown[0] - shown[1]:+.1f}".replace("-", "−")
+    bask = (f" · корзина {_signed(b['basket_pct'])}" if b.get("basket_pct") is not None
+            else "")
+    return (f"{head} {_signed(b['book_pct'])} · альты {_signed(b['alt_pct'])}{bask} → "
+            f"{pp} п.п. к альтам ({b['n']} поз.{usd})")
+
+
+def executor_weekly_block(books: list[dict], shadow: list[dict] | None = None) -> list[str]:
     """«🤖 Пробный исполнитель» недельной сводки: книги R/H против альтов и контрольной корзины
-    на тех же окнах (scanner/executor.weekly_books). Позиций нет — пусто."""
+    на тех же окнах (scanner/executor.weekly_books), ниже — теневые книги (weekly_shadow):
+    отсеянное фильтрами, против альтов и по причинам. Позиций нет нигде — пусто."""
     books = [b for b in books or [] if b.get("positions")]
-    if not books:
+    shadow = [b for b in shadow or [] if b.get("positions")]
+    if not (books or shadow):
         return []
     out = ["🤖 <b>Пробный исполнитель</b> (5×$10 на монету, ордера не отправлялись):"]
-    for b in books:
-        head = f"{b.get('emoji', '•')} {_esc(b.get('label', ''))}:"
-        if not b.get("n"):
-            out.append(f"{head} нет рынка на даты позиций ({b['positions']} поз.)")
-            continue
-        shown = [float(f"{b[k]:.1f}") for k in ("book_pct", "alt_pct")]
-        pp = f"{shown[0] - shown[1]:+.1f}".replace("-", "−")
-        bask = (f" · корзина {_signed(b['basket_pct'])}" if b.get("basket_pct") is not None
-                else "")
-        out.append(f"{head} {_signed(b['book_pct'])} · альты {_signed(b['alt_pct'])}{bask} → "
-                   f"{pp} п.п. к альтам ({b['n']} поз.)")
+    out += [_exec_book_line(b) for b in books]
+    if shadow:
+        out.append("👥 <b>Тень</b> — отсеяно фильтрами, те же лестница и выходы, без мест и денег:")
+        for b in shadow:
+            out.append(_exec_book_line(b))
+            by = sorted((b.get("by_why") or {}).items(), key=lambda kv: -kv[1]["n"])
+            if by:
+                out.append("   " + " · ".join(
+                    f"{_WHY_SHORT.get(k, _esc(k))} {d['n']} поз. "
+                    + (_signed(d['pnl'] / d['cost'] * 100) if d.get("cost") else "—")
+                    for k, d in by))
     out.append("<i>Обе книги входят одинаково, разница — только выходы. Корзина — все монеты "
                "watchlist того же прогона поровну (по капе, без комиссий).</i>")
+    if shadow:
+        both = any(sum(d["n"] for d in (b.get("by_why") or {}).values()) > b["positions"]
+                   for b in shadow)
+        out.append("<i>Тень хуже основной книги — фильтры сберегли деньги, лучше — срезали "
+                   "прибыль. Пока позиций единицы, разница — шум."
+                   + (" Монета с двумя причинами считается в обеих." if both else "") + "</i>")
     return out
 
 
@@ -917,7 +956,7 @@ def format_weekly(stats: dict, cfg) -> str:
     if bench:
         lines.append("")
         lines += bench
-    exb = executor_weekly_block(stats.get("executor") or [])
+    exb = executor_weekly_block(stats.get("executor") or [], stats.get("executor_shadow"))
     if exb:
         lines.append("")
         lines += exb
