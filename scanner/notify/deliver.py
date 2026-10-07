@@ -67,8 +67,8 @@ def coin_card(cfg, http, c, *, paper: dict | None = None, test: bool = False,
     closes = ohlcv.get("c") or []
     plan = None
     if price and len(closes) >= 30:
-        plan = plan_ladder(price, min(closes[-30:]), t.get("card_budget_usdt", 40),
-                           steps=t.get("card_steps", 4), min_order=t.get("card_min_order_usdt", 10),
+        plan = plan_ladder(price, min(closes[-30:]), t.get("card_budget_usdt", 50),
+                           steps=t.get("card_steps", 5), min_order=t.get("card_min_order_usdt", 10),
                            tick=tick, qty_step=inst.get("qty_step") or 0.0,
                            exch_min_amt=inst.get("min_amt") or 0.0,
                            exch_min_qty=inst.get("min_qty") or 0.0,

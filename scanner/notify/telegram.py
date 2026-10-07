@@ -481,6 +481,15 @@ def _ladder_table(plan: dict, P, cfg) -> list[str]:
 _SECTIONS = ("why", "risks")
 
 
+def _steps_word(n: int) -> str:
+    """«ступень / ступени / ступеней» по числу: 1, 21 — ступень; 2–4 — ступени; 5–20 — ступеней."""
+    if n % 10 == 1 and n % 100 != 11:
+        return "ступень"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "ступени"
+    return "ступеней"
+
+
 def format_coin_card(c, plan: dict | None, cfg, *, price: float | None = None,
                      price_src: str = "", P=None, paper: dict | None = None,
                      with_links: bool = False, test: bool = False,
@@ -517,7 +526,7 @@ def format_coin_card(c, plan: dict | None, cfg, *, price: float | None = None,
     if plan and plan.get("ok"):
         lines.append("<pre>" + _esc("\n".join(_ladder_table(plan, P, cfg))) + "</pre>")
         n = len(plan["buys"])
-        lines.append(f"<i>Цели — от средней {P(plan['avg'])} (все {n} ступени); "
+        lines.append(f"<i>Цели — от средней {P(plan['avg'])} (все {n} {_steps_word(n)}); "
                      f"после части — от своей средней.</i>")
     elif plan and plan.get("error"):
         lines.append(f"⚠ Лестница не построена: {_esc(plan['error'])}")

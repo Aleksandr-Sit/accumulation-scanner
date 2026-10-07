@@ -1108,6 +1108,21 @@ def test_telegram_format(cfg, failures: list[str]) -> None:
     _check("карточка: 4 ступени ценами + стоп в <pre>",
            "<pre>" in card and all(P(b["price"]) in card for b in plan["buys"])
            and "0.988" in card and "2 закрытия ниже" in card, failures)
+    plan5 = plan_ladder(1.5, 1.317, 50, steps=5, min_order=10, tick=0.001, qty_step=0.01,
+                        exch_min_amt=5, floor_pct=25, sell="prod",
+                        prod_levels=cfg["stage8_exit"]["ladder"])
+    card5 = tg.format_coin_card(g, plan5, cfg, price=1.5, price_src="Bybit", P=P)
+    _check("карточка: «все 4 ступени», «все 5 ступеней»; 5 цен лестницы в <pre>",
+           "(все 4 ступени)" in card and "(все 5 ступеней)" in card5
+           and len(plan5["buys"]) == 5 and all(P(b["price"]) in card5 for b in plan5["buys"]),
+           failures)
+    _check("склонение: 1/21 ступень, 2–4/22 ступени, 5/11/12 ступеней",
+           [tg._steps_word(n) for n in (1, 21, 2, 4, 22, 5, 11, 12)]
+           == ["ступень"] * 2 + ["ступени"] * 3 + ["ступеней"] * 3, failures)
+    t6, x6 = cfg["stage6_telegram"], cfg["executor"]
+    _check("карточка = лестница пробного исполнителя: ступени, бюджет и минимум ступени совпадают",
+           (t6["card_steps"], t6["card_budget_usdt"], t6["card_min_order_usdt"])
+           == (x6["steps"], x6["budget_usdt"], x6["min_order_usdt"]), failures)
     _check("карточка: цели +50/+150 и трейл остатка",
            "+50% → ⅓" in card and "+150% → ⅓" in card and "трейл 30%" in card, failures)
     _check("карточка: свёрнутый блок «почему/риски»",
