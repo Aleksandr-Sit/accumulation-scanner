@@ -1835,6 +1835,19 @@ def test_github_levels(cfg, failures: list[str]) -> None:
         _check("картинка: Pillow нет -> None (текстом)", png is None, failures)
     _check("картинка: мало истории -> None", chart.render_levels({"c": [1.0, 2.0]}, title="x")
            is None, failures)
+    # 5 ступеней + стоп у дна графика (LUNC 07.10): подписи упирались в строку «уровни — …»
+    ys = chart.label_ys([600, 610, 625, 640, 655, 672], chart.LABEL_BOTTOM)
+    _check("подписи уровней: не ближе 24 px, нижняя не ниже строки «уровни — правила сканера»",
+           all(b - a >= chart.LABEL_GAP - 1e-9 for a, b in zip(ys, ys[1:]))
+           and ys[-1] <= chart.LABEL_BOTTOM < chart.H - 30
+           and chart.label_ys([100, 300], chart.LABEL_BOTTOM) == [100, 300]
+           and chart.label_ys([], chart.LABEL_BOTTOM) == [], failures)
+    if chart.available():
+        long_png = chart.render_levels(
+            ohlcv, title="LUNC/USDT", buys=[9.0, 8.8, 8.6, 8.4, 8.2], stop=7.9,
+            targets=[(13.5, "+50%"), (22.5, "+150%")], fmt=lambda x: f"{x / 1e5:.8f}")
+        _check("картинка: 5 ступеней и длинные цены целей — PNG строится",
+               isinstance(long_png, bytes) and long_png[:4] == b"\x89PNG", failures)
 
 
 def test_ladder(cfg, failures: list[str]) -> None:

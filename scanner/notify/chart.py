@@ -44,6 +44,21 @@ def _font(size: int, bold: bool = False):
     return None                 # без TTF кириллица не отрисуется — картинку не делаем
 
 
+LABEL_GAP = 24              # px между подписями уровней (шрифт 20)
+LABEL_BOTTOM = H - 38       # центр нижней подписи — выше строки «уровни — правила сканера…»
+
+
+def label_ys(ys: list[float], bottom: float, gap: float = LABEL_GAP) -> list[float]:
+    """Высоты подписей уровней (ys — по возрастанию, у своих линий): не ближе gap друг к другу
+    и не ниже bottom — иначе стопка сдвигается вверх целиком (5 ступеней + стоп у дна графика
+    доходили до нижней строки и наезжали на неё)."""
+    out: list[float] = []
+    for y in ys:
+        out.append(max(y, out[-1] + gap) if out else y)
+    over = out[-1] - bottom if out else 0
+    return [y - max(0, over) for y in out]
+
+
 def render_levels(ohlcv: dict, *, title: str, subtitle: str = "", buys=(), stop=None,
                   targets=(), entry=None, extra=(), days: int = 180, fmt=None,
                   footer: str = "уровни — правила сканера, не рекомендация") -> bytes | None:
@@ -111,12 +126,15 @@ def render_levels(ohlcv: dict, *, title: str, subtitle: str = "", buys=(), stop=
             for xx in range(int(x0), int(x1), 14):
                 g.line([(xx, y), (min(xx + 8, x1), y)], fill=col, width=2)
         labels.append([y, lab, col])
-    labels.sort(key=lambda t: t[0])                     # подписи не налезают друг на друга
-    for i in range(1, len(labels)):
-        labels[i][0] = max(labels[i][0], labels[i - 1][0] + 24)
-    over = labels[-1][0] - (H - 14) if labels else 0
-    for t in labels:
-        t[0] -= max(0, over)
+    labels.sort(key=lambda t: t[0])
+    for t, y in zip(labels, label_ys([t[0] for t in labels], LABEL_BOTTOM)):
+        t[0] = y
+    # длинная цена («цель +150% · 0.00011036») не влезала в правое поле — шрифт меньше
+    room = W - (x1 + 10) - 6
+    for size in (18, 16):
+        if max(g.textlength(lab, font=f_lab) for _, lab, _ in labels or [(0, "", 0)]) <= room:
+            break
+        f_lab = _font(size) or f_lab
     for y, lab, col in labels:
         g.text((x1 + 10, y), lab, fill=col, font=f_lab, anchor="lm")
 
