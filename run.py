@@ -13,6 +13,7 @@
   python run.py market [--backfill]         # история рынка альтов + индекс перегрева
   python run.py quality [--refresh-if-due]  # срез трека Q: дата, возраст; обновить, если пора
   python run.py backup [--send-weekly --notify]   # бэкап scanner.db (+ раз в неделю в Telegram)
+  python run.py backup --accept-shrink      # база уменьшена намеренно: копия — новый эталон
   python run.py sync [--notify]             # реальные позиции из исполнений Bybit (Read-Only)
   python run.py execute --dry-run           # пробный исполнитель: «поставил бы», без ордеров
   python run.py halt [причина]              # стоп-кран исполнителя (снять — только resume)
@@ -796,26 +797,32 @@ def cmd_quality(args) -> int:
 
 
 def cmd_backup(args) -> int:
-    """Бэкап scanner.db: sqlite backup API → integrity_check → gzip → ротация. --send-weekly
-    (+ --notify): раз в неделю свежий .gz в Telegram документом без звука. Код ≠ 0 при любом
-    сбое; 3 — копия сделана, но в Telegram не ушла (сводка дня различает)."""
+    """Бэкап scanner.db: sqlite backup API → integrity_check → сверка строк с эталоном → gzip →
+    ротация ярусами (config backup). --send-weekly (+ --notify): раз в неделю тонкая копия в
+    Telegram документом без звука. Код ≠ 0 при любом сбое; 3 — копия сделана, но в Telegram не
+    ушла; 4 — копия подозрительная (строк меньше, чем в эталоне): старые копии не удаляются,
+    в Telegram она не уходит (сводка дня различает)."""
     cfg = load_config(args.config)
     from scanner import backup
     try:
-        info = backup.make_backup(cfg["output"]["db_path"], args.dir or backup.DEFAULT_DIR,
-                                  keep=args.keep)
+        info = backup.make_backup(
+            cfg["output"]["db_path"], args.dir or backup.DEFAULT_DIR,
+            keep=args.keep if args.keep is not None else cfg.get("backup.keep_daily", 14),
+            keep_weekly=cfg.get("backup.keep_weekly", 8),
+            keep_monthly=cfg.get("backup.keep_monthly", 6), accept_shrink=args.accept_shrink)
     except Exception as e:  # noqa: BLE001 — любой сбой: код 1, сводка дня покажет
         print(f"backup FAIL: {type(e).__name__}: {e}")
         return 1
-    print(backup.ok_line(info))
-    if not (args.send_weekly or args.test):
-        return 0
-    try:
-        code, msg = backup.send_weekly(cfg, info, notify=args.notify, test=args.test)
-    except Exception as e:  # noqa: BLE001 — копия уже есть: «не ушла», а не «не сделана»
-        code, msg = backup.EXIT_SEND_FAILED, f"недельная отправка упала: {type(e).__name__}: {e}"
-    print(f"[backup] {msg}")
-    return code
+    print(backup.suspect_line(info) if info["suspect"] else backup.ok_line(info))
+    code = 0
+    if args.send_weekly or args.test:
+        try:
+            code, msg = backup.send_weekly(cfg, info, notify=args.notify, test=args.test)
+        except Exception as e:  # noqa: BLE001 — копия уже есть: «не ушла», а не «не сделана»
+            code, msg = (backup.EXIT_SEND_FAILED,
+                         f"недельная отправка упала: {type(e).__name__}: {e}")
+        print(f"[backup] {msg}")
+    return backup.EXIT_SUSPECT if info["suspect"] else code
 
 
 def cmd_sync(args) -> int:
@@ -1074,7 +1081,12 @@ def main() -> int:
 
     pbk = sub.add_parser("backup", help="бэкап scanner.db: копия, integrity_check, gzip, ротация")
     pbk.add_argument("--dir", default=None, help="каталог копий (по умолчанию backups/ в корне)")
-    pbk.add_argument("--keep", type=_keep, default=14, help="сколько последних копий хранить")
+    pbk.add_argument("--keep", type=_keep, default=None,
+                     help="сколько последних копий хранить (по умолчанию backup.keep_daily; "
+                          "недельные и месячные — сверх них)")
+    pbk.add_argument("--accept-shrink", action="store_true",
+                     help="база уменьшена намеренно: новая копия не подозрительная, становится "
+                          "эталоном, ротация идёт дальше")
     pbk.add_argument("--send-weekly", action="store_true",
                      help="раз в неделю (weekly_report_weekday) свежий .gz в Telegram без звука")
     pbk.add_argument("--notify", action="store_true",

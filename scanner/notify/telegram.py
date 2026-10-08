@@ -820,7 +820,7 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
     elif state.get("backup") == "send_fail":
         head.append("⚠ бэкап не ушёл в Telegram")
     elif state.get("backup") == "suspect":
-        head.append("⚠ бэкап: база меньше прошлой копии — старые копии не удаляю")
+        head.append("⚠ бэкап: в базе строк меньше, чем в прошлой целой копии — старые не удаляю, в Telegram не шлю (намеренно — run.py backup --accept-shrink)")
     if state.get("sync_fail"):
         head.append("⚠ синхронизация с Bybit не прошла")
     if state.get("exec_fail"):
@@ -1152,22 +1152,37 @@ def format_failure(step: str, error: str) -> str:
 
 
 def format_backup_caption(info: dict, *, test: bool = False) -> str:
-    """Подпись к недельной копии базы (scanner/backup.py): дата, размер, как восстановить."""
-    name = _esc(info["path"].name)
+    """Подпись к недельной копии базы (scanner/backup.py): дата, размер, тонкая ли, где полные
+    копии и как восстановить. Журнал прерванной записи удаляется ДО распаковки: иначе SQLite
+    при первом открытии «откатит» его поверх восстановленной копии и испортит её."""
+    name = _esc(info.get("name") or info["path"].name)
     when = datetime.fromtimestamp(info["ts"]).strftime("%d.%m.%Y %H:%M")
+    days = info.get("thin_days")
+    where = (f"на сервере в <code>{_esc(info['path'].parent)}</code>: последние {info['keep']}, "
+             f"недельные за {info['keep_weekly']} нед., месячные за {info['keep_monthly']} мес.")
+    kind = (f"<b>Тонкая копия</b>: кандидаты только за последние {days:g} дн. Полные копии — "
+            f"{where}" if days else f"Полная копия. Копии — {where}")
     return (f"{'🧪 ТЕСТ · ' if test else ''}💾 <b>Бэкап базы сканера</b> · {when}\n"
             f"{name} — {fmt_size(info['size'])} (база {fmt_size(info['db_size'])}), "
-            f"integrity_check ok\n"
-            f"Восстановить (таймер остановлен, файл — в каталоге проекта):\n"
-            f"<code>gunzip -c {name} &gt; scanner.db</code>\n"
-            f"<i>Копия раз в неделю, без звука; на сервере — последние {info['keep']}.</i>")
+            f"integrity_check ok\n{kind}\n"
+            f"Восстановить в каталоге проекта; журнал прерванной записи удалить ДО распаковки, "
+            f"иначе SQLite откатит его поверх копии:\n"
+            f"<code>systemctl stop accumulation-scanner.timer\n"
+            f"rm -f scanner.db-journal scanner.db-wal scanner.db-shm\n"
+            f"gunzip -c {name} &gt; scanner.db\n"
+            f"systemctl start accumulation-scanner.timer</code>\n"
+            f"<i>Копия раз в неделю, без звука.</i>")
 
 
 def format_backup_too_big(info: dict, limit: int, *, test: bool = False) -> str:
-    """Копия больше лимита Bot API — файл не шлём, предупреждаем: копии только на сервере."""
+    """Копия больше лимита Bot API — файл не шлём, предупреждаем: копии только на сервере.
+    Не влезла даже тонкая — подсказка, что уменьшить."""
+    days = info.get("thin_days")
+    hint = (f", хотя это тонкая копия (кандидаты за {days:g} дн.) — уменьши "
+            f"backup.telegram_candidates_days" if days else "")
     return (f"{'🧪 ТЕСТ · ' if test else ''}⚠ <b>Бэкап базы не отправлен</b>: "
-            f"{_esc(info['path'].name)} — {fmt_size(info['size'])}, больше "
-            f"{fmt_size(limit)} (у ботов лимит 50 МБ).\nКопии есть только на сервере: "
+            f"{_esc(info.get('name') or info['path'].name)} — {fmt_size(info['size'])}, больше "
+            f"{fmt_size(limit)} (у ботов лимит 50 МБ){hint}.\nКопии есть только на сервере: "
             f"<code>{_esc(info['path'].parent)}</code> — забрать вручную (scp).")
 
 
