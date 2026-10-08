@@ -46,7 +46,15 @@ def spring_quality(candidate, cfg: Config) -> tuple[float, list[str]]:
              if isinstance(add, (int, float)) else None)
     src = q.get("market_dd_source", "btc")
     use_alt = src in ("alt", "mix") and m_alt is not None
-    if src == "mix" and m_btc is not None and m_alt is not None:
+    if src == "alt" and m_alt is None and cfg.get("market_regime.enabled", True):
+        # Нет (свежих) данных альт-рынка: откат на BTC-dd даёт множитель в другой шкале
+        # (на 03.10 +29% к alt, пружин ≥70 стало бы 6 вместо 1). Без контекста — по минимуму:
+        # лучше пропустить день алертов, чем купить по завышенному баллу. Контекст рынка
+        # выключен в конфиге (market_regime.enabled=false) — прежний откат на BTC.
+        mult *= lo_m
+        notes.append("⚠ нет свежих данных рынка альтов — множитель контекста по минимуму")
+        m = None
+    elif src == "mix" and m_btc is not None and m_alt is not None:
         m = (m_btc + m_alt) / 2
     else:
         m = m_alt if use_alt else m_btc

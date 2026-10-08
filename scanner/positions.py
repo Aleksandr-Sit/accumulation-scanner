@@ -6,11 +6,18 @@
 
 Профиль стратегии: откуп у дна -> холд/накопление -> распределение в бычьей
 фазе (горизонт 1-2 года ок). Не свинг.
+
+watch (pipeline.run_watch): positions.last_close_ts — последнее оценённое дневное закрытие
+(следующий прогон оценивает все более новые по порядку), trail_armed_ts — защёлка трейла
+(закрытие ≥ +arm от средней). notify_outbox — очередь карточек выхода: кладётся той же
+транзакцией, что события, помечается после доставки (сбой Telegram — повтор позже).
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from typing import Any
 
 _SCHEMA = """
@@ -34,7 +41,9 @@ CREATE TABLE IF NOT EXISTS positions (
     notes       TEXT DEFAULT '',
     is_paper    INTEGER DEFAULT 0,
     variant     TEXT DEFAULT 'A',
-    twin_of     INTEGER
+    twin_of     INTEGER,
+    last_close_ts  REAL,
+    trail_armed_ts REAL
 );
 CREATE TABLE IF NOT EXISTS position_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +51,8 @@ CREATE TABLE IF NOT EXISTS position_events (
     ts          REAL NOT NULL,
     type        TEXT NOT NULL,
     price       REAL,
-    note        TEXT DEFAULT ''
+    note        TEXT DEFAULT '',
+    close_ts    REAL
 );
 CREATE INDEX IF NOT EXISTS idx_events_pos ON position_events(position_id, type);
 CREATE TABLE IF NOT EXISTS position_snapshots (
@@ -50,9 +60,21 @@ CREATE TABLE IF NOT EXISTS position_snapshots (
     ts          REAL NOT NULL,
     price       REAL,
     pnl_pct     REAL,
-    hwm         REAL
+    hwm         REAL,
+    close_ts    REAL
 );
 CREATE INDEX IF NOT EXISTS idx_snap_pos ON position_snapshots(position_id, ts);
+CREATE TABLE IF NOT EXISTS notify_outbox (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    position_id INTEGER,
+    close_ts    REAL,
+    payload     TEXT NOT NULL,
+    created_ts  REAL NOT NULL,
+    sent_ts     REAL,
+    tries       INTEGER DEFAULT 0,
+    last_error  TEXT DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS exchange_fills (
     exec_id     TEXT PRIMARY KEY,
     venue       TEXT NOT NULL,
@@ -74,10 +96,16 @@ def _row_to_dict(cur: sqlite3.Cursor, row: tuple) -> dict[str, Any]:
     return {d[0]: row[i] for i, d in enumerate(cur.description)}
 
 
+# Порядок снапшотов: по дню закрытия; у старых (до close_ts) — день записи (так их и
+# подписывала сводка дня).
+_SNAP_KEY = "COALESCE(close_ts, (CAST(ts AS INTEGER) / 86400) * 86400)"
+
+
 class PositionStore:
     def __init__(self, db_path: str):
         # timeout: cron scan (07:00) может ещё писать БД, когда стартует watch (07:30)
         self.conn = sqlite3.connect(db_path, timeout=30)
+        self._tx = 0
         self.conn.executescript(_SCHEMA)
         self._migrate()
         self.conn.commit()
@@ -97,6 +125,38 @@ class PositionStore:
             self.conn.execute("ALTER TABLE positions ADD COLUMN variant TEXT DEFAULT 'A'")
         if "twin_of" not in cols:
             self.conn.execute("ALTER TABLE positions ADD COLUMN twin_of INTEGER")
+        # watch по закрытиям с датой: последнее оценённое закрытие и защёлка трейла.
+        # NULL у старых позиций -> первый watch переоценит закрытия с момента входа.
+        if "last_close_ts" not in cols:
+            self.conn.execute("ALTER TABLE positions ADD COLUMN last_close_ts REAL")
+        if "trail_armed_ts" not in cols:
+            self.conn.execute("ALTER TABLE positions ADD COLUMN trail_armed_ts REAL")
+        for table in ("position_snapshots", "position_events"):
+            tcols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if "close_ts" not in tcols:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN close_ts REAL")
+
+    # --- транзакции ---
+    @contextmanager
+    def atomic(self):
+        """Несколько записей одной транзакцией: внутри методы не коммитят, исключение —
+        откат всего блока (sync: позиция и exchange_fills; watch: события, paper-исполнение,
+        снапшот и очередь карточек — вместе или никак)."""
+        self._tx += 1
+        try:
+            yield self
+        except BaseException:
+            self._tx -= 1
+            if not self._tx:
+                self.conn.rollback()
+            raise
+        self._tx -= 1
+        if not self._tx:
+            self.conn.commit()
+
+    def _commit(self) -> None:
+        if not self._tx:
+            self.conn.commit()
 
     # --- CRUD ---
     def add(self, symbol: str, entry_price: float, qty: float,
@@ -114,7 +174,7 @@ class PositionStore:
             (symbol.upper(), coin_id, chain, address, venue,
              entry_price, qty, qty, ts, base_low, entry_price, notes, int(paper),
              variant, twin_of))
-        self.conn.commit()
+        self._commit()
         return int(cur.lastrowid)
 
     def find_open_real(self, symbol: str) -> dict[str, Any] | None:
@@ -185,24 +245,36 @@ class PositionStore:
         return _row_to_dict(cur, row) if row else None
 
     # --- снапшоты (дневная история P&L — для дайджеста/недельной сводки/анализа) ---
-    def snapshot(self, position_id: int, price: float, pnl_pct: float, hwm: float) -> None:
+    def snapshot(self, position_id: int, price: float, pnl_pct: float, hwm: float,
+                 close_ts: float | None = None, ts: float | None = None) -> None:
+        """Снапшот на дневное закрытие close_ts. Повтор того же закрытия и старый снапшот
+        того же дня без close_ts заменяются (переоценка после миграции не двоит историю)."""
+        if close_ts is not None:
+            self.conn.execute(
+                f"DELETE FROM position_snapshots WHERE position_id=? AND (close_ts=? OR "
+                f"(close_ts IS NULL AND {_SNAP_KEY}=?))",
+                (position_id, close_ts, int(close_ts)))
         self.conn.execute(
-            "INSERT INTO position_snapshots(position_id, ts, price, pnl_pct, hwm) "
-            "VALUES (?,?,?,?,?)", (position_id, time.time(), price, pnl_pct, hwm))
-        self.conn.commit()
+            "INSERT INTO position_snapshots(position_id, ts, price, pnl_pct, hwm, close_ts) "
+            "VALUES (?,?,?,?,?,?)",
+            (position_id, ts if ts is not None else time.time(), price, pnl_pct, hwm, close_ts))
+        self._commit()
 
     def last_snapshots(self) -> dict[int, dict[str, Any]]:
-        """position_id -> последний снапшот (без сети — для недельной сводки)."""
-        cur = self.conn.execute(
-            "SELECT s.* FROM position_snapshots s JOIN ("
-            "  SELECT position_id, MAX(ts) mt FROM position_snapshots GROUP BY position_id"
-            ") m ON s.position_id=m.position_id AND s.ts=m.mt")
-        return {r[0]: _row_to_dict(cur, r) for r in cur.fetchall()}
+        """position_id -> последний по дню закрытия снапшот (без сети — сводки)."""
+        cur = self.conn.execute(f"SELECT * FROM position_snapshots "
+                                f"ORDER BY position_id, {_SNAP_KEY}, ts, rowid")
+        out: dict[int, dict[str, Any]] = {}
+        for r in cur.fetchall():
+            d = _row_to_dict(cur, r)
+            out[d["position_id"]] = d
+        return out
 
     def snapshot_prices(self, position_id: int) -> list[tuple[float, float]]:
-        """[(ts, цена)] всех снапшотов позиции по времени — спарклайн сводки дня."""
-        cur = self.conn.execute("SELECT ts, price FROM position_snapshots WHERE position_id=? "
-                                "AND price IS NOT NULL ORDER BY ts", (position_id,))
+        """[(день закрытия, цена)] всех снапшотов позиции по порядку — спарклайн сводки дня."""
+        cur = self.conn.execute(f"SELECT {_SNAP_KEY}, price FROM position_snapshots "
+                                f"WHERE position_id=? AND price IS NOT NULL "
+                                f"ORDER BY {_SNAP_KEY}, ts, rowid", (position_id,))
         return [(r[0], r[1]) for r in cur.fetchall()]
 
     def closed_since(self, ts: float) -> list[dict[str, Any]]:
@@ -238,7 +310,7 @@ class PositionStore:
             "base_delta, ts, order_id, position_id, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (f["exec_id"], f["venue"], f["symbol"], f["side"], f["price"], f["qty"],
              f["fee_usdt"], f["base_delta"], f["ts"], f.get("order_id", ""), position_id, note))
-        self.conn.commit()
+        self._commit()
 
     def fills(self, position_id: int | None = None) -> list[dict[str, Any]]:
         if position_id is None:
@@ -258,16 +330,63 @@ class PositionStore:
         self.conn.execute(
             "INSERT INTO position_events(position_id, ts, type, note) VALUES (0,?,?,?)",
             (ts if ts is not None else time.time(), name, note))
-        self.conn.commit()
+        self._commit()
+
+    def set_watch_state(self, position_id: int, last_close_ts: float, hwm: float,
+                        trail_armed_ts: float | None) -> None:
+        """Итог оценки закрытия: что оценено, максимум, защёлка трейла."""
+        self.conn.execute("UPDATE positions SET last_close_ts=?, hwm=?, trail_armed_ts=? "
+                          "WHERE id=?", (last_close_ts, hwm, trail_armed_ts, position_id))
+        self._commit()
+
+    # --- очередь уведомлений (доставка с повтором) ---
+    def enqueue(self, kind: str, position_id: int | None, close_ts: float | None,
+                payload: dict[str, Any]) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO notify_outbox(kind, position_id, close_ts, payload, created_ts) "
+            "VALUES (?,?,?,?,?)",
+            (kind, position_id, close_ts,
+             json.dumps(payload, ensure_ascii=False, default=_json_default), time.time()))
+        self._commit()
+        return int(cur.lastrowid)
+
+    def outbox_pending(self, kind: str) -> list[dict[str, Any]]:
+        """Недоставленные по порядку: [{id, position_id, close_ts, tries, payload}]."""
+        cur = self.conn.execute(
+            "SELECT id, position_id, close_ts, tries, payload FROM notify_outbox "
+            "WHERE kind=? AND sent_ts IS NULL ORDER BY id", (kind,))
+        out = []
+        for r in cur.fetchall():
+            d = _row_to_dict(cur, r)
+            try:
+                d["payload"] = json.loads(d["payload"])
+            except ValueError:
+                d["payload"] = {}
+            out.append(d)
+        return out
+
+    def outbox_count(self, kind: str) -> int:
+        cur = self.conn.execute("SELECT COUNT(*) FROM notify_outbox WHERE kind=? AND "
+                                "sent_ts IS NULL", (kind,))
+        return int(cur.fetchone()[0])
+
+    def outbox_mark(self, item_id: int, delivered: bool, error: str = "") -> None:
+        if delivered:
+            self.conn.execute("UPDATE notify_outbox SET sent_ts=?, tries=tries+1, last_error='' "
+                              "WHERE id=?", (time.time(), item_id))
+        else:
+            self.conn.execute("UPDATE notify_outbox SET tries=tries+1, last_error=? WHERE id=?",
+                              (error[:300], item_id))
+        self._commit()
 
     def update_hwm(self, position_id: int, hwm: float) -> None:
         self.conn.execute("UPDATE positions SET hwm=? WHERE id=?", (hwm, position_id))
-        self.conn.commit()
+        self._commit()
 
     def set_base_low(self, position_id: int, base_low: float) -> None:
         self.conn.execute("UPDATE positions SET base_low=? WHERE id=?",
                           (base_low, position_id))
-        self.conn.commit()
+        self._commit()
 
     def get(self, position_id: int) -> dict[str, Any] | None:
         cur = self.conn.execute("SELECT * FROM positions WHERE id=?", (position_id,))
@@ -275,7 +394,7 @@ class PositionStore:
         return _row_to_dict(cur, row) if row else None
 
     def sell(self, position_id: int, sold_qty: float, price: float, reason: str,
-             note: str = "", fee: float = 0.0015) -> float:
+             note: str = "", fee: float = 0.0015, close_ts: float | None = None) -> float:
         """Продажа части/всей позиции с учётом realized P&L net-of-fees. Ядро для
         paper-executor, лестницы, ручного pos reduce/close. Закрывает при qty≈0.
         Возвращает realized_delta USDT."""
@@ -298,7 +417,8 @@ class PositionStore:
              time.time() if closed else pos["closed_ts"],
              position_id))
         self.record_event(position_id, reason, price,
-                          note or f"продано {sold_qty:.6g} @ {price:.6g}, realized {realized:+.2f}")
+                          note or f"продано {sold_qty:.6g} @ {price:.6g}, realized {realized:+.2f}",
+                          close_ts=close_ts)
         return realized
 
     def close(self, position_id: int, exit_price: float, note: str = "",
@@ -327,11 +447,13 @@ class PositionStore:
 
     # --- события (журнал + идемпотентность алертов) ---
     def record_event(self, position_id: int, etype: str,
-                     price: float | None = None, note: str = "") -> None:
+                     price: float | None = None, note: str = "",
+                     close_ts: float | None = None) -> None:
+        """close_ts — дневное закрытие, на котором сработал сигнал (watch); ручные и sync — None."""
         self.conn.execute(
-            "INSERT INTO position_events(position_id, ts, type, price, note) VALUES (?,?,?,?,?)",
-            (position_id, time.time(), etype, price, note))
-        self.conn.commit()
+            "INSERT INTO position_events(position_id, ts, type, price, note, close_ts) "
+            "VALUES (?,?,?,?,?,?)", (position_id, time.time(), etype, price, note, close_ts))
+        self._commit()
 
     def event_types(self, position_id: int) -> set[str]:
         cur = self.conn.execute(
@@ -358,6 +480,12 @@ class PositionStore:
 
     def close_db(self) -> None:
         self.conn.close()
+
+
+def _json_default(o):
+    if isinstance(o, (set, frozenset)):
+        return sorted(o)
+    raise TypeError(f"{type(o).__name__} не сериализуется")
 
 
 def risk_check(open_positions: list[dict], new_value_usdt: float, cfg,

@@ -879,8 +879,14 @@ def test_sources_parse(cfg, failures: list[str]) -> None:
 
 def test_entry_quality(cfg, failures: list[str]) -> None:
     print("Stage 4b — качество пружины (feature_study):")
+    import copy
+    from scanner.config import Config
     from scanner.stages.entry_quality import spring_quality
     from scanner.stages.score import _sub_zone
+    # Шкала BTC-dd и нейтральность без данных — на источнике btc (прод — alt, ниже отдельно).
+    d = copy.deepcopy(cfg._d)
+    d["stage4b_quality"]["market_dd_source"] = "btc"
+    cfg_alt, cfg = cfg, Config(d)
 
     # Сильная: рынок на дне (BTC −60%), длинная база, объём в полосе.
     good = Candidate(source="t", track="A", symbol="G", zone="ПРУЖИНА/ДНО",
@@ -918,6 +924,14 @@ def test_entry_quality(cfg, failures: list[str]) -> None:
                    funding_rate=0.001)
     me, _ = spring_quality(fe, cfg)
     _check("положительный фандинг на пружине -> штраф (<1)", me < 1.0, failures)
+
+    # Источник alt (прод): данных альт-рынка нет/устарели -> множитель контекста по минимуму,
+    # а не откат на BTC-dd в другой шкале (на 03.10 +29% и 6 пружин ≥70 вместо 1).
+    lo = cfg_alt.get("stage4b_quality.btc_dd_min_mult", 0.6)
+    ma, na = spring_quality(Candidate(source="t", track="A", symbol="N", zone="ПРУЖИНА/ДНО",
+                                      market_dd=0.60), cfg_alt)
+    _check("alt без данных рынка: множитель = минимум, BTC −60% не поднимает",
+           abs(ma - lo) < 1e-9 and any("нет свежих данных рынка" in n for n in na), failures)
 
 
 def test_market_regime(cfg, failures: list[str]) -> None:
@@ -957,8 +971,17 @@ def test_market_regime(cfg, failures: list[str]) -> None:
     top, nt = sq(alt_market_dd=0.20, market_dd=0.60)
     _check("источник alt: альты −70% > альты −20% (BTC игнорируется)", bottom > 1.1 > 0.7 > top, failures)
     _check("заметка про альт-рынок на дне", any("альт-рынок на дне" in n for n in nb), failures)
-    fb, _ = sq(market_dd=0.60)
-    _check("нет alt_dd -> фолбэк на BTC-dd", fb > 1.1, failures)
+    fb, nfb = sq(market_dd=0.60)
+    _check("нет alt_dd -> множитель контекста по минимуму, не BTC-dd",
+           fb == cfg.get("stage4b_quality.btc_dd_min_mult", 0.6)
+           and any("нет свежих данных рынка" in n for n in nfb), failures)
+    import copy
+    from scanner.config import Config
+    d_off = copy.deepcopy(cfg._d)
+    d_off["market_regime"]["enabled"] = False
+    fb_off, _ = spring_quality(Candidate(source="t", track="A", symbol="Q", zone="ПРУЖИНА/ДНО",
+                                         market_dd=0.60), Config(d_off))
+    _check("контекст рынка выключен в конфиге -> прежний откат на BTC-dd", fb_off > 1.1, failures)
     cold, _ = sq(alt_market_dd=0.5)
     warm, nw = sq(alt_market_dd=0.5, market_hot_score=0.125, market_hot_lit=["fng30"])
     hotm, nh = sq(alt_market_dd=0.5, market_hot_score=0.375,
@@ -1579,6 +1602,338 @@ def test_exit_alert_format(cfg, failures: list[str]) -> None:
     _check("итоговая: заголовок ИТОГОВАЯ", "ИТОГОВАЯ за 4" in ms, failures)
     _check("итоговая: кумулятив пружин", "34" in ms, failures)
     _check("итоговая: call-to-decide про капитал", "capital_usdt" in ms, failures)
+
+
+def test_watch_data(cfg, failures: list[str]) -> None:
+    print("Блок A — watch по закрытиям с датой (Bybit/CoinGecko), доставка, данные скана:")
+    import copy
+    import os
+    import sqlite3
+    import tempfile
+    from scanner import closes, pipeline, regime, sync
+    from scanner.config import Config
+    from scanner.notify import deliver, telegram as tg
+    from scanner.sources import bybit as by, coingecko as cg, funding as fnd, market as mk
+    D0 = 1790812800                       # 2026-10-01 00:00 UTC
+    DAY = 86400
+
+    def D(n):
+        return D0 + n * DAY
+
+    # --- источники закрытий (чистые функции) ---
+    chart = {"ts": [D(1), D(2), D(3), D(3) + 6 * 3600], "prices": [1.0, 1.1, 1.2, 9.9],
+             "volumes": [5, 6, 7, 8], "mcaps": [None] * 4}
+    s = closes.from_coingecko(chart)
+    _check("CoinGecko: живой тик отброшен, close_ts = точка 00:00",
+           s["close_ts"] == [D(1), D(2), D(3)] and s["prices"] == [1.0, 1.1, 1.2], failures)
+    b = closes.from_bybit({"ts": [D(1), D(2)], "c": [2.0, 2.1], "qv": [10, 11]})
+    _check("Bybit: close_ts = старт свечи + 1 день", b["close_ts"] == [D(2), D(3)], failures)
+    _check("подпись дня закрытия: close_ts 00:00 03.10 -> «02.10»",
+           closes.close_label(D(2)) == "02.10", failures)
+    _check("возраст замёрзшего графика (последняя точка 9 дней назад) = 9",
+           closes.chart_age_days(chart, D(12) + 3600) == 9, failures)
+
+    calls = []
+    real_ohlcv, real_chart = by.fetch_daily_ohlcv, cg.fetch_market_chart
+
+    def bybit_ok(http, pair, limit=400):
+        calls.append(("bybit", pair))
+        return {"ts": [D(i) for i in range(-40, 7)], "c": [1.0] * 47, "qv": [1.0] * 47,
+                "o": [], "h": [], "l": [], "v": []}
+
+    def cg_chart(http, coin_id, days, demo=""):
+        calls.append(("cg", coin_id))
+        pts = [D(i) for i in range(-40, 7)]           # 06.10 точки 07.10 00:00 ещё нет
+        return {"ts": pts + [D(6) + 22000], "prices": [1.0] * 47 + [1.3],
+                "volumes": [1.0] * 48, "mcaps": [None] * 48}
+    try:
+        by.fetch_daily_ohlcv, cg.fetch_market_chart = bybit_ok, cg_chart
+        r1 = closes.load(None, {"symbol": "GRAM", "venue": "Bybit spot", "coin_id": "x"},
+                         now=D(7) + 22000)
+        _check("пара Bybit свежая -> Bybit, CoinGecko не спрашиваем",
+               r1["src"] == "Bybit" and r1["lag_days"] == 0 and calls == [("bybit", "GRAMUSDT")],
+               failures)
+        calls.clear()
+        by.fetch_daily_ohlcv = lambda http, pair, limit=400: {"ts": [], "c": [], "qv": []}
+        r2 = closes.load(None, {"symbol": "GRAM", "venue": "bybit", "coin_id": "x"},
+                         now=D(7) + 22000)
+        _check("Bybit пуст -> CoinGecko, отставание 1 день и пометка «ещё не вышло»",
+               r2["src"] == "CoinGecko" and r2["lag_days"] == 1
+               and "ещё не вышло" in r2["note"] and "Bybit GRAMUSDT" in r2["note"], failures)
+        r3 = closes.load(None, {"symbol": "DEXC", "venue": "DEX only", "coin_id": ""},
+                         now=D(7) + 22000)
+        _check("нет ни Bybit, ни coin_id -> пусто с причиной",
+               not r3["prices"] and "coin_id" in r3["note"], failures)
+    finally:
+        by.fetch_daily_ohlcv, cg.fetch_market_chart = real_ohlcv, real_chart
+
+    # Дневные свечи Bybit — без кэша (кэш до 00:00 отдал бы живую свечу закрытой).
+    seen = {}
+
+    class _H:
+        def get_json(self, url, params=None, headers=None, use_cache=True, retries=5):
+            seen["use_cache"] = use_cache
+            return {"result": {"list": []}}
+    by.fetch_daily_ohlcv(_H(), "GRAMUSDT", 10)
+    c1 = seen.pop("use_cache")
+    by.fetch_daily_closes(_H(), "BTCUSDT", 10)
+    _check("свечи D Bybit (ohlcv и closes) — без кэша", c1 is False and seen["use_cache"] is False,
+           failures)
+
+    # Фандинг приводится к 8ч по fundingIntervalHour.
+    fm = fnd.parse_funding({"result": {"list": [
+        {"symbol": "MEMEUSDT", "fundingRate": "0.0003", "fundingIntervalHour": "4"},
+        {"symbol": "BTCUSDT", "fundingRate": "0.0001", "fundingIntervalHour": "8"},
+        {"symbol": "OLDUSDT", "fundingRate": "0.0002"}]}})
+    _check("фандинг 4ч ×2 к 8ч, 8ч и без поля — как есть",
+           abs(fm["MEME"] - 0.0006) < 1e-12 and abs(fm["BTC"] - 0.0001) < 1e-12
+           and abs(fm["OLD"] - 0.0002) < 1e-12, failures)
+
+    # --- run_watch на подменённых источниках ---
+    e = cfg["stage8_exit"]
+    with tempfile.TemporaryDirectory() as tmp:
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {**d["output"], "db_path": os.path.join(tmp, "t.db"),
+                       "watchlist_json": os.path.join(tmp, "wl.json")}
+        d["market_regime"]["enabled"] = False
+        d["stage6_telegram"]["charts"] = False
+        d["api_keys"]["dune"] = ""
+        c = Config(d)
+        db = d["output"]["db_path"]
+        series: dict[str, dict[int, float]] = {}       # coin_id -> {точка 00:00: цена}
+        live_now = {"t": 0}
+
+        def fake_chart(http, coin_id, days, demo=""):
+            if coin_id == "boom":
+                raise RuntimeError("битый ответ")
+            pts = sorted((t, p) for t, p in series.get(coin_id, {}).items() if t <= live_now["t"])
+            ts = [t for t, _ in pts] + [live_now["t"]]          # + живой тик
+            pr = [p for _, p in pts] + [pts[-1][1] if pts else 1.0]
+            return {"ts": ts, "prices": pr, "volumes": [1e6] * len(ts), "mcaps": [None] * len(ts)}
+
+        real_fund, real_dune = pipeline.fetch_funding_map, pipeline.dune.fetch_onchain
+
+        def watch(at):
+            live_now["t"] = at
+            return pipeline.run_watch(c, now=at, http=object())
+
+        try:
+            cg.fetch_market_chart = fake_chart
+            pipeline.fetch_funding_map = lambda http: {}
+            pipeline.dune.fetch_onchain = lambda cfg_: {}
+            ps = PositionStore(db)
+            # 1) Пропуск точки CoinGecko: стоп из закрытия, которое ни разу не было последним.
+            pa = ps.add("TST", 1.0, 100, coin_id="tst", paper=True, base_low=1.0,
+                        entry_ts=D(-60) + 7 * 3600)
+            pb = ps.add("TST", 1.0, 100, coin_id="tst", paper=True, base_low=1.0,
+                        entry_ts=D(-60) + 7 * 3600, variant="B", twin_of=pa)
+            ps.close_db()
+            series["tst"] = {D(i): 0.95 for i in range(-90, 6)}
+            series["tst"].update({D(6): 0.70, D(8): 0.80})          # D(7)=0.72 придёт позже
+            out1 = watch(D(6) + 22800)
+            row1 = next(r for r in out1["rows"] if r["position"]["id"] == pa)
+            _check("прогон 1: переоценка с входа, одно закрытие ниже пола — стопа нет",
+                   not row1["signals"] and row1["new_closes"] > 30, failures)
+            out2 = watch(D(7) + 22800)                    # точки D(7) ещё нет
+            row2 = next(r for r in out2["rows"] if r["position"]["id"] == pa)
+            _check("прогон 2: закрытия дня нет -> ничего не оценено, отставание 1 день",
+                   row2["new_closes"] == 0 and row2["lag_days"] == 1 and not row2["signals"],
+                   failures)
+            st2 = deliver.brief_state(c, now=D(7) + 23400, watch_exit=0)
+            txt2 = tg.strip_html(tg.format_brief(st2, c, now=D(7) + 23400))
+            _check("сводка: позиция помечена «⚠ цена на <день последнего закрытия>»",
+                   f"⚠ цена на {closes.close_label(D(6))}" in txt2, failures)
+            series["tst"][D(7)] = 0.72
+            out3 = watch(D(8) + 22800)
+            ps = PositionStore(db)
+            ev = [x for x in ps.events(pa) if x["type"] == "invalidation"]
+            _check("прогон 3: стоп по закрытию D(7) 0.72 (2 подряд ниже пола 0.75), не по 0.80",
+                   len(ev) == 1 and ev[0]["close_ts"] == D(7) and abs(ev[0]["price"] - 0.72) < 1e-9,
+                   failures)
+            _check("paper A исполнена по 0.72 и закрыта, D(8) после выхода не оценивался",
+                   ps.get(pa)["status"] == "closed" and abs(ps.get(pa)["exit_price"] - 0.72) < 1e-9
+                   and ps.get(pa)["last_close_ts"] == D(7), failures)
+            _check("снапшоты — по одному на закрытие, с close_ts",
+                   len({t for t, _ in ps.snapshot_prices(pa)}) == len(ps.snapshot_prices(pa))
+                   and ps.last_snapshots()[pa]["close_ts"] == D(7), failures)
+            _check("очередь: карточка только у A (близнец B — тихо)",
+                   [x["position_id"] for x in ps.outbox_pending("exit")] == [pa]
+                   and "invalidation" in ps.event_types(pb), failures)
+            ps.close_db()
+            # доставка: сбой -> остаётся в очереди, сводка предупреждает; успех -> снята
+            sent_cards = []
+            r_fail = deliver.flush_exit_outbox(c, None, send=lambda cfg_, card: False)
+            st_f = deliver.brief_state(c, now=D(8) + 23400, watch_exit=3)
+            txt_f = tg.strip_html(tg.format_brief(st_f, c, now=D(8) + 23400))
+            r_ok = deliver.flush_exit_outbox(c, None,
+                                             send=lambda cfg_, card: sent_cards.append(card) or True)
+            ps = PositionStore(db)
+            _check("Telegram не принял -> (0, 1), карточка в очереди, сводка: «не доставлено»",
+                   r_fail == (0, 1) and "не доставлено карточек выхода: 1" in txt_f, failures)
+            _check("повтор доставки -> ушла карточка закрытия D(7), очередь пуста",
+                   r_ok == (1, 0) and ps.outbox_count("exit") == 0 and sent_cards
+                   and f"({closes.close_label(D(7))})" in sent_cards[0]["text"], failures)
+
+            # 2) День 0: покупка 06:00, закрытие 00:00 до покупки — не сравнивается.
+            p0 = ps.add("CRSH", 0.60, 100, coin_id="crsh", paper=True,
+                        entry_ts=D(8) + 6 * 3600)
+            ps.close_db()
+            series["crsh"] = {D(i): 1.0 for i in range(-40, 8)}
+            series["crsh"][D(8)] = 0.60
+            out4 = watch(D(8) + 22800)
+            r0 = next(r for r in out4["rows"] if r["position"]["id"] == p0)
+            ps = PositionStore(db)
+            _check("день 0: закрытие до входа не оценивается (нет лестницы/стопа, нет снапшота)",
+                   not r0["signals"] and r0["new_closes"] == 0 and p0 not in ps.last_snapshots(),
+                   failures)
+            st0 = deliver.brief_state(c, now=D(8) + 23400, watch_exit=0)
+            row0 = next(r for r in st0["positions"] if r["position"]["id"] == p0)
+            _check("сводка: новая позиция — цена входа и пометка, а не «⚠ без цены»",
+                   row0.get("pnl") and "первое закрытие" in (row0.get("note") or ""), failures)
+
+            # 3) Докупка вниз: старый максимум не взводит трейл на убыточной позиции.
+            pm = ps.add("DCA", 1.0, 10, coin_id="dca", base_low=0.5, entry_ts=D(-30))
+            ps.set_watch_state(pm, D(10), 1.5, None)        # пик 1.5 был до докупки, не взведён
+            ps.merge(pm, 0.5, 30)                           # средняя 0.625
+            ps.close_db()
+            series["dca"] = {D(i): 1.0 for i in range(-60, 11)}
+            series["dca"].update({D(11): 0.70, D(12): 1.05, D(13): 0.70})
+            watch(D(11) + 22800)
+            ps = PositionStore(db)
+            _check("докупка: закрытие 0.70 при старом пике 1.5 — трейла нет, не взведён",
+                   "trailing" not in ps.event_types(pm) and ps.get(pm)["trail_armed_ts"] is None,
+                   failures)
+            ps.close_db()
+            watch(D(13) + 22800)
+            ps = PositionStore(db)
+            tr = [x for x in ps.events(pm) if x["type"] == "trailing"]
+            arm_ok = ps.get(pm)["trail_armed_ts"] == D(12)
+            _check("взвод фактом закрытия 1.05 ≥ +60% от средней, трейл −33% от него на D(13)",
+                   arm_ok and len(tr) == 1 and tr[0]["close_ts"] == D(13), failures)
+            # 4) Сбой одной позиции не роняет watch.
+            ps.add("BAD", 1.0, 10, coin_id="boom", entry_ts=D(-30))
+            pg = ps.add("GOOD", 1.0, 10, coin_id="good", base_low=0.9, entry_ts=D(-30))
+            # снапшот старого формата (до close_ts) за тот же день, с ценой «не того» дня
+            ps.snapshot(pg, 9.99, 0.0, 9.99, ts=D(14) + 22000)
+            ps.close_db()
+            series["good"] = {D(i): 1.0 for i in range(-60, 15)}
+            out5 = watch(D(14) + 22800)
+            good = next(r for r in out5["rows"] if r["position"]["id"] == pg)
+            bad = next(r for r in out5["rows"] if r["position"]["symbol"] == "BAD")
+            _check("сбой источника одной позиции: строка с ошибкой, остальные посчитаны",
+                   good.get("pnl") and bad.get("error") and out5["summary"]["errors"] == 1,
+                   failures)
+            ps = PositionStore(db)
+            sp = ps.snapshot_prices(pg)
+            _check("миграция: старый снапшот дня заменён снапшотом закрытия (без двойников)",
+                   9.99 not in [x for _, x in sp] and len({t for t, _ in sp}) == len(sp)
+                   and dict(sp).get(D(14)) == 1.0, failures)
+            ps.close_db()
+            ps = PositionStore(db)
+            n_ev, n_snap = len(ps.events(pg)), len(ps.snapshot_prices(pg))
+            ps.close_db()
+            out6 = watch(D(14) + 23000)                      # повторный прогон того же дня
+            ps = PositionStore(db)
+            _check("повтор прогона: ни событий, ни снапшотов не прибавилось",
+                   len(ps.events(pg)) == n_ev and len(ps.snapshot_prices(pg)) == n_snap
+                   and next(r for r in out6["rows"] if r["position"]["id"] == pg)["new_closes"] == 0,
+                   failures)
+            ps.close_db()
+        finally:
+            cg.fetch_market_chart = real_chart
+            pipeline.fetch_funding_map, pipeline.dune.fetch_onchain = real_fund, real_dune
+
+        # 5) sync: позиция и exchange_fills — одной транзакцией.
+        ps = PositionStore(os.path.join(tmp, "s.db"))
+        fill = {"exec_id": "E1", "venue": "bybit", "symbol": "LINK", "pair": "LINKUSDT",
+                "side": "buy", "price": 10.0, "qty": 5.0, "value": 50.0, "fee_usdt": 0.05,
+                "fee_rate": 0.001, "base_delta": 5.0, "ts": 1.76e9, "order_id": "o1"}
+        orig = PositionStore.record_fill
+
+        def boom(self, *a, **k):
+            raise sqlite3.OperationalError("database is locked")
+        PositionStore.record_fill = boom
+        try:
+            sync.apply_fills(ps, [fill], lambda s_: {"coin_id": "chainlink"})
+            raised = False
+        except sqlite3.OperationalError:
+            raised = True
+        finally:
+            PositionStore.record_fill = orig
+        _check("sync: сбой записи исполнения -> позиция тоже откатилась",
+               raised and ps.find_open_real("LINK") is None, failures)
+        sync.apply_fills(ps, [fill], lambda s_: {"coin_id": "chainlink"})
+        _check("sync: следующий прогон применяет покупку один раз (5, не 10)",
+               ps.find_open_real("LINK")["qty"] == 5.0 and len(ps.fills()) == 1, failures)
+        ps.close_db()
+
+    # --- Telegram: повторы ---
+    real_post, real_sleep = tg._post, tg._sleep
+    script, waits = [], []
+    tg._sleep = waits.append
+    tg._post = lambda token, method, data, ctype, timeout=30: script.pop(0)
+    try:
+        script[:] = [None, {"ok": False, "error_code": 502, "description": "Bad Gateway"},
+                     {"ok": True}]
+        ok3 = tg.send_message("T", "C", "x")
+        left3, w3 = len(script), list(waits)
+        waits.clear()
+        script[:] = [{"ok": False, "error_code": 400, "description": "chat not found"}, {"ok": True}]
+        ok4 = tg.send_message("T", "C", "x")
+        left4 = len(script)
+        script[:] = [{"ok": False, "error_code": 429, "parameters": {"retry_after": 20}},
+                     {"ok": True}]
+        waits.clear()
+        ok5 = tg.send_message("T", "C", "x")
+    finally:
+        tg._post, tg._sleep = real_post, real_sleep
+    _check("Telegram: сеть/502 -> повтор, третья попытка дошла", ok3 and left3 == 0
+           and w3 == [3.0, 10.0], failures)
+    _check("Telegram: 400 (ошибка запроса) — без повтора", not ok4 and left4 == 1, failures)
+    _check("Telegram: 429 -> ждём retry_after+1", ok5 and waits == [21.0], failures)
+
+    # --- выходной контур: None и затёртый индекс перегрева ---
+    pos = {"entry_price": 1.0, "base_low": 0.5, "qty": 10}
+    try:
+        sg = exit_stage.evaluate_exit(pos, 1.2, 1.2, {"funding_rate": 0.001}, set(), cfg)
+        crash = False
+    except TypeError:
+        sg, crash = [], True
+    _check("фандинг-эйфория без индикаторов зоны (<15 закрытий) — не падает",
+           not crash and any(x["type"] == "peak_zone" and "фандинг" in x["note"] for x in sg),
+           failures)
+    sh = exit_stage.evaluate_exit(pos, 1.2, 1.2, {"pct_above_sma": 50, "range_pos": 0.95},
+                                  set(), cfg, market={"hot_score": 0.5, "lit": ["fng30"]})
+    mh = next((x for x in sh if x["type"] == "market_hot"), None)
+    _check("перегрев рынка после зоны распределения: «индекс перегрева 50%», не 100/0%",
+           mh is not None and "индекс перегрева 50%" in mh["note"], failures)
+
+    # --- скан: тикер Bybit, стейблы, alt_dd, свежесть рынка ---
+    _check("Bybit: цена совпала -> та же монета", pipeline.bybit_identity(
+        "MEME", {"MEME"}, {"MEME": 0.0057}, 0.0056) == "", failures)
+    _check("Bybit: цены разошлись -> bybit_ticker_mismatch", pipeline.bybit_identity(
+        "MEME", {"MEME"}, {"MEME": 0.0057}, 0.9) == "bybit_ticker_mismatch", failures)
+    _check("Bybit: цены CoinGecko нет (MEMETOON) -> bybit_unverified, не наследует Bybit",
+           pipeline.bybit_identity("MEME", {"MEME"}, {"MEME": 0.0057}, None)
+           == "bybit_unverified", failures)
+    llama = {D(i): 311e9 for i in range(-5, 1)}
+    cm = {D(i): 254e9 for i in range(-400, 1)}
+    _check("стейблы: DefiLlama есть -> её значение", mk.merge_stables(llama, cm, D(-3))[D(0)]
+           == 311e9, failures)
+    _check("стейблы: DefiLlama не ответила -> не пишем (CoinMetrics не подменяет)",
+           mk.merge_stables({}, cm, D(-3)) == {}, failures)
+    m10 = mk.merge_stables(llama, cm, D(-10))           # окно с since − 1 день
+    _check("стейблы: CoinMetrics — только дни до начала ряда DefiLlama",
+           set(m10) == {D(i) for i in range(-11, 1)} and m10[D(-6)] == 254e9
+           and m10[D(-5)] == 311e9, failures)
+    rows = [{"day": D(i), "total_mcap": 3000.0, "btc_dominance": 50.0, "stables_usd": 100.0}
+            for i in range(-99, 1)]
+    _check("alt_dd: 100 дней истории < 365 -> нет (не «рынок у хаёв»)",
+           "alt_dd" not in regime.market_context(rows, cfg), failures)
+    ctx = {"day": D(0), "alt_dd": 0.5}
+    _check("контекст рынка: 2 дня — свежий, 5 дней — не используется",
+           regime.fresh_context(ctx, cfg, D(2) + 3600) == ctx
+           and regime.fresh_context(ctx, cfg, D(5) + 3600) == {}, failures)
 
 
 def test_benchmark(cfg, failures: list[str]) -> None:
@@ -3158,6 +3513,8 @@ def main() -> int:
     test_positions_store(cfg, failures)
     print()
     test_exit_alert_format(cfg, failures)
+    print()
+    test_watch_data(cfg, failures)
     print()
     test_benchmark(cfg, failures)
     print()

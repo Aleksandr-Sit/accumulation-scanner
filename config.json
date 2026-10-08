@@ -52,6 +52,8 @@
   "stage4_zone": {
     "enabled": true,
     "price_history_days": 180,
+    "_chart_age_note": "Зона считается по закрытым дневным точкам CoinGecko (живой тик отброшен, как в бэктестах). Последнее закрытие старше max_chart_age_days — ряд замёрз (memetoon до 02.09): зона не считается, флаг stale_chart.",
+    "max_chart_age_days": 3,
     "recent_days": 30,
     "sma_days": 50,
     "vol_contraction_ratio": 0.7,
@@ -128,6 +130,9 @@
     "update_min_interval_hours": 6,
     "update_lookback_days": 10,
     "breadth_top_n": 150,
+    "_age_note": "max_age_days: последний день данных альт-рынка старше — контекст в скане и watch не используется (как будто данных нет: множитель качества пружины по минимуму, без сужения трейла); alt_dd_min_days: просадка альт-рынка от ATH считается только при истории ≥ стольких дней (на 90/10/1 дне ATH окна ≈ текущий уровень, alt_dd ≈ 0 — ложный «рынок у хаёв»).",
+    "max_age_days": 3,
+    "alt_dd_min_days": 365,
     "hot_min_available": 4,
     "hot_flags": {
       "alt_vs_sma200": [">=", 0.40, 0.30],

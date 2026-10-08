@@ -18,7 +18,7 @@ from .sources.bybit import (fetch_spot_basecoins, fetch_daily_closes, fetch_spot
                             same_coin)
 from .sources.funding import fetch_funding_map
 from .sources import github
-from . import regime
+from . import closes, regime
 from .stages import (antirug, entry_quality, exit as exit_stage, fundamentals,
                     liveness, onchain, zone, score)
 from .sources import dune
@@ -130,7 +130,12 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
     # Контекст рынка альтов (market_daily): до ингеста, чтобы бэкфилл при первом
     # запуске не делил rate-limit с CoinGecko. Сбой источника -> {} (скан идёт дальше).
     from .sources import market
-    mctx = market.load_context(cfg, http, store)
+    unavailable: set[str] = set()
+    raw_ctx = market.load_context(cfg, http, store)
+    # Устаревший контекст (источник молчит дольше max_age_days) — как будто данных нет.
+    mctx = regime.fresh_context(raw_ctx, cfg, time.time())
+    if raw_ctx and not mctx:
+        unavailable.add("market")
     mhot = mctx.get("hot") or {}
 
     ingested = stage0_ingest(cfg, http, track)
@@ -168,10 +173,10 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
     n_zone = 0
     n_dev = 0
     btc_regime: dict = {"regime": "?"}
-    unavailable: set[str] = set()
     if cfg.get("stage4_zone.enabled", True) and watchlist:
         demo = cfg.get("api_keys.coingecko_demo", "")
-        days = cfg["stage4_zone"]["price_history_days"]
+        z_cfg = cfg["stage4_zone"]
+        days = z_cfg["price_history_days"]
         recent = cfg["stage4_zone"]["recent_days"]
         sma = cfg["stage4_zone"]["sma_days"]
         bybit_spot = fetch_spot_basecoins(http)
@@ -195,8 +200,17 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
 
         live_on = cfg.get("stage3b_liveness.enabled", True)
         kept: list[Candidate] = []
+        max_chart_age = z_cfg.get("max_chart_age_days", 3)
         for c in watchlist:
-            chart = coingecko.fetch_market_chart(http, c.coin_id, days, demo)
+            # Только закрытые дневные точки (как в бэктестах): живой тик сдвигал тренд,
+            # диапазон и SMA на внутридневное движение.
+            chart = coingecko.closed_daily(coingecko.fetch_market_chart(http, c.coin_id, days, demo))
+            age = closes.chart_age_days(chart, t0)
+            stale = age is not None and age > max_chart_age
+            if stale:
+                # Замёрзший ряд (монета умирает, CoinGecko перестал считать) — не «текущий».
+                c.flags.append("stale_chart")
+                chart = {"ts": [], "prices": [], "volumes": [], "mcaps": []}
             c.indicators = zone.compute_indicators(
                 chart["prices"], recent, sma, chart["volumes"]) or {}
             # Stage 3b — живость: dev-активность + широта листингов + wash-ratio.
@@ -211,6 +225,9 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
                 n_dev += c.dev_commits_4w is not None or c.dev_last_commit_days is not None
             c.zone, c.zone_signals = zone.classify_zone(
                 c.indicators or None, c.drawdown_from_ath_pct, cfg)
+            if stale:
+                c.zone_signals.append(f"⚠ график CoinGecko не обновлялся {age} дн. — "
+                                      f"зона не считается")
             if extras:
                 coin_context.annotate(c, extras, cfg, chart["prices"], chart.get("mcaps"))
 
@@ -225,10 +242,13 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
             c.market_hot_lit = list(mhot.get("lit") or [])
             sym = c.symbol.upper()
             # Тикер совпал, а цена Bybit расходится с CoinGecko больше чем на 25% — это
-            # другая монета под тем же символом: не Bybit spot и не её фандинг.
-            mismatch = sym in bybit_spot and same_coin(bybit_px.get(sym), c.price_usd) is False
+            # другая монета под тем же символом: не Bybit spot и не её фандинг. Сравнить не
+            # с чем (нет цены одной из сторон, MEMETOON без цены CoinGecko унаследовал Bybit
+            # MEME) — тоже не Bybit: исполнитель купил бы по тикеру чужую монету.
+            bybit_flag = bybit_identity(sym, bybit_spot, bybit_px, c.price_usd)
+            mismatch = bool(bybit_flag)
             if mismatch:
-                c.flags.append("bybit_ticker_mismatch")
+                c.flags.append(bybit_flag)
             c.funding_rate = None if mismatch else funding.get(sym)
             # On-chain накопление (Dune): по адресу, затем по symbol; наполняет блок onchain.
             oc = onchain.match_onchain(onchain_map, c.symbol, c.address)
@@ -319,6 +339,20 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
     return summary
 
 
+def bybit_identity(sym: str, bybit_spot: set[str], bybit_px: dict[str, float],
+                   price: float | None) -> str:
+    """Тикер есть на Bybit spot — та же ли монета? '' — да или тикера на Bybit нет;
+    'bybit_ticker_mismatch' — цены разошлись > 25% (другая монета); 'bybit_unverified' —
+    сравнить не с чем (нет цены одной из сторон): MEMETOON без цены CoinGecko унаследовал
+    Bybit MEME — исполнитель купил бы по тикеру чужую монету, поэтому тоже «не Bybit»."""
+    if sym not in bybit_spot:
+        return ""
+    verdict = same_coin(bybit_px.get(sym), price)
+    if verdict is True:
+        return ""
+    return "bybit_ticker_mismatch" if verdict is False else "bybit_unverified"
+
+
 def load_watchlist(path: str) -> list[Candidate]:
     """watchlist.json -> кандидаты (все поля модели, что есть в файле). Для Telegram и
     команд, которые работают по итогам последнего скана без сети."""
@@ -398,22 +432,25 @@ def _open_paper_positions(cfg: Config, watchlist: list[Candidate],
     return opened
 
 
-def run_watch(cfg: Config) -> dict:
-    """Stage 7-8: обход открытых позиций -> exit-сигналы. Дёшево: 1 вызов/позицию.
+def run_watch(cfg: Config, *, now: float | None = None, http: HttpClient | None = None) -> dict:
+    """Stage 7-8: обход открытых позиций -> exit-сигналы.
 
-    Возвращает {"rows": [{position, pnl, held_days, signals}], "summary": {...}}.
-    Идемпотентность алертов — по журналу position_events.
+    Закрытия — scanner/closes: монеты с парой Bybit — закрытые свечи Bybit без кэша, иначе
+    точки CoinGecko 00:00, у каждого закрытия дата (close_ts). Оцениваются ВСЕ закрытия новее
+    positions.last_close_ts по порядку: отставание CoinGecko, пропущенный прогон или простой
+    сервера не теряют ни стопа, ни уровня лестницы; закрытия до входа (день 0) не
+    оцениваются. Трейл взводится фактом закрытия ≥ +arm от средней (защёлка trail_armed_ts).
+    События, paper-исполнение, снапшот и карточка в очередь notify_outbox — одной транзакцией
+    на закрытие; доставку делает run.py watch --notify (повторы, пока не дойдёт). Сбой одной
+    позиции — строка с ошибкой, остальные считаются.
+
+    Возвращает {"rows": [{position, pnl, held_days, signals, ...}], "summary": {...}}.
     """
-    http = _make_http(cfg)
+    http = http or _make_http(cfg)
+    now = now if now is not None else time.time()
     pstore = PositionStore(cfg["output"]["db_path"])
     demo = cfg.get("api_keys.coingecko_demo", "")
-    z = cfg["stage4_zone"]
-    now = time.time()
 
-    e = cfg["stage8_exit"]
-    ladder = e["ladder"]
-    peak_cooldown = e.get("peak_zone_cooldown_days", 30) * 86400
-    hot_cooldown = e.get("market_hot_cooldown_days", 30) * 86400
     open_pos = pstore.open_positions()
     funding = fetch_funding_map(http) if open_pos else {}
     market_in: dict | None = None
@@ -421,98 +458,143 @@ def run_watch(cfg: Config) -> dict:
     if open_pos:
         from .sources import market
         mstore = Store(cfg["output"]["db_path"])
-        mctx = market.load_context(cfg, http, mstore)
+        mctx = regime.fresh_context(market.load_context(cfg, http, mstore), cfg, now)
         mstore.close()
-        hot = mctx.get("hot") or {}
-        market_in = {"hot_score": hot.get("score"), "lit": hot.get("lit") or []}
+        if mctx:
+            hot = mctx.get("hot") or {}
+            market_in = {"hot_score": hot.get("score"), "lit": hot.get("lit") or []}
     onchain_map = dune.fetch_onchain(cfg) if open_pos else {}  # cached-результаты, дёшево
 
     rows: list[dict] = []
     for pos in open_pos:
-        if not pos["coin_id"]:
-            rows.append({"position": pos, "pnl": None, "held_days": None,
-                         "signals": [], "error": "нет coin_id — цену не достать (задай при pos add)"})
-            continue
-        # Только ЗАКРЫТЫЕ дневные свечи: последняя точка market_chart — live-тик,
-        # он ломал бы подтверждение инвалидации «2 закрытия» и дёргал HWM/зону.
-        chart = coingecko.closed_daily(coingecko.fetch_market_chart(http, pos["coin_id"], 365, demo))
-        prices, ts = chart["prices"], chart["ts"]
-        if not prices:
-            rows.append({"position": pos, "pnl": None, "held_days": None,
-                         "signals": [], "error": "нет истории цены (429/новый coin_id?)"})
-            continue
-        last_close = prices[-1]
-
-        # HWM: максимум с момента входа в пределах окна + накопленный между прогонами.
-        since_entry = [p for t, p in zip(ts, prices) if t >= pos["entry_ts"]]
-        hwm = max([pos["hwm"] or pos["entry_price"], last_close] + since_entry)
-        if hwm != pos["hwm"]:
-            pstore.update_hwm(pos["id"], hwm)
-
-        # base_low мог не проставиться при add (429) — дожимаем из истории до входа.
-        if not pos.get("base_low"):
-            before_entry = [p for t, p in zip(ts, prices) if t <= pos["entry_ts"]]
-            bl = exit_stage.compute_base_low(before_entry)
-            if bl:
-                pstore.set_base_low(pos["id"], bl)
-                pos["base_low"] = bl
-
-        indicators = zone.compute_indicators(prices, z["recent_days"], z["sma_days"],
-                                             chart["volumes"]) or {}
-        indicators["funding_rate"] = funding.get(pos["symbol"].upper())
-        triggered = pstore.event_types(pos["id"])
-        # peak_zone — переармируется после cooldown (окно распределения может
-        # повториться на горизонте 1–2 года), в отличие от once-ever у остальных.
-        for etype, cd in (("peak_zone", peak_cooldown), ("market_hot", hot_cooldown)):
-            if etype in triggered:
-                lastp = pstore.last_event_ts(pos["id"], etype)
-                if lastp and (now - lastp) > cd:
-                    triggered = triggered - {etype}
-
-        signals = exit_stage.evaluate_exit(pos, last_close, hwm, indicators,
-                                           triggered, cfg, recent_closes=prices,
-                                           market=market_in)
-        pnl_at_signal = exit_stage.position_pnl(pos, last_close)   # до paper-исполнения
-        executed: list[str] = []
-        for s in signals:
-            pstore.record_event(pos["id"], s["type"], last_close, s["note"])
-            # Paper-executor: виртуально ИСПОЛНЯЕМ сигналы, чтобы журнал мерил
-            # стратегию-с-выходами, а не buy&hold. Реальные позиции — только алерт.
-            if pos.get("is_paper"):
-                if s["type"] in ("invalidation", "trailing"):
-                    r = pstore.sell(pos["id"], pstore.get(pos["id"])["qty"], last_close,
-                                    f"paper_{s['type']}_exec")
-                    executed.append(f"{s['type']}: выход, realized {r:+.2f}")
-                elif s["type"].startswith("ladder_"):
-                    idx = int(s["type"].split("_")[1])
-                    frac = ladder[idx][1] if idx < len(ladder) else 0.0
-                    r = pstore.sell(pos["id"], frac * pos["initial_qty"], last_close,
-                                    f"paper_{s['type']}_exec")
-                    executed.append(f"{s['type']}: фикс {frac*100:.0f}%, realized {r:+.2f}")
-
-        cur = pstore.get(pos["id"]) or pos          # состояние после исполнения
-        pnl = exit_stage.position_pnl(cur, last_close)
-        pstore.snapshot(pos["id"], last_close, pnl["pnl_pct"], hwm)
-
-        oc = onchain.match_onchain(onchain_map, pos["symbol"], pos.get("address"))
-        rows.append({
-            "position": cur, "last_price": last_close, "last_ts": ts[-1], "hwm": hwm,
-            "pnl": pnl, "pnl_at_signal": pnl_at_signal,
-            "realized_usdt": round(cur.get("realized_usdt") or 0.0, 2),
-            "held_days": exit_stage.held_days(pos, now),
-            "signals": signals, "executed": executed,
-            "spark_prices": since_entry if since_entry else prices[-30:],
-            # с учётом сигналов этого прогона — иначе дайджест покажет ближайшим
-            # уровень лестницы, который только что сработал
-            "triggered": triggered | {s["type"] for s in signals},
-            "net_flow_usd_7d": (oc or {}).get("net_flow_usd_7d"),
-        })
+        try:
+            rows.append(_watch_position(cfg, http, pstore, pos, now=now, demo=demo,
+                                        funding=funding, market=market_in,
+                                        onchain_map=onchain_map))
+        except Exception as e:  # noqa: BLE001 — одна позиция не должна ронять остальные
+            import traceback
+            traceback.print_exc()
+            rows.append({"position": pos, "pnl": None, "held_days": None, "signals": [],
+                         "error": f"сбой расчёта: {type(e).__name__}: {e}"})
 
     pstore.close_db()
     ok_rows = [r for r in rows if r.get("pnl")]
     summary = exit_stage.summarize_watch(ok_rows)
     summary["market"] = regime.context_line(mctx) if mctx else ""
+    summary["errors"] = sum(1 for r in rows if r.get("error"))
+    summary["lagging"] = sum(1 for r in ok_rows if r.get("lag_days"))
     return {"rows": rows, "summary": summary}
+
+
+def _watch_position(cfg: Config, http: HttpClient, pstore: PositionStore, pos: dict, *,
+                    now: float, demo: str, funding: dict, market: dict | None,
+                    onchain_map: dict) -> dict:
+    """Одна позиция: новые закрытия по порядку -> сигналы, paper-исполнение, снапшоты."""
+    series = closes.load(http, pos, demo, now)
+    ct, px, vol = series["close_ts"], series["prices"], series["volumes"]
+    if not px:
+        return {"position": pos, "pnl": None, "held_days": None, "signals": [],
+                "error": f"нет истории цены: {series['note'] or 'источники не ответили'}"}
+    z, e = cfg["stage4_zone"], cfg["stage8_exit"]
+    ladder = e["ladder"]
+    arm = e["trailing_arm_after_gain_pct"] / 100.0
+    pid = pos["id"]
+
+    # base_low мог не проставиться при add (429) — дожимаем из закрытий до входа.
+    if not pos.get("base_low"):
+        bl = exit_stage.compute_base_low([p for t, p in zip(ct, px) if t <= pos["entry_ts"]])
+        if bl:
+            pstore.set_base_low(pid, bl)
+            pos["base_low"] = bl
+
+    # Закрытия новее оценённого; день 0 — закрытие до покупки — не сравниваем.
+    # last_close_ts NULL (позиция до миграции) -> переоценка с момента входа: сработавшее
+    # уже в журнале и не повторится, пропущенное — сработает по своему закрытию.
+    done = pos.get("last_close_ts")
+    todo = [i for i, t in enumerate(ct) if t > max(done or 0.0, pos["entry_ts"])]
+    hwm = (pos.get("hwm") or pos["entry_price"]) if done else pos["entry_price"]
+    armed_ts = pos.get("trail_armed_ts") if done else None
+
+    triggered = pstore.event_types(pid)
+    # peak_zone/market_hot переармируются после cooldown (окно распределения может
+    # повториться на горизонте 1–2 года), остальные — один раз.
+    for etype, days in (("peak_zone", e.get("peak_zone_cooldown_days", 30)),
+                        ("market_hot", e.get("market_hot_cooldown_days", 30))):
+        lastp = pstore.last_event_ts(pid, etype) if etype in triggered else None
+        if lastp and (now - lastp) > days * 86400:
+            triggered = triggered - {etype}
+
+    state = dict(pos)
+    all_signals: list[dict] = []
+    executed_all: list[str] = []
+    for i in todo:
+        t, price = ct[i], px[i]
+        entry = state["entry_price"]
+        hwm = max(hwm, price)
+        if armed_ts is None and entry > 0 and price / entry - 1 >= arm:
+            # взвод — фактом закрытия от текущей средней; максимум считается с взвода
+            # (старый пик до докупки вниз не тянет трейл на убыточную позицию)
+            armed_ts, hwm = t, price
+        indicators = zone.compute_indicators(px[:i + 1], z["recent_days"], z["sma_days"],
+                                             vol[:i + 1]) or {}
+        if i == len(px) - 1:          # фандинг — текущий, к прошлым закрытиям не относится
+            indicators["funding_rate"] = funding.get(pos["symbol"].upper())
+        signals = exit_stage.evaluate_exit(state, price, hwm, indicators, triggered, cfg,
+                                           recent_closes=px[:i + 1], market=market,
+                                           armed=armed_ts is not None)
+        pnl_at_signal = exit_stage.position_pnl(state, price)     # до paper-исполнения
+        executed: list[str] = []
+        with pstore.atomic():
+            for s in signals:
+                s.update(close_ts=t, price=price)
+                pstore.record_event(pid, s["type"], price, s["note"], close_ts=t)
+                # Paper-executor: виртуально ИСПОЛНЯЕМ сигналы, чтобы журнал мерил
+                # стратегию-с-выходами, а не buy&hold. Реальные позиции — только алерт.
+                if not pos.get("is_paper"):
+                    continue
+                if s["type"] in ("invalidation", "trailing"):
+                    r = pstore.sell(pid, pstore.get(pid)["qty"], price,
+                                    f"paper_{s['type']}_exec", close_ts=t)
+                    executed.append(f"{s['type']}: выход, realized {r:+.2f}")
+                elif s["type"].startswith("ladder_"):
+                    idx = int(s["type"].split("_")[1])
+                    frac = ladder[idx][1] if idx < len(ladder) else 0.0
+                    r = pstore.sell(pid, frac * (state.get("initial_qty") or state["qty"]), price,
+                                    f"paper_{s['type']}_exec", close_ts=t)
+                    executed.append(f"{s['type']}: фикс {frac*100:.0f}%, realized {r:+.2f}")
+            state = pstore.get(pid) or state                # после исполнения
+            pnl = exit_stage.position_pnl(state, price)
+            pstore.snapshot(pid, price, pnl["pnl_pct"], hwm, close_ts=t, ts=now)
+            pstore.set_watch_state(pid, t, hwm, armed_ts)
+            triggered = triggered | {s["type"] for s in signals}
+            # Карточки — только основная книга; близнецы B/S — тихий эксперимент (report).
+            if signals and (pos.get("variant") or "A") == "A":
+                pstore.enqueue("exit", pid, t, {
+                    "position": state, "last_price": price, "last_ts": t, "hwm": hwm,
+                    "pnl": pnl, "pnl_at_signal": pnl_at_signal,
+                    "held_days": max(0, int((t - pos["entry_ts"]) // 86400)),
+                    "signals": signals, "executed": executed, "triggered": triggered,
+                    "trail_armed": armed_ts is not None, "src": series["src"]})
+        all_signals += signals
+        executed_all += executed
+        if state.get("status") != "open":
+            break
+
+    cur = pstore.get(pid) or state
+    last_close = px[-1]
+    pnl = exit_stage.position_pnl(cur, last_close)
+    since_entry = [p for t, p in zip(ct, px) if t > pos["entry_ts"]]
+    oc = onchain.match_onchain(onchain_map, pos["symbol"], pos.get("address"))
+    return {
+        "position": cur, "last_price": last_close, "last_ts": ct[-1], "hwm": hwm,
+        "pnl": pnl, "realized_usdt": round(cur.get("realized_usdt") or 0.0, 2),
+        "held_days": exit_stage.held_days(pos, now),
+        "signals": all_signals, "executed": executed_all, "new_closes": len(todo),
+        "src": series["src"], "lag_days": series["lag_days"], "note": series["note"],
+        "spark_prices": since_entry if since_entry else px[-30:],
+        "triggered": triggered, "trail_armed": armed_ts is not None,
+        "net_flow_usd_7d": (oc or {}).get("net_flow_usd_7d"),
+    }
 
 
 def _write_watchlist(cfg: Config, watchlist: list[Candidate]) -> None:

@@ -92,6 +92,25 @@ def fetch_llama_stables(http: HttpClient) -> dict[int, float]:
     return out
 
 
+def merge_stables(llama: dict[int, float], cm_st: dict[int, float],
+                  since_ts: int) -> dict[int, float]:
+    """{день: стейблы USD} с since_ts − 1д. Основа — DefiLlama (все стейблы). CoinMetrics
+    USDT+USDC (~$254B против ~$311B 08.10) — не замена: при сбое DefiLlama он перезаписал бы
+    10 дней и раздул альт-рынок (alt_vs_sma200 0.27→0.36, ложные флаги перегрева). Поэтому
+    CoinMetrics — только для дней ДО начала ряда DefiLlama (история), а DefiLlama не ответила —
+    стейблы не пишем вовсе (None не затирает записанное, Store.upsert_market)."""
+    out: dict[int, float] = {}
+    first_llama = min(llama) if llama else None
+    for d in set(llama) | set(cm_st):
+        if d < since_ts - DAY:
+            continue
+        if d in llama:
+            out[d] = max(llama[d], cm_st.get(d, 0.0))
+        elif first_llama is not None and d < first_llama:
+            out[d] = cm_st[d]
+    return out
+
+
 def fetch_coinmetrics(http: HttpClient, assets: str, metrics: str,
                       start: str) -> dict[str, dict[int, dict]]:
     """{asset: {day: {metric: value}}} — community API, с пагинацией."""
@@ -272,9 +291,8 @@ def collect(http: HttpClient, since_ts: int, demo_key: str = "",
         for d, rec in (cm.get(a) or {}).items():
             if rec.get("SplyCur"):
                 cm_st[d] = cm_st.get(d, 0.0) + rec["SplyCur"]
-    for d in set(llama) | set(cm_st):
-        if d >= since_ts - DAY:
-            rows.setdefault(d, {})["stables_usd"] = max(llama.get(d, 0.0), cm_st.get(d, 0.0))
+    for d, v in merge_stables(llama, cm_st, since_ts).items():
+        rows.setdefault(d, {})["stables_usd"] = v
 
     fng_limit = 0 if full else max(10, int((now - since_ts) / DAY) + 3)
     _merge(rows, {d: v for d, v in fetch_fng(http, fng_limit).items() if d >= since_ts - DAY},

@@ -77,66 +77,76 @@ def apply_fills(ps, fills: list[dict], lookup: Callable[[str], dict], *,
         if ps.has_fill(f["exec_id"]):
             out["skipped"] += 1
             continue
-        out["new"] += 1
-        sym, px = f["symbol"], f["price"]
-        pos = ps.find_open_real(sym)
-        when = time.strftime("%d.%m %H:%M", time.localtime(f["ts"]))
-        if f["side"] == "buy":
-            qty = f["base_delta"]
-            if pos:
-                m = ps.merge(pos["id"], px, qty)
-                pid, note = pos["id"], "merge"
-                out["merged"] += 1
-                out["lines"].append(f"{when} {sym}: докупка {qty:.6g} @ {px:.6g} → позиция "
-                                    f"#{pid}, средняя {m['entry_price']:.6g}, кол-во "
-                                    f"{m['qty']:.6g}")
-            else:
-                info = lookup(sym) or {}
-                coin_id = info.get("coin_id", "")
-                pid = ps.add(sym, px, qty, coin_id=coin_id, chain=info.get("chain", ""),
-                             address=info.get("address", ""), venue=VENUE, entry_ts=f["ts"],
-                             notes="bybit sync")
-                ps.record_event(pid, "bybit_open", px, f"исполнение {f['exec_id']}: "
-                                f"{qty:.6g} @ {px:.6g}, комиссия {f['fee_usdt']:.4f} USDT")
-                note = "open"
-                out["opened"].append(sym)
-                if not coin_id:
-                    out["no_coin_id"].append(sym)
-                out["lines"].append(f"{when} {sym}: покупка {qty:.6g} @ {px:.6g} → новая "
-                                    f"позиция #{pid}" + ("" if coin_id else
-                                                         " (⚠ coin_id не найден — watch не "
-                                                         "достанет цену)"))
-        else:
-            sold = -f["base_delta"]
-            if not pos:
-                ps.record_fill(f, None, "sell без позиции")
-                out["unmatched"].append(sym)
-                out["lines"].append(f"{when} {sym}: продажа {sold:.6g} @ {px:.6g} — открытой "
-                                    f"реальной позиции нет (куплено до окна синхронизации?)")
-                continue
-            pid, note = pos["id"], "sell"
-            if sold > pos["qty"] * (1 + 1e-9):
-                out["lines"].append(f"⚠ {sym}: продано {sold:.6g} > {pos['qty']:.6g} в позиции "
-                                    f"#{pid} — лишнее куплено до окна синхронизации")
-            realized = ps.sell(pid, sold, px, "bybit_sell",
-                               f"исполнение {f['exec_id']}: {min(sold, pos['qty']):.6g} @ "
-                               f"{px:.6g}, комиссия {f['fee_usdt']:.4f} USDT",
-                               fee=f["fee_rate"])
-            out["sold"] += 1
-            left = ps.get(pid)
-            if left["status"] == "open" and left["qty"] * px < dust_usdt:
-                realized += ps.sell(pid, left["qty"], px, "bybit_dust",
-                                    f"остаток {left['qty']:.6g} < {dust_usdt:g} USDT — "
-                                    f"закрыт без комиссии", fee=0.0)
-                left = ps.get(pid)
-            closed = left["status"] == "closed"
-            if closed:
-                out["closed"].append(sym)
-            rest = "закрыта" if closed else f"остаток {left['qty']:.6g}"
-            out["lines"].append(f"{when} {sym}: продажа {sold:.6g} @ {px:.6g} → позиция #{pid} "
-                                f"{rest}, realized {realized:+.2f} USDT")
-        ps.record_fill(f, pid, note)
+        # Позиция и запись исполнения — одной транзакцией: сбой между ними (диск, база
+        # занята) иначе оставлял докупку без exchange_fills, и следующий sync применял её
+        # второй раз (кол-во 10 вместо 5).
+        with ps.atomic():
+            _apply_fill(ps, f, lookup, dust_usdt, out)
     return out
+
+
+def _apply_fill(ps, f: dict, lookup: Callable[[str], dict], dust_usdt: float,
+                out: dict[str, Any]) -> None:
+    """Одно исполнение -> позиция + exchange_fills (внутри ps.atomic())."""
+    out["new"] += 1
+    sym, px = f["symbol"], f["price"]
+    pos = ps.find_open_real(sym)
+    when = time.strftime("%d.%m %H:%M", time.localtime(f["ts"]))
+    if f["side"] == "buy":
+        qty = f["base_delta"]
+        if pos:
+            m = ps.merge(pos["id"], px, qty)
+            pid, note = pos["id"], "merge"
+            out["merged"] += 1
+            out["lines"].append(f"{when} {sym}: докупка {qty:.6g} @ {px:.6g} → позиция "
+                                f"#{pid}, средняя {m['entry_price']:.6g}, кол-во "
+                                f"{m['qty']:.6g}")
+        else:
+            info = lookup(sym) or {}
+            coin_id = info.get("coin_id", "")
+            pid = ps.add(sym, px, qty, coin_id=coin_id, chain=info.get("chain", ""),
+                         address=info.get("address", ""), venue=VENUE, entry_ts=f["ts"],
+                         notes="bybit sync")
+            ps.record_event(pid, "bybit_open", px, f"исполнение {f['exec_id']}: "
+                            f"{qty:.6g} @ {px:.6g}, комиссия {f['fee_usdt']:.4f} USDT")
+            note = "open"
+            out["opened"].append(sym)
+            if not coin_id:
+                out["no_coin_id"].append(sym)
+            out["lines"].append(f"{when} {sym}: покупка {qty:.6g} @ {px:.6g} → новая "
+                                f"позиция #{pid}" + ("" if coin_id else
+                                                     " (⚠ coin_id не найден — watch не "
+                                                     "достанет цену)"))
+    else:
+        sold = -f["base_delta"]
+        if not pos:
+            ps.record_fill(f, None, "sell без позиции")
+            out["unmatched"].append(sym)
+            out["lines"].append(f"{when} {sym}: продажа {sold:.6g} @ {px:.6g} — открытой "
+                                f"реальной позиции нет (куплено до окна синхронизации?)")
+            return
+        pid, note = pos["id"], "sell"
+        if sold > pos["qty"] * (1 + 1e-9):
+            out["lines"].append(f"⚠ {sym}: продано {sold:.6g} > {pos['qty']:.6g} в позиции "
+                                f"#{pid} — лишнее куплено до окна синхронизации")
+        realized = ps.sell(pid, sold, px, "bybit_sell",
+                           f"исполнение {f['exec_id']}: {min(sold, pos['qty']):.6g} @ "
+                           f"{px:.6g}, комиссия {f['fee_usdt']:.4f} USDT",
+                           fee=f["fee_rate"])
+        out["sold"] += 1
+        left = ps.get(pid)
+        if left["status"] == "open" and left["qty"] * px < dust_usdt:
+            realized += ps.sell(pid, left["qty"], px, "bybit_dust",
+                                f"остаток {left['qty']:.6g} < {dust_usdt:g} USDT — "
+                                f"закрыт без комиссии", fee=0.0)
+            left = ps.get(pid)
+        closed = left["status"] == "closed"
+        if closed:
+            out["closed"].append(sym)
+        rest = "закрыта" if closed else f"остаток {left['qty']:.6g}"
+        out["lines"].append(f"{when} {sym}: продажа {sold:.6g} @ {px:.6g} → позиция #{pid} "
+                            f"{rest}, realized {realized:+.2f} USDT")
+    ps.record_fill(f, pid, note)
 
 
 def reconcile(ps, wallet: dict[str, dict[str, float]], *, dust_usdt: float = 1.0,

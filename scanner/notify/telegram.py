@@ -47,6 +47,32 @@ def _post(token: str, method: str, data: bytes, content_type: str,
         return None
 
 
+_RETRY_CODES = (429, 500, 502, 503, 504)
+_RETRY_WAITS = (3.0, 10.0)     # три попытки: обрывы сети, 429 и 5xx у Telegram короткие
+_sleep = time.sleep            # подменяется в selftest
+
+
+def _send(token: str, method: str, data: bytes, content_type: str, timeout: float = 30,
+          waits: tuple[float, ...] = _RETRY_WAITS) -> dict | None:
+    """_post с повторами: нет ответа (сеть) или 429/5xx -> пауза и ещё раз (429 — не раньше
+    retry_after). Ошибка запроса (400: битая разметка, чужой chat_id) — без повтора: ответ
+    вызывающему. Повтор после таймаута может задвоить сообщение — лучше, чем потерять сигнал."""
+    resp = None
+    for i in range(len(waits) + 1):
+        resp = _post(token, method, data, content_type, timeout)
+        if resp is not None and (resp.get("ok") or resp.get("error_code") not in _RETRY_CODES):
+            return resp
+        if i < len(waits):
+            wait = waits[i]
+            ra = ((resp or {}).get("parameters") or {}).get("retry_after")
+            if isinstance(ra, (int, float)):
+                wait = min(max(wait, ra + 1.0), 60.0)
+            why = "нет ответа" if resp is None else resp.get("description")
+            print(f"[telegram] {method}: {why} — повтор через {wait:.0f} с")
+            _sleep(wait)
+    return resp
+
+
 def keyboard(buttons: list[list[tuple[str, str]]] | None) -> str | None:
     """[[(текст, url), …], …] -> reply_markup (кнопки-ссылки, бот-сервер не нужен)."""
     rows = [[{"text": t, "url": u} for t, u in row if t and u] for row in (buttons or [])]
@@ -84,13 +110,13 @@ def send_message(token: str, chat_id: str, text: str, silent: bool = False,
         print("[telegram] нет token/chat_id — пропуск отправки")
         return False
     form = "application/x-www-form-urlencoded"
-    resp = _post(token, "sendMessage",
+    resp = _send(token, "sendMessage",
                  urllib.parse.urlencode(build_payload(chat_id, text, silent, buttons)).encode(),
                  form)
     if _parse_error(resp):
         # битая разметка не должна съедать сообщение: шлём тем же текстом без тегов
         print(f"[telegram] HTML не принят ({resp.get('description')}) — отправляю без разметки")
-        resp = _post(token, "sendMessage", urllib.parse.urlencode(build_payload(
+        resp = _send(token, "sendMessage", urllib.parse.urlencode(build_payload(
             chat_id, strip_html(text), silent, buttons, html_mode=False)).encode(), form)
     if resp and not resp.get("ok"):
         print(f"[telegram] sendMessage: {resp.get('description')}")
@@ -125,7 +151,7 @@ def send_photo(token: str, chat_id: str, png: bytes, caption: str, silent: bool 
     if kb:
         fields["reply_markup"] = kb
     boundary = uuid.uuid4().hex
-    resp = _post(token, "sendPhoto",
+    resp = _send(token, "sendPhoto",
                  multipart_body(fields, {"photo": ("levels.png", png, "image/png")}, boundary),
                  f"multipart/form-data; boundary={boundary}")
     if resp and resp.get("ok"):
@@ -147,12 +173,14 @@ def send_document(token: str, chat_id: str, data: bytes, filename: str, caption:
     files = {"document": (filename, data, mime)}
     boundary = uuid.uuid4().hex
     ctype = f"multipart/form-data; boundary={boundary}"
-    resp = _post(token, "sendDocument", multipart_body(fields, files, boundary), ctype, 300)
+    resp = _send(token, "sendDocument", multipart_body(fields, files, boundary), ctype, 300,
+                 waits=(10.0,))
     if _parse_error(resp):
         print(f"[telegram] HTML не принят ({resp.get('description')}) — подпись без разметки")
         fields = {k: v for k, v in fields.items() if k != "parse_mode"}
         fields["caption"] = strip_html(caption)
-        resp = _post(token, "sendDocument", multipart_body(fields, files, boundary), ctype, 300)
+        resp = _send(token, "sendDocument", multipart_body(fields, files, boundary), ctype, 300,
+                 waits=(10.0,))
     if resp and not resp.get("ok"):
         print(f"[telegram] sendDocument: {resp.get('description')}")
     return bool(resp and resp.get("ok"))
@@ -368,6 +396,8 @@ _FLAG_RISK = {
     "wash_suspect": "объём, возможно, накручен",
     "rf_dex_only": "только DEX — покупать своим кошельком",
     "bybit_ticker_mismatch": "тикер на Bybit — другая монета (цена не совпала)",
+    "bybit_unverified": "тикер на Bybit не сверить по цене — считаем, что не Bybit",
+    "stale_chart": "график CoinGecko замёрз — зона не считается",
     "dd_in_bull_market": "BTC растёт, а монета у дна — часто отставание, не недооценка",
     "solana:limited_antirug": "Solana — проверка контракта беднее",
 }
@@ -672,8 +702,12 @@ def _position_lines(r: dict, cfg, now: float) -> list[str]:
             tgt = p["entry_price"] * (1 + level)
             bits.append(f"цель {fmt_price(tgt)} ({_pct(tgt / price - 1)})")
             break
-    if _is_stale(r.get("last_ts"), now):
-        bits.append(f"⚠ цена на {_close_day(r['last_ts'])}")
+    lt = r.get("last_ts")
+    if isinstance(lt, (int, float)) and lt < int(now) // 86400 * 86400:
+        # закрытие вчерашнего дня ещё не вышло (CoinGecko отстаёт) или ряд замёрз
+        bits.append(f"⚠ цена на {_close_day(lt)}")
+    elif r.get("note"):
+        bits.append(_esc(r["note"]))
     return [l1, "   " + " · ".join(bits)]
 
 
@@ -700,6 +734,9 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
     head.append(f"🔔 сигналов: {len(sigs)}" if sigs else "сигналов нет")
     if state.get("watch_ok") is False:
         head.append("⚠ позиции не обновлены")
+    if state.get("undelivered"):
+        head.append(f"⚠ не доставлено карточек выхода: {state['undelivered']} — повтор "
+                    f"в следующем прогоне")
     if state.get("backup") == "fail":
         head.append("⚠ бэкап не сделан")
     elif state.get("backup") == "send_fail":
@@ -755,7 +792,8 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
                      + ", ".join(_esc(r["position"]["symbol"]) for r in errs[:10]))
         lines.append("")
     if sigs:
-        lines.append("🔔 <b>Сигналы сегодня</b> — карточки выше")
+        lines.append("🔔 <b>Сигналы сегодня</b> — " + ("не все карточки доставлены"
+                                                       if state.get("undelivered") else "карточки выше"))
         lines.append(", ".join(f"{'📝' if s.get('is_paper') else '💰'}{_esc(s['symbol'])} "
                                f"{_esc(s['label'])}" for s in sigs))
         lines.append("")

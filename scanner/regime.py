@@ -117,8 +117,12 @@ def _window(s: dict[int, float], d: int, n: int) -> list[float]:
 
 
 def market_feature_table(S: dict[str, dict[int, float]],
-                         days: list[int] | None = None) -> dict[int, dict]:
+                         days: list[int] | None = None,
+                         alt_dd_min_days: int = 0) -> dict[int, dict]:
     """Признаки рынка на каждый день (только данные <= дня, walk-forward).
+
+    alt_dd_min_days — alt_dd только при истории альт-рынка не короче (прод: 365; бэктесты
+    идут с 2017 и передают 0).
 
     alt_dd        — просадка альт-рынка без стейблов от его ATH (0..1)
     alt_vs_sma200 — альт-рынок к своей SMA200 − 1
@@ -143,7 +147,8 @@ def market_feature_table(S: dict[str, dict[int, float]],
         a = alt.get(d)
         if a is not None and run_max > 0:
             f["alt_ex"] = a
-            f["alt_dd"] = 1 - a / run_max
+            if j >= alt_dd_min_days:          # j — дней истории альт-рынка до d включительно
+                f["alt_dd"] = 1 - a / run_max
             w = _window(alt, d, 200)
             if len(w) >= 190:
                 f["alt_vs_sma200"] = a / (sum(w) / len(w)) - 1
@@ -208,8 +213,22 @@ def market_context(rows: list[dict], cfg) -> dict:
     if not alt:
         return {}
     last = max(alt)
-    f = market_feature_table(S, [last]).get(last, {})
+    f = market_feature_table(S, [last], cfg.get("market_regime.alt_dd_min_days", 365)
+                             ).get(last, {})
     return {"day": last, **f, "hot": hot_flags(f, cfg)}
+
+
+def fresh_context(ctx: dict, cfg, now: float) -> dict:
+    """ctx, если последний день данных не старше market_regime.max_age_days, иначе {}:
+    устаревший контекст (источник молчит неделю) не должен выдаваться за сегодняшний."""
+    day = (ctx or {}).get("day")
+    if not isinstance(day, (int, float)):
+        return {}
+    age = (int(now) // DAY * DAY - day) / DAY
+    if age > cfg.get("market_regime.max_age_days", 3):
+        print(f"[market] данные рынка за {age:.0f} дн. назад — контекст не используется")
+        return {}
+    return ctx
 
 
 def context_line(ctx: dict, btc_dd: float | None = None) -> str:

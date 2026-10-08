@@ -30,7 +30,7 @@ from ..config import Config
 def evaluate_exit(position: dict, last_price: float, hwm: float,
                   indicators: dict | None, triggered: set[str],
                   cfg: Config, recent_closes: list[float] | None = None,
-                  market: dict | None = None) -> list[dict]:
+                  market: dict | None = None, armed: bool | None = None) -> list[dict]:
     """Возвращает список новых сигналов [{type, action, note, urgency}].
 
     position: dict c entry_price, base_low (может быть None).
@@ -38,6 +38,9 @@ def evaluate_exit(position: dict, last_price: float, hwm: float,
     recent_closes: хвост дневных закрытий (для подтверждения инвалидации N дней).
         None -> проверка по одному last_price (обратная совместимость).
     market: {"hot_score": 0..1 | None, "lit": [флаги]} — перегрев рынка (None = нет данных).
+    armed: трейл взведён фактом закрытия ≥ +arm от средней (защёлка watch). None — по hwm
+        (прежнее правило: после докупки вниз старый максимум от новой средней взводил трейл
+        на убыточной позиции).
     """
     e = cfg["stage8_exit"]
     entry = position["entry_price"]
@@ -90,7 +93,8 @@ def evaluate_exit(position: dict, last_price: float, hwm: float,
             })
 
     # 3) Взводимый трейлинг: только после существенной прибыли.
-    armed = hwm_gain >= e["trailing_arm_after_gain_pct"] / 100.0
+    if armed is None:
+        armed = hwm_gain >= e["trailing_arm_after_gain_pct"] / 100.0
     trail_pct = e["trailing_from_hwm_pct"]
     if tighten:
         trail_pct = min(trail_pct, e.get("market_hot_trailing_pct", trail_pct))
@@ -113,14 +117,18 @@ def evaluate_exit(position: dict, last_price: float, hwm: float,
         funding = indicators.get("funding_rate")  # эйфория лонгов = перегрев у вершины
         euphoria = (isinstance(funding, (int, float))
                     and funding >= e.get("funding_euphoria", 0.0005))
-        hot = (isinstance(above, (int, float)) and above >= e["peak_min_above_sma_pct"]
-               and isinstance(rangep, (int, float)) and rangep >= e["peak_min_range_pos"])
-        if (hot or euphoria) and gain > 0:
-            note = f"разгон: +{above:.0f}% над SMA, верх диапазона ({rangep:.2f})"
+        # не `hot`: имя занято индексом перегрева рынка (п.5 писал бы «перегрев 0%»)
+        overheated = (isinstance(above, (int, float)) and above >= e["peak_min_above_sma_pct"]
+                      and isinstance(rangep, (int, float)) and rangep >= e["peak_min_range_pos"])
+        if (overheated or euphoria) and gain > 0:
+            parts = []
+            if overheated:      # только фандинг (меньше 15 закрытий): above/rangep — None
+                parts.append(f"разгон: +{above:.0f}% над SMA, верх диапазона ({rangep:.2f})")
             if isinstance(vol_exp, (int, float)) and vol_exp >= e.get("vol_expansion_ratio", 1.6):
-                note += f", объём ×{vol_exp:.1f} к базе"
+                parts.append(f"объём ×{vol_exp:.1f} к базе")
             if euphoria:
-                note += f", фандинг +{funding*100:.3f}%/8h (эйфория лонгов — распределение)"
+                parts.append(f"фандинг +{funding*100:.3f}%/8h (эйфория лонгов — распределение)")
+            note = ", ".join(parts)
             signals.append({
                 "type": "peak_zone", "urgency": "low",
                 "action": "ЗОНА РАСПРЕДЕЛЕНИЯ — рассмотреть фиксацию",

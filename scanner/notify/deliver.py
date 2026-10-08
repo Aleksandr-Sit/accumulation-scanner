@@ -113,28 +113,70 @@ def exit_card(cfg, http, row: dict, *, test: bool = False) -> dict:
                                 p.get("chain", ""), p.get("address", ""))
     png = None
     if text and cfg.get("stage6_telegram.charts", True) and chart.available():
-        md = market_data(cfg, http, p["symbol"], p.get("venue", ""), p.get("coin_id", ""),
-                         row.get("last_price"))
-        e = cfg["stage8_exit"]
-        inv = e["invalidation_below_base_low_pct"]
-        if p.get("variant") == "S":
-            inv = cfg.get("stage7_positions.paper_ab_stop_pct", inv)
-        bl = p.get("base_low")
-        trig = row.get("triggered") or set()
-        tg = [(p["entry_price"] * (1 + lv), f"+{lv * 100:.0f}%")
-              for i, (lv, _f) in enumerate(e["ladder"]) if f"ladder_{i}" not in trig]
-        extra = []
-        hwm = row.get("hwm") or 0
-        if hwm and hwm / p["entry_price"] - 1 >= e["trailing_arm_after_gain_pct"] / 100:
-            tr = hwm * (1 - e["trailing_from_hwm_pct"] / 100)
-            extra.append((tr, f"трейл · {telegram.fmt_price(tr)}", "trail"))
-        png = chart.render_levels(md["ohlcv"], title=f"{p['symbol']} · позиция "
-                                  f"{'paper' if p.get('is_paper') else 'real'}",
-                                  subtitle=f"вход {telegram.fmt_price(p['entry_price'])} · "
-                                           f"{row.get('held_days', '?')} дн.",
-                                  stop=bl * (1 - inv / 100) if bl else None, targets=tg,
-                                  entry=p["entry_price"], extra=extra)
+        try:
+            png = _exit_png(cfg, http, row)
+        except Exception as e:  # noqa: BLE001 — без картинки карточка всё равно уходит
+            print(f"[telegram] картинка выхода {p['symbol']} пропущена: {type(e).__name__}: {e}")
     return {"text": text, "png": png, "buttons": [links] if links else None, "loud": loud}
+
+
+def _exit_png(cfg, http, row: dict) -> bytes | None:
+    """Картинка карточки выхода: свечи, вход, стоп, невзятые цели, трейл (если взведён)."""
+    p = row["position"]
+    md = market_data(cfg, http, p["symbol"], p.get("venue", ""), p.get("coin_id", ""),
+                     row.get("last_price"))
+    e = cfg["stage8_exit"]
+    inv = e["invalidation_below_base_low_pct"]
+    if p.get("variant") == "S":
+        inv = cfg.get("stage7_positions.paper_ab_stop_pct", inv)
+    bl = p.get("base_low")
+    trig = row.get("triggered") or set()
+    tg = [(p["entry_price"] * (1 + lv), f"+{lv * 100:.0f}%")
+          for i, (lv, _f) in enumerate(e["ladder"]) if f"ladder_{i}" not in trig]
+    extra = []
+    hwm = row.get("hwm") or 0
+    armed = row.get("trail_armed")          # защёлка watch; старые строки — по максимуму
+    if armed is None:
+        armed = bool(hwm) and hwm / p["entry_price"] - 1 >= e["trailing_arm_after_gain_pct"] / 100
+    if armed and hwm:
+        tr = hwm * (1 - e["trailing_from_hwm_pct"] / 100)
+        extra.append((tr, f"трейл · {telegram.fmt_price(tr)}", "trail"))
+    return chart.render_levels(md["ohlcv"], title=f"{p['symbol']} · позиция "
+                               f"{'paper' if p.get('is_paper') else 'real'}",
+                               subtitle=f"вход {telegram.fmt_price(p['entry_price'])} · "
+                                        f"{row.get('held_days', '?')} дн.",
+                               stop=bl * (1 - inv / 100) if bl else None, targets=tg,
+                               entry=p["entry_price"], extra=extra)
+
+
+def flush_exit_outbox(cfg, http, *, send=None) -> tuple[int, int]:
+    """Карточки выхода из очереди notify_outbox по порядку -> (доставлено, не доставлено).
+    run_watch кладёт их той же транзакцией, что события; здесь — отправка (с повторами в
+    telegram._send). Дошла — sent_ts; нет — остаётся в очереди до следующего прогона, и
+    сводка дня пишет «не доставлено»: стоп реальной позиции не теряется молча."""
+    from ..positions import PositionStore
+    send = send or send_exit_card
+    ps = PositionStore(cfg["output"]["db_path"])
+    ok_n = fail_n = 0
+    try:
+        for item in ps.outbox_pending("exit"):
+            row = item["payload"]
+            sym = (row.get("position") or {}).get("symbol", "?")
+            try:
+                card = exit_card(cfg, http, row)
+                ok = bool(card["text"]) and send(cfg, card)
+                err = "" if ok else "Telegram не принял"
+            except Exception as e:  # noqa: BLE001 — одна карточка не держит остальные
+                ok, err = False, f"{type(e).__name__}: {e}"
+            ps.outbox_mark(item["id"], ok, err)
+            ok_n += ok
+            fail_n += not ok
+            loud = "со звуком" if ok and card.get("loud") else "без звука"
+            print(f"[telegram] сигнал {sym}: {'ok (' + loud + ')' if ok else 'FAIL: ' + err}"
+                  + (f", попытка {item['tries'] + 1}" if item["tries"] else ""))
+    finally:
+        ps.close_db()
+    return ok_n, fail_n
 
 
 def send_exit_card(cfg, card: dict) -> bool:
@@ -210,12 +252,23 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
             rows.append({"position": p, "pnl": {"pnl_pct": 0.0, "pnl_usdt": 0.0},
                          "realized_usdt": p.get("realized_usdt") or 0.0})
             continue
+        if not s and p["entry_ts"] >= now - 2 * 86400:
+            # куплена сегодня-вчера: первое закрытие после входа ещё не вышло — день 0
+            # не сравнивается с закрытием до покупки, цена — вход
+            rows.append({"position": p, "last_price": p["entry_price"], "last_ts": None,
+                         "hwm": p.get("hwm"), "pnl": position_pnl(p, p["entry_price"]),
+                         "realized_usdt": p.get("realized_usdt") or 0.0,
+                         "held_days": held_days(p, now), "triggered": ps.event_types(p["id"]),
+                         "spark_prices": [], "snap_ts": now,
+                         "note": "новая — первое закрытие после входа ещё не вышло"})
+            continue
         if not s:
             rows.append({"position": p, "pnl": None, "error": "нет цены (watch ещё не считал)"})
             continue
-        hist =[px for ts_, px in ps.snapshot_prices(p["id"]) if ts_ >= p["entry_ts"] - 86400]
+        hist = [px for ts_, px in ps.snapshot_prices(p["id"]) if ts_ >= p["entry_ts"] - 86400]
         rows.append({"position": p, "last_price": s["price"],
-                     "last_ts": (s["ts"] // 86400) * 86400,   # последнее закрытие 00:00 UTC
+                     # день закрытия; у старых снапшотов (до close_ts) — день записи
+                     "last_ts": s.get("close_ts") or (s["ts"] // 86400) * 86400,
                      "hwm": s.get("hwm"), "pnl": position_pnl(p, s["price"]),
                      "realized_usdt": p.get("realized_usdt") or 0.0,
                      "held_days": held_days(p, now), "triggered": ps.event_types(p["id"]),
@@ -234,6 +287,7 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
         else:
             continue
         sigs.append({"symbol": ev["symbol"], "label": lab, "is_paper": ev.get("is_paper")})
+    undelivered = ps.outbox_count("exit")
     ps.close_db()
 
     open_rows = [r for r in rows if r["position"]["status"] == "open"]
@@ -249,7 +303,8 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
     if cfg.get("track_q.enabled", False):
         s = fresh_slice(cfg, now)
         track_q = {"ok": s["ok"], "date": s["date"], "age_days": s["age_days"]}
-    return {"scan": scan, "watch_ok": watch_ok, "market": ctx, "new": new, "muted": muted,
+    return {"scan": scan, "watch_ok": watch_ok, "undelivered": undelivered,
+            "market": ctx, "new": new, "muted": muted,
             "near": near, "positions": rows, "signals_today": sigs,
             "unavailable": summ.get("unavailable") or [], "dev_github": summ.get("dev_github"),
             "backup": backup, "track_q": track_q,

@@ -32,10 +32,12 @@ def fetch_spot_basecoins(http: HttpClient) -> set[str]:
 def fetch_daily_closes(http: HttpClient, symbol: str = "BTCUSDT",
                        limit: int = 1000) -> list[float]:
     """Дневные закрытия (oldest→newest) с Bybit spot. Надёжнее CoinGecko (лимиты
-    выше, без 429) — для BTC-drawdown, сильнейшего предиктора качества пружины."""
+    выше, без 429) — для BTC-drawdown, сильнейшего предиктора качества пружины.
+    Без кэша: ответ, закэшированный до 00:00 UTC, после 00:00 отдал бы живую свечу
+    вчерашнего дня как закрытую (у Bybit лимиты высокие, кэш не нужен)."""
     data = http.get_json(f"{_BASE}/v5/market/kline",
                          params={"category": "spot", "symbol": symbol,
-                                 "interval": "D", "limit": limit})
+                                 "interval": "D", "limit": limit}, use_cache=False)
     return parse_daily_closes(data, int(time.time() * 1000))
 
 
@@ -60,10 +62,11 @@ def parse_daily_closes(data, now_ms: int) -> list[float]:
 def fetch_daily_ohlcv(http: HttpClient, symbol: str, limit: int = 400) -> dict:
     """Дневные свечи спот-пары (oldest→newest, только закрытые): {ts, o, h, l, c, v, qv}.
     qv — оборот в USDT. Для уровней (фитили, ATR, профиль объёма) и картинки в Telegram:
-    закрытия те же, что у fetch_daily_closes, плюс хаи/лои и объём именно этой биржи."""
+    закрытия те же, что у fetch_daily_closes, плюс хаи/лои и объём именно этой биржи.
+    Без кэша — по той же причине, что fetch_daily_closes."""
     data = http.get_json(f"{_BASE}/v5/market/kline",
                          params={"category": "spot", "symbol": symbol,
-                                 "interval": "D", "limit": limit})
+                                 "interval": "D", "limit": limit}, use_cache=False)
     return parse_daily_ohlcv(data, int(time.time() * 1000))
 
 

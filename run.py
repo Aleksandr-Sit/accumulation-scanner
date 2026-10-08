@@ -20,8 +20,10 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 
+from scanner import closes
 from scanner.config import load_config
 from scanner.pipeline import run_scan, run_watch
 
@@ -418,6 +420,8 @@ def cmd_ladder(args) -> int:
 
 
 def cmd_watch(args) -> int:
+    """Код: 0 — всё посчитано и доставлено; 2 — у части позиций нет цены/сбой расчёта;
+    3 — карточка выхода не доставлена (осталась в очереди — повтор в следующем прогоне)."""
     cfg = load_config(args.config)
     try:
         out = run_watch(cfg)
@@ -426,9 +430,9 @@ def cmd_watch(args) -> int:
             _notify_failure(cfg, "watch", e)
         raise
     rows, summary = out["rows"], out["summary"]
+    code = 2 if summary.get("errors") else 0
     if not rows:
         print("Открытых позиций нет — нечего отслеживать (run.py pos add ...).")
-        return 0
     print(f"=== WATCH: {summary['positions']} позиций, "
           f"{summary['signals']} новых сигналов ===")
     if summary.get("market"):
@@ -445,35 +449,35 @@ def cmd_watch(args) -> int:
             tag += p["variant"]
         rz = r.get("realized_usdt") or 0.0
         rzs = f", realized {rz:+.2f}" if abs(rz) > 1e-9 else ""
+        day = f" ({closes.close_label(r['last_ts'])}, {r.get('src')})" if r.get("last_ts") else ""
         print(f"  {tag} {p['symbol']:<8} {pnl['pnl_pct']:+7.1f}%  "
               f"({pnl['pnl_usdt']:+.2f} USDT{rzs}, {r['held_days']}д, "
-              f"закрытие {r['last_price']:.6g}, hwm {r['hwm']:.6g})")
+              f"закрытие {r['last_price']:.6g}{day}, hwm {r['hwm']:.6g}, "
+              f"новых закрытий {r.get('new_closes', 0)})")
+        if r.get("note"):
+            print(f"           ⚠ {r['note']}")
         for s in r["signals"]:
-            print(f"           🔔 [{s['type']}] {s['action']} — {s['note']}")
+            when = f" ({closes.close_label(s['close_ts'])})" if s.get("close_ts") else ""
+            print(f"           🔔 [{s['type']}]{when} {s['action']} — {s['note']}")
         for ex in r.get("executed", []):
             print(f"           ⚙ [paper] {ex}")
     print(f"\n  Итого нереализованный P&L: {summary['pnl_total_usdt']:+.2f} USDT")
 
     if args.notify:
-        # Гибрид: по карточке на позицию с новым сигналом. Звук — только реальная позиция
-        # и сигнал high/medium; paper и информационные — тихо. Позиции целиком — в сводке
-        # дня (run.py brief). Близнецы B/S (A/B выхода и стопа) — тихий эксперимент: в
-        # карточки не идут, итог сравнения — в недельном report.
+        # Гибрид: по карточке на позицию и закрытие с новым сигналом. Звук — только реальная
+        # позиция и сигнал high/medium; paper и информационные — тихо. Позиции целиком — в
+        # сводке дня (run.py brief). Близнецы B/S — тихий эксперимент, в очередь не попадают.
+        # Очередь notify_outbox: карточка, не дошедшая в прошлый раз, уходит сейчас.
+        # Без --notify очередь не трогается — ручной просмотр не съедает уведомление.
         from scanner.notify import deliver
         from scanner.pipeline import _make_http
-        http = _make_http(cfg)
-        sent = 0
-        for r in rows:
-            if (r["position"].get("variant") or "A") != "A" or not r.get("signals"):
-                continue
-            card = deliver.exit_card(cfg, http, r)
-            ok = deliver.send_exit_card(cfg, card)
-            sent += 1
-            print(f"[telegram] сигнал {r['position']['symbol']}: {'ok' if ok else 'fail'} "
-                  f"({'со звуком' if card['loud'] else 'без звука'})")
-        if not sent:
+        sent, failed = deliver.flush_exit_outbox(cfg, _make_http(cfg))
+        if not (sent or failed):
             print("[telegram] новых сигналов нет — карточек нет (позиции — в run.py brief)")
-    return 0
+        if failed:
+            print(f"[telegram] не доставлено карточек: {failed} — остались в очереди")
+            code = 3
+    return code
 
 
 def cmd_brief(args) -> int:
@@ -787,8 +791,8 @@ def cmd_sync(args) -> int:
     ps = PositionStore(cfg["output"]["db_path"])
     try:
         code, lines = sync.run_sync(cfg, ps, lookup=lambda sym: _lookup_coin(cfg, sym))
-    except (bybit.BybitError, OSError) as e:   # сеть/ключ — без трейсбека, текст в лог
-        code, lines = 1, [f"FAIL: {type(e).__name__}: {e}"]
+    except (bybit.BybitError, OSError, sqlite3.Error) as e:   # сеть/ключ/база — текст в лог;
+        code, lines = 1, [f"FAIL: {type(e).__name__}: {e}"]    # исполнение не записано целиком
     finally:
         ps.close_db()
     for line in lines:
