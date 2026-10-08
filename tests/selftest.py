@@ -3665,6 +3665,10 @@ def test_ops_guard(cfg, failures: list[str]) -> None:
                    and any("через 10 дн. (2026-10-11)" in x for x in r_ip["issues"])
                    and r_30["level"] == "warn" and not any("истекает" in x
                                                           for x in r_30["issues"]), failures)
+            r_star = bybit.check_key({**ok_info, "ips": ["*"]}, "sync")
+            _check("ключ: ips ['*'] — не привязка: «без IP» в фактах, warn и без срока",
+                   r_star["level"] == "warn" and "без IP" in r_star["facts"]
+                   and any("IP" in x for x in r_star["issues"]), failures)
             tr = {"readOnly": 0, "permissions": {"Spot": ["SpotTrade"]}, "ips": ["1.2.3.4"],
                   "deadlineDay": -1}
             _check("ключ trade (демо): только Spot с IP — ok; лишние права, без IP, вывод — "
@@ -3747,6 +3751,13 @@ def test_ops_guard(cfg, failures: list[str]) -> None:
                    len(parts) >= 3 and all(tg.vis_len(p) <= tg.SPLIT_AT for p in parts) and bal
                    and "".join(flat(p) for p in parts) == flat(long)
                    and tg.split_html("<b>коротко</b>") == ["<b>коротко</b>"], failures)
+            straddle = tg.split_html("<b>" + "\n".join("z" * 90 for _ in range(12)) + "</b>",
+                                     limit=400)
+            _check("split_html: тег через границу — закрыт в конце части, открыт в следующей",
+                   len(straddle) >= 3
+                   and all(p.startswith("<b>") and p.endswith("</b>")
+                           and p.count("<b>") == p.count("</b>") == 1 for p in straddle),
+                   failures)
             posts = []
             tg._post = lambda token, method, data, ctype, timeout=30: (
                 posts.append(urllib.parse.parse_qs(data.decode())) or {"ok": True})
