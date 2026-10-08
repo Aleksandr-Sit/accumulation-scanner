@@ -31,6 +31,7 @@ TG_MAX_BYTES = 45 * 1024 * 1024     # лимит Bot API на файл — 50 М
 FLAG = "backup_sent"                 # отметка недельной отправки (position_events, id=0)
 EXIT_SEND_FAILED = 3                 # копия сделана, но в Telegram не ушла (сводка различает;
                                      # 1 — сбой/исключение, 2 — ошибка аргументов argparse)
+EXIT_SUSPECT = 4                     # копия сделана, но база меньше прошлой — старые не удалены
 
 
 class BackupError(RuntimeError):

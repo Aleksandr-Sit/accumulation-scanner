@@ -190,12 +190,21 @@ def send_exit_card(cfg, card: dict) -> bool:
 
 # ---------------------------------------------------------------- сводка дня
 
+TIMEOUT_CODES = (124, 137)      # timeout(1) в daily_run.sh: TERM по таймауту / KILL (или OOM)
+DISK_WARN_BYTES = 1024 ** 3     # меньше гигабайта свободно — предупреждение в шапке
+
+
 def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
                 watch_exit: int | None = None, backup_exit: int | None = None,
-                sync_exit: int | None = None, exec_exit: int | None = None) -> dict:
-    """Всё для сводки дня — из scanner.db, watchlist.json и среза трека Q, без сети."""
-    from .. import regime
-    from ..backup import EXIT_SEND_FAILED
+                sync_exit: int | None = None, exec_exit: int | None = None,
+                report_exit: int | None = None, quality_exit: int | None = None,
+                data_dir=None) -> dict:
+    """Всё для сводки дня — из scanner.db, watchlist.json, среза трека Q и data/ (стоп-кран,
+    опрос команд, ключ Bybit, состояние прошлого прогона), без сети. data_dir — для тестов."""
+    import shutil
+    from pathlib import Path
+    from .. import control, keycheck, regime, runguard
+    from ..backup import EXIT_SEND_FAILED, EXIT_SUSPECT
     from ..db import Store
     from ..pipeline import load_watchlist
     from ..positions import PositionStore
@@ -298,12 +307,30 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
     # бэкап: код шага из daily_run (нет кода — шаг не запускали, молчим)
     backup = None
     if backup_exit:
-        backup = "send_fail" if backup_exit == EXIT_SEND_FAILED else "fail"
+        backup = ("send_fail" if backup_exit == EXIT_SEND_FAILED
+                  else "suspect" if backup_exit == EXIT_SUSPECT else "fail")
     track_q = None
     if cfg.get("track_q.enabled", False):
         s = fresh_slice(cfg, now)
         track_q = {"ok": s["ok"], "date": s["date"], "age_days": s["age_days"]}
-    return {"scan": scan, "watch_ok": watch_ok, "undelivered": undelivered,
+    steps = (("quality", quality_exit), ("scan", scan_exit), ("sync", sync_exit),
+             ("watch", watch_exit), ("execute", exec_exit), ("report", report_exit),
+             ("backup", backup_exit))
+    try:
+        disk_free = shutil.disk_usage(Path(db).resolve().parent).free
+    except OSError:
+        disk_free = None
+    guard = {
+        # стоп-кран и опрос /stop из Telegram (scanner/control.py)
+        "halt": control.halted(data_dir), "poll_stale": control.poll_stale(data_dir, now),
+        "key": keycheck.load(data_dir, now),                  # самопроверка ключа Bybit
+        "prev_run": runguard.prev_line(data_dir),             # прошлый прогон оборвался
+        "timeouts": [n for n, c in steps if c in TIMEOUT_CODES],
+        "report_fail": bool(report_exit), "quality_fail": bool(quality_exit),
+        "config_warnings": cfg.get("_config_warnings") or [],
+        "disk_low": disk_free if disk_free is not None and disk_free < DISK_WARN_BYTES else None,
+    }
+    return {"guard": guard, "scan": scan, "watch_ok": watch_ok, "undelivered": undelivered,
             "market": ctx, "new": new, "muted": muted,
             "near": near, "positions": rows, "signals_today": sigs,
             "unavailable": summ.get("unavailable") or [], "dev_github": summ.get("dev_github"),

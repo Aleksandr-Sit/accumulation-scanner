@@ -104,11 +104,89 @@ def _parse_error(resp: dict | None) -> bool:
                 and "parse" in (resp.get("description") or "").lower())
 
 
+_TAG_RE = re.compile(r"<(/?)([a-zA-Z]+)[^>]*>")
+SPLIT_AT = TEXT_MAX - 96     # запас под «(часть i/n)» и расхождения подсчёта с Telegram
+
+
+def vis_len(text: str) -> int:
+    """Видимая длина в единицах UTF-16 — так Telegram считает лимит 4096 (эмодзи = 2)."""
+    return len(strip_html(text).encode("utf-16-le")) // 2
+
+
+def _open_tags(text: str, stack: list[str]) -> list[str]:
+    """Открытые теги (целиком, с атрибутами) после text, если до него были открыты stack."""
+    st = list(stack)
+    for m in _TAG_RE.finditer(text):
+        if not m.group(1):
+            st.append(m.group(0))
+            continue
+        for i in range(len(st) - 1, -1, -1):
+            if _TAG_RE.match(st[i]).group(2).lower() == m.group(2).lower():
+                del st[i:]
+                break
+    return st
+
+
+def split_html(text: str, limit: int = SPLIT_AT) -> list[str]:
+    """Длинное сообщение -> части не длиннее limit видимых символов. Режем по строкам, по
+    возможности по пустой строке (блок сводки не рвётся); тег, открытый на границе,
+    закрывается в конце части и открывается снова в начале следующей. Строка длиннее limit
+    уходит кусками без разметки."""
+    if vis_len(text) <= limit:
+        return [text]
+    lines: list[str] = []
+    for line in text.split("\n"):
+        if vis_len(line) <= limit:
+            lines.append(line)
+            continue
+        plain, step = strip_html(line), limit // 2          # //2: суррогатные пары эмодзи
+        lines += [html.escape(plain[i:i + step], quote=False) for i in range(0, len(plain), step)]
+    parts: list[str] = []
+    head: list[str] = []                 # теги, открытые до начала текущей части
+
+    def close(chunk: list[str]) -> None:
+        nonlocal head
+        body = "\n".join(chunk).strip("\n")
+        tail = _open_tags(body, head)
+        if strip_html(body).strip():
+            parts.append("".join(head) + body
+                         + "".join(f"</{_TAG_RE.match(t).group(2)}>" for t in reversed(tail)))
+        head = tail
+
+    cur: list[str] = []
+    for line in lines:
+        if cur and vis_len("\n".join(cur + [line])) > limit:
+            blank = max((i for i, x in enumerate(cur) if not x.strip()), default=-1)
+            if blank > len(cur) // 2:            # пустая строка во второй половине — режем там
+                close(cur[:blank])
+                cur = cur[blank + 1:]
+            if cur and vis_len("\n".join(cur + [line])) > limit:   # остаток всё ещё не влезает
+                close(cur)
+                cur = []
+        cur.append(line)
+    close(cur)
+    return parts
+
+
 def send_message(token: str, chat_id: str, text: str, silent: bool = False,
                  buttons: list[list[tuple[str, str]]] | None = None) -> bool:
+    """Длиннее лимита Telegram — частями (кнопки у последней); True — ушли все части."""
     if not token or not chat_id:
         print("[telegram] нет token/chat_id — пропуск отправки")
         return False
+    parts = split_html(text)
+    if len(parts) == 1:
+        return _send_text(token, chat_id, text, silent, buttons)
+    ok = True
+    for i, part in enumerate(parts, 1):
+        part += f"\n<i>(часть {i}/{len(parts)})</i>"
+        ok = _send_text(token, chat_id, part, silent,
+                        buttons if i == len(parts) else None) and ok
+    return ok
+
+
+def _send_text(token: str, chat_id: str, text: str, silent: bool,
+               buttons: list[list[tuple[str, str]]] | None) -> bool:
     form = "application/x-www-form-urlencoded"
     resp = _send(token, "sendMessage",
                  urllib.parse.urlencode(build_payload(chat_id, text, silent, buttons)).encode(),
@@ -741,11 +819,20 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
         head.append("⚠ бэкап не сделан")
     elif state.get("backup") == "send_fail":
         head.append("⚠ бэкап не ушёл в Telegram")
+    elif state.get("backup") == "suspect":
+        head.append("⚠ бэкап: база меньше прошлой копии — старые копии не удаляю")
     if state.get("sync_fail"):
         head.append("⚠ синхронизация с Bybit не прошла")
     if state.get("exec_fail"):
         head.append("⚠ пробный исполнитель упал")
-    lines = ["<b>" + " · ".join(head) + "</b>", ""]
+    g = state.get("guard") or {}
+    if g.get("report_fail"):
+        head.append("⚠ недельная сводка не ушла")
+    if g.get("quality_fail"):
+        head.append("⚠ срез трека Q не обновился")
+    if g.get("timeouts"):
+        head.append("⏱ убит по таймауту: " + ", ".join(g["timeouts"]))
+    lines = ["<b>" + " · ".join(head) + "</b>"] + guard_lines(g) + [""]
     lines += market_block(state.get("market") or {}, cfg, now)
     lines.append("")
 
@@ -810,12 +897,37 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
         foot.append(f"GitHub {state['dev_github']}")
     if "onchain" in (state.get("unavailable") or []):
         foot.append("on-chain недоступен")
+    if ((state.get("guard") or {}).get("key") or {}).get("level") == "ok":
+        foot.append("ключ Bybit ✓")
     if foot:
         lines.append("<i>" + _esc(" · ".join(foot)) + "</i>")
     note = track_q_note(state.get("track_q"), cfg)
     if note:                              # служебная пометка о данных — отдельной строкой
         lines.append(_esc(note))
     return "\n".join(lines).strip()
+
+
+def guard_lines(g: dict) -> list[str]:
+    """Строки защиты под шапкой сводки: стоп-кран, ключ Bybit, прошлый прогон оборвался,
+    /stop не читается, ключи в config.json, мало места на диске. Всё в порядке — пусто."""
+    out = []
+    if g.get("halt"):
+        from ..control import halt_line
+        out.append("<b>" + _esc(halt_line(g["halt"])) + "</b> — снять: python3 run.py resume "
+                   "(на сервере)")
+    key = g.get("key") or {}
+    if key.get("level") in ("warn", "danger", "error"):
+        from ..keycheck import line
+        out.append(("<b>" + _esc(line(key)) + "</b>") if key["level"] == "danger"
+                   else _esc(line(key)))
+    for k in ("prev_run", "poll_stale"):
+        if g.get(k):
+            out.append(_esc(g[k]))
+    out += ["⚠ " + _esc(w) for w in g.get("config_warnings") or []]
+    if g.get("disk_low") is not None:
+        out.append(f"⚠ на диске свободно {fmt_size(g['disk_low'])} — логи и бэкап скоро "
+                   f"перестанут писаться")
+    return out
 
 
 def _signal_text(stype: str, cfg) -> str:

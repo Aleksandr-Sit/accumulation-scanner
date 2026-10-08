@@ -13,13 +13,18 @@
   python run.py market [--backfill]         # история рынка альтов + индекс перегрева
   python run.py quality [--refresh-if-due]  # срез трека Q: дата, возраст; обновить, если пора
   python run.py backup [--send-weekly --notify]   # бэкап scanner.db (+ раз в неделю в Telegram)
-  python run.py sync                        # реальные позиции из исполнений Bybit (Read-Only)
+  python run.py sync [--notify]             # реальные позиции из исполнений Bybit (Read-Only)
   python run.py execute --dry-run           # пробный исполнитель: «поставил бы», без ордеров
+  python run.py halt [причина]              # стоп-кран исполнителя (снять — только resume)
+  python run.py resume                      # снять стоп-кран (только на сервере, по SSH)
+  python run.py control [--status]          # команды /stop /status из Telegram (таймер 5 мин)
+  python run.py killed [--why ...]          # «⚠ прогон убит», если прогон не дошёл до конца
   python run.py selftest                    # офлайн-проверка логики на фикстурах
 """
 from __future__ import annotations
 
 import argparse
+import html
 import sqlite3
 import sys
 
@@ -117,6 +122,37 @@ def _papers_opened_since(cfg, ts: float) -> dict[str, dict]:
            if p.get("is_paper") and (p.get("variant") or "A") == "A" and p["entry_ts"] >= ts}
     ps.close_db()
     return out
+
+
+def _say(*parts) -> None:
+    """print, который не роняет шаг: лог прогона — это stdout в logs/, и при полном диске
+    (ENOSPC) print бросает OSError раньше, чем сводка дня уйдёт в Telegram."""
+    try:
+        print(*parts)
+    except OSError:
+        pass
+
+
+class _SafeStream:
+    """stdout/stderr, запись в которые не бросает OSError (полный диск под logs/)."""
+
+    def __init__(self, stream):
+        self._s = stream
+
+    def write(self, s):
+        try:
+            return self._s.write(s)
+        except OSError:
+            return len(s)
+
+    def flush(self):
+        try:
+            self._s.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
 
 
 def _notify_failure(cfg, step: str, e: Exception) -> None:
@@ -488,18 +524,19 @@ def cmd_brief(args) -> int:
     try:
         state = deliver.brief_state(cfg, scan_exit=args.scan_exit, watch_exit=args.watch_exit,
                                     backup_exit=args.backup_exit, sync_exit=args.sync_exit,
-                                    exec_exit=args.exec_exit)
+                                    exec_exit=args.exec_exit, report_exit=args.report_exit,
+                                    quality_exit=args.quality_exit)
         text = telegram.format_brief(state, cfg, test=args.test)
     except Exception as e:
         if args.notify:
             _notify_failure(cfg, "brief", e)
         raise
-    print(telegram.strip_html(text))
+    _say(telegram.strip_html(text))
     if not args.notify:
         return 0
     ok = telegram.send_message(cfg.get("api_keys.telegram_token", ""),
                                cfg.get("api_keys.telegram_chat_id", ""), text, silent=True)
-    print(f"[telegram] сводка дня: {'ok' if ok else 'fail'}")
+    _say(f"[telegram] сводка дня: {'ok' if ok else 'fail'}")
     return 0 if ok else 1
 
 
@@ -673,21 +710,20 @@ def cmd_report(args) -> int:
         print(f"[report] блок пробного исполнителя пропущен: {type(e).__name__}: {e}")
     text = telegram.format_weekly(stats, cfg)
     print(text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
-    delivered = True
+    delivered = False
     if args.notify:
         delivered = telegram.send_message(cfg.get("api_keys.telegram_token", ""),
                                           cfg.get("api_keys.telegram_chat_id", ""), text,
                                           silent=True)
         print(f"[telegram] недельная сводка: {'ok' if delivered else 'fail'}")
-    # Флаги — только после доставки: сбой Telegram не должен «съесть» итоговую
-    # 4-недельную сводку или неделю.
+    # Флаги — только после доставки в Telegram: ручной просмотр (без --notify), прогон
+    # --no-notify и сбой отправки не должны «съесть» сводку недели и итоговую 4-недельную.
     if delivered:
         if milestone:
             pstore.set_system_flag("milestone_4w", f"week={week_no}")
-        if args.notify or args.if_due:
-            pstore.set_system_flag("weekly_report", f"week={week_no}")
+        pstore.set_system_flag("weekly_report", f"week={week_no}")
     pstore.close_db()
-    return 0
+    return 1 if args.notify and not delivered else 0
 
 
 def cmd_market(args) -> int:
@@ -784,10 +820,20 @@ def cmd_backup(args) -> int:
 
 def cmd_sync(args) -> int:
     """Реальные позиции из спот-исполнений Bybit (ключ Read-Only в .env). Нет ключа — тихий
-    пропуск, код 0; сбой API — код 1 (сводка дня: «⚠ синхронизация с Bybit не прошла»)."""
+    пропуск, код 0; сбой API — код 1 (сводка дня: «⚠ синхронизация с Bybit не прошла»).
+    Сначала самопроверка ключа (scanner/keycheck.py): итог — в сводку дня; опасность (право
+    вывода, ключ умеет торговать) — с --notify ещё и отдельным сообщением со звуком."""
     cfg = load_config(args.config)
-    from scanner import bybit, sync
+    from scanner import bybit, keycheck, sync
     from scanner.positions import PositionStore
+    kc = keycheck.run(cfg)
+    if kc:
+        print(f"[sync] {keycheck.line(kc)}")
+        if kc["level"] == "danger" and getattr(args, "notify", False):
+            from scanner.notify import telegram
+            telegram.send_message(cfg.get("api_keys.telegram_token", ""),
+                                  cfg.get("api_keys.telegram_chat_id", ""),
+                                  "<b>" + html.escape(keycheck.line(kc)) + "</b>")
     ps = PositionStore(cfg["output"]["db_path"])
     try:
         code, lines = sync.run_sync(cfg, ps, lookup=lambda sym: _lookup_coin(cfg, sym))
@@ -844,6 +890,70 @@ def cmd_execute(args) -> int:
         code, lines = 1, [f"FAIL: {type(e).__name__}: {e}"]
     for line in lines:
         print(f"[execute] {line}")
+    return code
+
+
+def _tell_owner(cfg, text: str) -> None:
+    """Сообщение владельцу о стоп-кране (без исключений: стоп важнее доставки)."""
+    try:
+        from scanner.notify import telegram
+        telegram.send_message(cfg.get("api_keys.telegram_token", ""),
+                              cfg.get("api_keys.telegram_chat_id", ""), text)
+    except Exception as e:  # noqa: BLE001
+        _say(f"[telegram] не отправлено: {type(e).__name__}: {e}")
+
+
+def cmd_halt(args) -> int:
+    """Стоп-кран с сервера: исполнитель не ставит лестниц и не исполняет ордеров до resume."""
+    from scanner import control
+    cfg = load_config(args.config)
+    info = control.set_halt(" ".join(args.reason) or "остановлен на сервере", "сервер")
+    line = control.halt_line(info)
+    print(line + "\nСнять: python3 run.py resume")
+    if not args.quiet:
+        _tell_owner(cfg, html.escape(line) + "\nСнять — только на сервере: python3 run.py resume")
+    return 0
+
+
+def cmd_resume(args) -> int:
+    """Снять стоп-кран. Только с сервера (по SSH): из Telegram нельзя. Владельцу — сообщение,
+    чтобы снятие чужими руками не прошло тихо."""
+    from scanner import control
+    cfg = load_config(args.config)
+    was = control.clear_halt()
+    if not was:
+        print("стоп-крана не было — исполнитель и так работает")
+        return 0
+    print(f"стоп-кран снят (был: {control.halt_line(was)})")
+    if not args.quiet:
+        _tell_owner(cfg, "▶️ Стоп-кран снят на сервере — исполнитель снова работает со "
+                         "следующего прогона.\n<i>Был: "
+                         + html.escape(control.halt_line(was)) + "</i>")
+    return 0
+
+
+def cmd_control(args) -> int:
+    """Опрос команд владельца в Telegram (/stop, /status, /help) — таймер раз в 5 минут.
+    --status: то же, что /status, в консоль (без Telegram)."""
+    from scanner import control
+    cfg = load_config(args.config)
+    if args.status:
+        print(control.status_text(cfg["output"]["db_path"]))
+        return 0
+    code, log = control.poll(cfg)
+    for line in log:
+        if line != "новых команд нет":         # журнал таймера — только события
+            print(f"[control] {line}")
+    return code
+
+
+def cmd_killed(args) -> int:
+    """«⚠ прогон убит»: зовут trap daily_run.sh и scanner-alert.service (OnFailure=). Сообщает,
+    только если прогон не дошёл до сводки дня и о нём ещё не сообщали."""
+    from scanner import runguard
+    cfg = load_config(args.config)
+    code, msg = runguard.alert(cfg, why=args.why)
+    _say(f"[killed] {msg}")
     return code
 
 
@@ -928,6 +1038,10 @@ def main() -> int:
                          "прошла» в строке статуса")
     pb.add_argument("--exec-exit", type=int, default=None,
                     help="код выхода execute из daily_run: ≠ 0 — «⚠ пробный исполнитель упал»")
+    pb.add_argument("--report-exit", type=int, default=None,
+                    help="код выхода report из daily_run: ≠ 0 — «⚠ недельная сводка не ушла»")
+    pb.add_argument("--quality-exit", type=int, default=None,
+                    help="код выхода quality из daily_run: ≠ 0 — «⚠ срез трека Q не обновился»")
     pb.add_argument("--config", default=None)
     pb.set_defaults(func=cmd_brief)
 
@@ -974,6 +1088,8 @@ def main() -> int:
 
     psy = sub.add_parser("sync", help="реальные позиции из спот-исполнений Bybit (ключ "
                                       "Read-Only в .env; нет ключа — пропуск)")
+    psy.add_argument("--notify", action="store_true",
+                     help="опасный ключ (право вывода, торговля) — сообщение со звуком")
     psy.add_argument("--config", default=None)
     psy.set_defaults(func=cmd_sync)
 
@@ -983,6 +1099,31 @@ def main() -> int:
                      help="обязателен: реального режима пока нет (шаги 3–4)")
     pex.add_argument("--config", default=None)
     pex.set_defaults(func=cmd_execute)
+
+    ph = sub.add_parser("halt", help="стоп-кран: исполнитель не ставит лестниц и не "
+                                     "исполняет ордеров (снять — run.py resume)")
+    ph.add_argument("reason", nargs="*", help="причина (попадёт в сводку дня)")
+    ph.add_argument("--quiet", action="store_true", help="не сообщать в Telegram")
+    ph.add_argument("--config", default=None)
+    ph.set_defaults(func=cmd_halt)
+
+    pre = sub.add_parser("resume", help="снять стоп-кран (только здесь, на сервере)")
+    pre.add_argument("--quiet", action="store_true", help="не сообщать в Telegram")
+    pre.add_argument("--config", default=None)
+    pre.set_defaults(func=cmd_resume)
+
+    pco = sub.add_parser("control", help="команды владельца из Telegram: /stop, /status "
+                                         "(таймер scanner-control раз в 5 минут)")
+    pco.add_argument("--status", action="store_true",
+                     help="показать состояние в консоли, без Telegram")
+    pco.add_argument("--config", default=None)
+    pco.set_defaults(func=cmd_control)
+
+    pki = sub.add_parser("killed", help="«⚠ прогон убит» в Telegram, если прогон не дошёл "
+                                        "до сводки (trap daily_run.sh, OnFailure=)")
+    pki.add_argument("--why", default="", help="причина: сигнал, systemd")
+    pki.add_argument("--config", default=None)
+    pki.set_defaults(func=cmd_killed)
 
     pt = sub.add_parser("selftest", help="офлайн-проверка на фикстурах")
     pt.set_defaults(func=cmd_selftest)
@@ -996,6 +1137,8 @@ def main() -> int:
     pg.set_defaults(func=cmd_tgtest)
 
     args = p.parse_args()
+    # лог прогона — stdout в logs/: полный диск не должен ронять шаг посреди работы
+    sys.stdout, sys.stderr = _SafeStream(sys.stdout), _SafeStream(sys.stderr)
     return args.func(args)
 
 

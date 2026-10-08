@@ -290,10 +290,7 @@
   },
 
   "api_keys": {
-    "_note": "Пусто = используем free/demo. Переопределяется env: COINGECKO_DEMO_KEY, GOPLUS_KEY, DUNE_API_KEY.",
-    "coingecko_demo": "",
-    "goplus": "",
-    "dune": ""
+    "_note": "Ключи сюда НЕ вписывать: репозиторий публичный. Только .env (права 600): COINGECKO_DEMO_KEY, GOPLUS_KEY, DUNE_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_OWNER_ID (необяз.), BYBIT_API_KEY, BYBIT_API_SECRET. Непустое значение здесь игнорируется с предупреждением в сводке. Нет ключа — free/demo или шаг пропускается."
   },
 
   "output": {

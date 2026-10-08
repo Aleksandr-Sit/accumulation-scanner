@@ -1,0 +1,10 @@
+[Unit]
+Description=Accumulation Scanner — сообщение «прогон убит» (OnFailure= ежедневного прогона)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/scanner
+Environment=PYTHONIOENCODING=utf-8 PYTHONUTF8=1
+# Сообщает, только если прогон не дошёл до сводки дня и о нём ещё не сообщали (data/daily_run.state).
+ExecStart=/usr/bin/timeout 120 /usr/bin/python3 -u /opt/scanner/run.py killed --why "прогон завершился аварийно (systemd)"
+TimeoutStartSec=3min

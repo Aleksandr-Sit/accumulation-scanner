@@ -109,6 +109,11 @@ class Client:
                              + (f" — {hint}" if hint else ""), code)
         return data.get("result") or {}
 
+    def api_key_info(self) -> dict:
+        """GET /v5/user/query-api — права, IP и срок жизни этого же ключа (доступно любому
+        ключу, в том числе Read-Only)."""
+        return self.get("/v5/user/query-api", {})
+
     def wallet_balance(self) -> dict[str, dict[str, float]]:
         """Ненулевые монеты единого счёта -> {COIN: {"balance", "usd", "locked"}}."""
         res = self.get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
@@ -154,3 +159,51 @@ def _num(x) -> float:
         return float(x)
     except (TypeError, ValueError):
         return 0.0
+
+
+def check_key(info: dict, role: str = "sync", warn_days: int = 14) -> dict:
+    """Ответ /v5/user/query-api -> {"level": ok|warn|danger, "issues": [...], "facts": [...]}.
+    role "sync" — ключ синхронизации: только Read-Only (readOnly=1). role "trade" — торговый
+    ключ демо-счёта (блок F): торговля, но только Spot. Обоим нельзя право вывода (Withdraw) и
+    нужна привязка к IP: ключ без IP живёт 90 дней, deadlineDay — сколько осталось (у ключа
+    с IP — −1/−2, срока нет). Сверено с docs/v5/user/apikey-info 08.10.2026: у Read-Only ключа
+    permissions всё равно перечисляют категории (ContractTrade, Spot…) — для sync решает
+    readOnly."""
+    perms = {k: [str(x) for x in v] for k, v in (info.get("permissions") or {}).items() if v}
+    ro = info.get("readOnly") == 1
+    withdraw = "Withdraw" in perms.get("Wallet", [])
+    ips = [str(x).strip() for x in info.get("ips") or [] if str(x).strip()]
+    bound = bool(ips) and "*" not in ips
+    dd = info.get("deadlineDay")
+    days_left = dd if isinstance(dd, int) and dd >= 0 else None
+    issues: list[tuple[str, str]] = []
+    if withdraw:
+        issues.append(("danger", "у ключа есть право ВЫВОДА средств — удали его на bybit.com "
+                                 "и создай новый без Withdraw"))
+    if role == "sync":
+        if not ro:
+            issues.append(("danger", "ключ может торговать (не Read-Only) — для sync нужен "
+                                     "ключ только на чтение"))
+    else:
+        if ro:
+            issues.append(("warn", "ключ только на чтение — ордера им не поставить"))
+        extra = sorted(k for k in perms if k != "Spot")
+        if extra:
+            issues.append(("danger", "лишние права: " + ", ".join(extra) + " — нужен только Spot"))
+        if "SpotTrade" not in perms.get("Spot", []):
+            issues.append(("warn", "нет права SpotTrade"))
+    if not bound:
+        issues.append(("warn" if role == "sync" else "danger",
+                       "ключ не привязан к IP сервера — укради его кто-то, им можно "
+                       "пользоваться откуда угодно, и он истечёт через 90 дней"))
+    if days_left is not None and days_left <= warn_days:
+        issues.append(("warn", f"ключ истекает через {days_left} дн. "
+                               f"({str(info.get('expiredAt') or '')[:10]}) — создай новый с "
+                               f"привязкой к IP"))
+    level = ("danger" if any(lv == "danger" for lv, _ in issues)
+             else "warn" if issues else "ok")
+    facts = ["только чтение" if ro else "торговля",
+             "вывода нет" if not withdraw else "ЕСТЬ ВЫВОД",
+             "IP привязан" if bound else "без IP",
+             "бессрочный" if days_left is None else f"ещё {days_left} дн."]
+    return {"role": role, "level": level, "issues": [t for _, t in issues], "facts": facts}

@@ -730,14 +730,22 @@ def _vol_ranks(market, now: float) -> dict:
 
 def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None,
             wallet_usdt: float | None = None, wallet_note: str = "",
-            mctx: dict | None = None) -> tuple[int, list[str]]:
+            mctx: dict | None = None, halt_base=None) -> tuple[int, list[str]]:
     """Шаг ежедневного прогона -> (код выхода, строки лога). Сбой одной позиции не валит
     остальные, но код станет 1 (сводка дня: «⚠ пробный исполнитель упал»). mctx — контекст
     рынка (run.py execute: sources.market.load_context); None — из market_daily этой БД.
-    Места по обороту (market.vol_ranks) считаются, только если сегодня есть карточки."""
+    Места по обороту (market.vol_ranks) считаются, только если сегодня есть карточки.
+    Стоп-кран (scanner/control.py, data/HALT; halt_base — каталог для тестов) — исполнитель
+    не делает ничего: ни новых лестниц, ни исполнений и продаж по открытым; база не меняется.
+    После `run.py resume` открытые досчитываются со своего места (fills_until, last_day)."""
     s = settings(cfg)
     if not s.get("enabled", True):
         return 0, ["executor.enabled = false — пропуск"]
+    from . import control
+    halt = control.halted(halt_base)
+    if halt:
+        return 0, [control.halt_line(halt) + " — новых лестниц и исполнений нет; снять: "
+                   "python3 run.py resume (на сервере)"]
     now = now if now is not None else time.time()
     con = connect(db_path or cfg["output"]["db_path"])
     lines: list[str] = []

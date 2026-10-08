@@ -8,13 +8,15 @@
 останавливать: угнанный аккаунт Telegram может остановить исполнителя, но не запустить его.
 Файл, который не читается, считается стоп-краном: сомнение — в пользу остановки.
 
-Команды владельца (`run.py control --poll`, таймер раз в 5 минут), только из чата
-TELEGRAM_CHAT_ID:
+Команды владельца (`run.py control`, таймер scanner-control.timer раз в 5 минут) — только
+из чата TELEGRAM_CHAT_ID и только от его владельца (from.id = TELEGRAM_OWNER_ID, по умолчанию
+= TELEGRAM_CHAT_ID: в личном чате с ботом id чата и id человека совпадают; в группе команду
+участника, а не владельца, не исполняем):
   /stop [причина] — стоп-кран;
   /status         — стоп-кран, последний прогон, позиции, книги исполнителя;
   /help           — список команд.
-Сообщения из чужих чатов не исполняются; владельцу уходит одно предупреждение на каждый
-такой чат.
+Сообщения из чужих чатов и от чужих людей не исполняются; владельцу уходит одно
+предупреждение на каждого такого отправителя.
 """
 from __future__ import annotations
 
@@ -89,6 +91,18 @@ def halt_line(info: dict | None) -> str:
     return f"⛔ исполнитель остановлен с {when} ({info.get('by')}): {info.get('reason')}"
 
 
+def poll_stale(base: Path | None = None, now: float | None = None,
+               max_age_sec: float = 3600) -> str:
+    """Пусто — команды из Telegram читаются (или опрос ни разу не запускали: таймера нет);
+    иначе предупреждение для сводки дня: /stop сейчас не сработает."""
+    last = _state(base).get("last_poll")
+    now = now if now is not None else time.time()
+    if not isinstance(last, (int, float)) or now - last <= max_age_sec:
+        return ""
+    when = time.strftime("%d.%m %H:%M", time.localtime(last))
+    return f"⚠ команды из Telegram не читаются с {when} — /stop не сработает (scanner-control.timer)"
+
+
 # ---------------------------------------------------------------- команды из Telegram
 
 def _state(base: Path | None) -> dict:
@@ -108,9 +122,12 @@ def _save_state(st: dict, base: Path | None) -> None:
     tmp.replace(p)
 
 
-def parse_updates(updates: list[dict], owner_chat: str) -> tuple[list[dict], list[dict], int | None]:
-    """Разбор getUpdates: (команды владельца, сообщения из чужих чатов, последний update_id).
-    Команда — {cmd, arg, update_id}; чужое — {chat_id, name, update_id}."""
+def parse_updates(updates: list[dict], owner_chat: str,
+                  owner_user: str | None = None) -> tuple[list[dict], list[dict], int | None]:
+    """Разбор getUpdates: (команды владельца, чужие сообщения, последний update_id).
+    Команда — {cmd, arg, update_id}; чужое — {chat_id, from_id, name, update_id}.
+    Владелец — чат owner_chat И отправитель owner_user (None — тот же id, что у чата)."""
+    owner_user = str(owner_user or owner_chat)
     own, foreign, last = [], [], None
     for u in updates:
         uid = u.get("update_id")
@@ -118,12 +135,15 @@ def parse_updates(updates: list[dict], owner_chat: str) -> tuple[list[dict], lis
             last = uid if last is None else max(last, uid)
         msg = u.get("message") or u.get("edited_message") or {}
         chat = msg.get("chat") or {}
+        sender = msg.get("from") or {}
         text = (msg.get("text") or "").strip()
         if chat.get("id") is None:
             continue
-        if str(chat["id"]) != str(owner_chat):
-            foreign.append({"chat_id": str(chat["id"]), "update_id": uid,
-                            "name": chat.get("username") or chat.get("first_name") or ""})
+        if str(chat["id"]) != str(owner_chat) or str(sender.get("id")) != owner_user:
+            foreign.append({"chat_id": str(chat["id"]), "from_id": str(sender.get("id")),
+                            "update_id": uid,
+                            "name": (sender.get("username") or sender.get("first_name")
+                                     or chat.get("username") or chat.get("title") or "")})
             continue
         if not text.startswith("/"):
             continue
@@ -139,24 +159,30 @@ def status_text(db_path: str, base: Path | None = None, now: float | None = None
     h = halted(base)
     lines = [halt_line(h) if h else "✅ исполнитель работает (стоп-крана нет)"]
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+        con = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True, timeout=10)
+        con.row_factory = sqlite3.Row
         try:
-            r = con.execute("SELECT id, ts, finished_ts, n_watchlist FROM runs "
-                            "ORDER BY id DESC LIMIT 1").fetchone()
+            # SELECT *: у старых баз нет finished_ts; n_watchlist пишет только finish_run —
+            # завершённость как в deliver.brief_state
+            r = con.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
             if r:
-                ago = (now - (r[2] or r[1])) / 3600
-                state = "завершён" if r[2] else "не завершён"
-                lines.append(f"последний скан #{r[0]}: {state} {ago:.0f} ч назад, "
-                             f"в наблюдении {r[3]}")
+                r = dict(r)
+                done = bool(r.get("finished_ts") or r.get("n_watchlist") is not None)
+                ago = (now - (r.get("finished_ts") or r["ts"])) / 3600
+                lines.append(f"последний скан #{r['id']}: "
+                             + (f"завершён {ago:.0f} ч назад, в наблюдении {r['n_watchlist']}"
+                                if done else f"не завершён (начат {ago:.0f} ч назад)"))
+            # близнецы B/S (A/B выхода и стопа) — копии paper-позиции, не отдельные позиции
             p = con.execute("SELECT SUM(is_paper = 0), SUM(is_paper = 1) FROM positions "
-                            "WHERE status = 'open'").fetchone()
+                            "WHERE status = 'open' AND COALESCE(variant, 'A') = 'A'").fetchone()
             lines.append(f"позиции: 💰 реальных {p[0] or 0} · 📝 paper {p[1] or 0}")
             tabs = {t for (t,) in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if "dry_positions" in tabs:
-                for book, n, inv in con.execute(
-                        "SELECT book, COUNT(*), SUM(invested) FROM dry_positions "
-                        "WHERE status = 'open' AND COALESCE(shadow, 0) = 0 GROUP BY book"):
-                    lines.append(f"книга {book}: открыто {n}, вложено ${inv or 0:.2f}")
+                for book, n, spent in con.execute(
+                        "SELECT book, COUNT(*), SUM(spent_usdt) FROM dry_positions "
+                        "WHERE status = 'open' AND COALESCE(shadow, 0) = 0 GROUP BY book "
+                        "ORDER BY book DESC"):
+                    lines.append(f"пробная книга {book}: открыто {n}, вложено ${spent or 0:.2f}")
         finally:
             con.close()
     except sqlite3.Error as e:
@@ -171,6 +197,7 @@ def poll(cfg, *, base: Path | None = None, now: float | None = None, fetch=None,
     from scanner.notify import telegram
     token = cfg.get("api_keys.telegram_token", "")
     owner = str(cfg.get("api_keys.telegram_chat_id", ""))
+    owner_user = str(cfg.get("api_keys.telegram_owner_id", "") or owner)
     if not token or not owner:
         return 0, ["нет TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID — команды не читаются"]
     st = _state(base)
@@ -189,7 +216,7 @@ def poll(cfg, *, base: Path | None = None, now: float | None = None, fetch=None,
     updates = fetch(offset)
     if updates is None:
         return 1, ["Telegram getUpdates не ответил"]
-    own, foreign, last = parse_updates(updates, owner)
+    own, foreign, last = parse_updates(updates, owner, owner_user)
     log = []
     db_path = cfg.get("output.db_path", "scanner.db")
     for c in own:
@@ -211,12 +238,14 @@ def poll(cfg, *, base: Path | None = None, now: float | None = None, fetch=None,
             log.append(f"{c['cmd']} → неизвестна")
     warned = set(st.get("warned_chats") or [])
     for f in foreign:
-        if f["chat_id"] in warned:
+        key = f"{f['chat_id']}/{f['from_id']}"
+        if key in warned:
             continue
-        warned.add(f["chat_id"])
-        send(f"⚠ Боту пишет чужой чат {f['chat_id']} {('@' + f['name']) if f['name'] else ''}"
-             f" — команды из него не исполняются.")
-        log.append(f"чужой чат {f['chat_id']} — предупредил")
+        warned.add(key)
+        who = f"{f['from_id']}" + (f" ({f['name']})" if f["name"] else "")
+        send(f"⚠ Боту пишет чужой: отправитель {who}, чат {f['chat_id']} — команды не "
+             f"исполняются.")
+        log.append(f"чужой {key} — предупредил")
     if last is not None:
         st["offset"] = last + 1                  # подтверждаем: Telegram их больше не отдаст
     st["warned_chats"] = sorted(warned)

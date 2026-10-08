@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -41,23 +42,30 @@ class Config:
         return cur
 
 
+# api_keys.<имя> <- переменная окружения (.env). Других источников ключей нет.
+ENV_KEYS = {"coingecko_demo": "COINGECKO_DEMO_KEY", "goplus": "GOPLUS_KEY",
+            "dune": "DUNE_API_KEY", "telegram_token": "TELEGRAM_BOT_TOKEN",
+            "telegram_chat_id": "TELEGRAM_CHAT_ID", "telegram_owner_id": "TELEGRAM_OWNER_ID",
+            "bybit_key": "BYBIT_API_KEY", "bybit_secret": "BYBIT_API_SECRET"}
+
+
 def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     _load_dotenv()
     p = Path(path) if path else _DEFAULT_PATH
     data = json.loads(p.read_text(encoding="utf-8"))
 
-    # Секреты из окружения приоритетнее файла.
+    # Ключи — только из окружения (.env, права 600): репозиторий публичный, ключ, вписанный
+    # в config.json, уйдёт в git с первым же коммитом. Непустое значение из файла не
+    # используется — предупреждение в лог и в сводку дня (_config_warnings).
     keys = data.setdefault("api_keys", {})
-    if os.getenv("COINGECKO_DEMO_KEY"):
-        keys["coingecko_demo"] = os.environ["COINGECKO_DEMO_KEY"]
-    if os.getenv("GOPLUS_KEY"):
-        keys["goplus"] = os.environ["GOPLUS_KEY"]
-    if os.getenv("DUNE_API_KEY"):
-        keys["dune"] = os.environ["DUNE_API_KEY"]
-    keys["telegram_token"] = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    keys["telegram_chat_id"] = os.getenv("TELEGRAM_CHAT_ID", "")
-    # Ключ Bybit Read-Only для run.py sync — только из .env, в config.json его нет.
-    keys["bybit_key"] = os.getenv("BYBIT_API_KEY", "")
-    keys["bybit_secret"] = os.getenv("BYBIT_API_SECRET", "")
+    leaked = sorted(k for k, v in keys.items()
+                    if not k.startswith("_") and isinstance(v, str) and v.strip())
+    if leaked:
+        warn = (f"config.json: в api_keys есть ключи ({', '.join(leaked)}) — не использую; "
+                f"ключи только в .env, а из config.json и истории git их убрать")
+        data["_config_warnings"] = [warn]
+        print(f"[config] ⚠ {warn}", file=sys.stderr)
+    for name, env in ENV_KEYS.items():
+        keys[name] = os.getenv(env, "")
 
     return Config(data)

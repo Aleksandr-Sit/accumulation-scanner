@@ -2,11 +2,14 @@
 Description=Accumulation Scanner — ежедневный прогон (scan, watch, report, brief)
 After=network-online.target
 Wants=network-online.target
+# Прогон убит (таймаут, OOM, kill) — «⚠ прогон убит» в Telegram. Сбой отдельного шага сюда
+# тоже приводит, но scanner-alert молчит: прогон дошёл до сводки дня (scanner/runguard.py).
+OnFailure=scanner-alert.service
 
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/scanner
 ExecStart=/usr/bin/bash /opt/scanner/scripts/daily_run.sh
-# Прогон ~25 мин; больше двух часов — завис.
-TimeoutStartSec=2h
+# Прогон ~25 мин; у шагов свои таймауты (сумма 3 ч 15 мин) — больше четырёх часов не бывает.
+TimeoutStartSec=4h
 Nice=10

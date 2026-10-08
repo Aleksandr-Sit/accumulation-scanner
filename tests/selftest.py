@@ -3462,10 +3462,496 @@ def test_executor_filters(cfg, failures: list[str]) -> None:
                                       "обороту (302-е место из 370)" in exb, failures)
 
 
+def test_ops_guard(cfg, failures: list[str]) -> None:
+    print("Защита и эксплуатация (блок D): стоп-кран, ключ Bybit, длинная сводка, report, "
+          "сторож прогона, ключи в config.json, daily_run.sh:")
+    import copy
+    import errno
+    import io
+    import json as _json
+    import os
+    import re
+    import sqlite3
+    import sys
+    import tempfile
+    import types
+    import urllib.parse
+    from pathlib import Path as _P
+    import run as run_cli
+    from scanner import bybit, control, executor as ex, keycheck, runguard
+    from scanner.config import Config, load_config as _load
+    from scanner.db import Store
+    from scanner.notify import deliver, telegram as tg
+
+    root = _P(__file__).resolve().parent.parent
+    d0 = 1790812800                                  # 2026-10-01 00:00 UTC
+    now = d0 + 6 * 3600 + 1800
+    env_saved = {k: os.environ.get(k) for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+                                                "TELEGRAM_OWNER_ID", "DUNE_API_KEY")}
+    real_post, real_sleep, real_out = tg._post, tg._sleep, sys.stdout
+    tg._sleep = lambda s: None
+    os.environ.update(TELEGRAM_BOT_TOKEN="T", TELEGRAM_CHAT_ID="42")
+    os.environ.pop("TELEGRAM_OWNER_ID", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            T = _P(tmp)
+            base = T / "data"
+            db = str(T / "t.db")
+            d = copy.deepcopy(cfg._d)
+            d["output"] = {**d.get("output", {}), "db_path": db,
+                           "watchlist_json": str(T / "wl.json")}
+            d["api_keys"] = {**d.get("api_keys", {}), "telegram_token": "T",
+                             "telegram_chat_id": "42", "telegram_owner_id": ""}
+            c = Config(d)
+            cpath = T / "cfg.json"
+            cpath.write_text(_json.dumps(d, ensure_ascii=False), encoding="utf-8")
+            Store(db).close()
+            PositionStore(db).close_db()
+            ex.connect(db).close()
+
+            # (а) /status: старая база без finished_ts, близнецы B/S, вложено = spent_usdt
+            old = str(T / "old.db")
+            con = sqlite3.connect(old)
+            con.executescript(
+                "CREATE TABLE runs (id INTEGER PRIMARY KEY, ts REAL, n_ingested INT, "
+                "n_stage1 INT, n_watchlist INT, cfg_version TEXT);"
+                "CREATE TABLE positions (id INTEGER PRIMARY KEY, symbol TEXT, status TEXT, "
+                "is_paper INT, variant TEXT);"
+                "CREATE TABLE dry_positions (id INTEGER PRIMARY KEY, book TEXT, status TEXT, "
+                "shadow INT, spent_usdt REAL);")
+            con.execute("INSERT INTO runs VALUES (1, ?, 900, 100, 83, 'x')", (now - 3 * 3600,))
+            con.executemany("INSERT INTO positions(symbol, status, is_paper, variant) "
+                            "VALUES (?,?,?,?)", [("GRAM", "open", 1, "A"), ("GRAM", "open", 1, "B"),
+                                                 ("GRAM", "open", 1, "S"), ("LUNC", "open", 0, None)])
+            con.executemany("INSERT INTO dry_positions(book, status, shadow, spent_usdt) "
+                            "VALUES (?,?,?,?)", [("R", "open", 0, 30.0), ("R", "open", 0, 20.0),
+                                                 ("H", "open", 0, 50.0), ("R", "open", 1, 99.0),
+                                                 ("R", "closed", 0, 10.0)])
+            con.commit()
+            con.close()
+            st_old = control.status_text(old, base, now)
+            st_new = control.status_text(db, base, now)
+            _check("/status: база без finished_ts — «завершён 3 ч назад, в наблюдении 83»",
+                   "завершён 3 ч назад, в наблюдении 83" in st_old, failures)
+            _check("/status: близнецы B/S не считаются (paper 1, реальных 1)",
+                   "реальных 1 · 📝 paper 1" in st_old, failures)
+            _check("/status: книги по spent_usdt без тени и закрытых (R $50 из 2, H $50)",
+                   "пробная книга R: открыто 2, вложено $50.00" in st_old
+                   and "пробная книга H: открыто 1, вложено $50.00" in st_old, failures)
+            _check("/status: на схеме из кода база читается (колонки совпадают)",
+                   "не читается" not in st_new and "не читается" not in st_old, failures)
+
+            # (б) команды: только владелец; в группе — только его from.id
+            ups = [{"update_id": 10, "message": {"chat": {"id": 42, "type": "private"},
+                                                 "from": {"id": 42},
+                                                 "text": "/stop@Scannerb_bot падает биржа"}},
+                   {"update_id": 11, "message": {"chat": {"id": 42}, "from": {"id": 999,
+                                                 "username": "mallory"}, "text": "/status"}},
+                   {"update_id": 12, "message": {"chat": {"id": 7}, "from": {"id": 42},
+                                                 "text": "/stop"}},
+                   {"update_id": 13, "edited_message": {"chat": {"id": 42}, "from": {"id": 42},
+                                                        "text": "просто текст"}}]
+            own, foreign, last = control.parse_updates(ups, "42")
+            _check("команды: /stop@бот с причиной — от владельца; чужой from.id и чужой чат — "
+                   "не команды",
+                   own == [{"cmd": "/stop", "arg": "падает биржа", "update_id": 10}]
+                   and {(f["chat_id"], f["from_id"]) for f in foreign} == {("42", "999"),
+                                                                           ("7", "42")}
+                   and last == 13, failures)
+            grp = [{"update_id": 1, "message": {"chat": {"id": -100123, "type": "group"},
+                                                "from": {"id": 999}, "text": "/stop"}},
+                   {"update_id": 2, "message": {"chat": {"id": -100123, "type": "group"},
+                                                "from": {"id": 42}, "text": "/status"}}]
+            g_own, g_foreign, _ = control.parse_updates(grp, "-100123", "42")
+            g_def, _, _ = control.parse_updates(grp, "-100123")
+            _check("команды в группе: участник 999 не владелец, владелец 42 — да; без "
+                   "TELEGRAM_OWNER_ID в группе не исполняется ничего",
+                   [x["cmd"] for x in g_own] == ["/status"] and len(g_foreign) == 1
+                   and g_def == [], failures)
+
+            sent, offsets = [], []
+            batches = [ups, [{"update_id": 14, "message": {"chat": {"id": 42},
+                                                           "from": {"id": 999}, "text": "/stop"}},
+                             {"update_id": 15, "message": {"chat": {"id": 42}, "from": {"id": 42},
+                                                           "text": "/resume"}},
+                             {"update_id": 16, "message": {"chat": {"id": 42}, "from": {"id": 42},
+                                                           "text": "/status"}}]]
+
+            def fetch(off):
+                offsets.append(off)
+                return batches.pop(0) if batches else []
+            rc1, _ = control.poll(c, base=base, now=now, fetch=fetch,
+                                  send=lambda t: sent.append(t) or True)
+            h1 = control.halted(base)
+            n1 = len(sent)
+            rc2, _ = control.poll(c, base=base, now=now + 300, fetch=fetch,
+                                  send=lambda t: sent.append(t) or True)
+            _check("/stop владельца ставит стоп-кран с причиной, ответ «⛔»; чужим — одно "
+                   "предупреждение на отправителя",
+                   rc1 == 0 and h1 and h1["reason"] == "падает биржа" and h1["by"] == "telegram"
+                   and n1 == 3 and "⛔" in sent[0]
+                   and sum("чужой" in s for s in sent[:n1]) == 2, failures)
+            _check("повторный чужой — без нового предупреждения; /resume из Telegram — отказ, "
+                   "стоп-кран на месте; /status — «остановлен»; offset = последний + 1",
+                   rc2 == 0 and len(sent) == n1 + 2 and "только на сервере" in sent[n1]
+                   and "остановлен" in sent[n1 + 1] and control.halted(base) is not None
+                   and offsets == [None, 14]
+                   and _json.loads((base / control.STATE_NAME).read_text(
+                       encoding="utf-8"))["offset"] == 17, failures)
+            _check("опрос команд: свежий — тихо; молчит больше часа — предупреждение",
+                   control.poll_stale(base, now + 600) == ""
+                   and "/stop не сработает" in control.poll_stale(base, now + 2 * 3600), failures)
+            (base / control.HALT_NAME).write_text("{битый", encoding="utf-8")
+            bad = control.halted(base)
+            _check("стоп-кран: нечитаемый файл = стоп", bool(bad) and "не читается" in
+                   bad["reason"], failures)
+            control.clear_halt(base)
+            _check("стоп-кран снят — halted() None", control.halted(base) is None, failures)
+
+            # (в) исполнитель: при стоп-кране ничего не делает, после снятия — работает
+            m = _FakeMarket(now)
+            m.inst["AAAUSDT"] = {"symbol": "AAAUSDT", "status": "Trading", "st": False,
+                                 "tick": 0.01, "qty_step": 0.1, "min_qty": 0.1, "min_amt": 5.0}
+            m.price["AAAUSDT"] = 1.0
+            m.days["AAAUSDT"] = [(d0 - k * 86400, 1.0) for k in range(40, 0, -1)]
+            cold = {"day": d0, "hot": {"lit": [], "near": [], "avail": 8, "n_lit": 0}}
+            (T / "wl.json").write_text(_json.dumps([{"symbol": "AAA", "coin_id": "aaa-coin"}]),
+                                       encoding="utf-8")
+            con = sqlite3.connect(db)
+            con.execute("INSERT INTO alert_log(symbol, ts, score) VALUES ('AAA', ?, 72)",
+                        (now - 60,))
+            con.commit()
+            con.close()
+
+            def n_dry() -> int:
+                k = sqlite3.connect(db)
+                try:
+                    return k.execute("SELECT COUNT(*) FROM dry_positions").fetchone()[0]
+                finally:
+                    k.close()
+            control.set_halt("тест", "selftest", base, now)
+            code_h, lines_h = ex.run_dry(c, m, now=now, mctx=cold, halt_base=base)
+            n_h = n_dry()
+            control.clear_halt(base)
+            code_r, lines_r = ex.run_dry(c, m, now=now, mctx=cold, halt_base=base)
+            _check("исполнитель при стоп-кране: код 0, «⛔ … resume», лестниц нет; снят — "
+                   "лестницы есть",
+                   code_h == 0 and len(lines_h) == 1 and "⛔" in lines_h[0]
+                   and "resume" in lines_h[0] and n_h == 0 and code_r == 0 and n_dry() > 0,
+                   failures)
+
+            # (г) ключ Bybit: правила sync и trade
+            ok_info = {"readOnly": 1, "permissions": {
+                "ContractTrade": ["Order", "Position"], "Spot": ["SpotTrade"],
+                "Options": ["OptionsTrade"], "Derivatives": ["DerivativesTrade"], "Wallet": []},
+                "ips": ["151.244.251.34"], "deadlineDay": -2, "expiredAt": "1970-01-01T00:00:00Z"}
+            r_ok = bybit.check_key(ok_info, "sync")
+            r_rw = bybit.check_key({**ok_info, "readOnly": 0}, "sync")
+            r_wd = bybit.check_key({**ok_info, "permissions": {
+                "Wallet": ["AccountTransfer", "Withdraw"]}}, "sync")
+            r_ip = bybit.check_key({**ok_info, "ips": ["*"], "deadlineDay": 10,
+                                    "expiredAt": "2026-10-11T00:00:00Z"}, "sync")
+            r_30 = bybit.check_key({**ok_info, "ips": [], "deadlineDay": 30}, "sync")
+            _check("ключ sync: Read-Only с IP и без вывода — ok, «бессрочный» (deadlineDay −2)",
+                   r_ok["level"] == "ok" and r_ok["issues"] == []
+                   and "только чтение" in r_ok["facts"] and "бессрочный" in r_ok["facts"],
+                   failures)
+            _check("ключ sync: торговля или право вывода — danger",
+                   r_rw["level"] == "danger" and r_wd["level"] == "danger"
+                   and any("ВЫВОДА" in x for x in r_wd["issues"]), failures)
+            _check("ключ sync: без IP ('*' или пусто) — warn; срок ≤ 14 дн. — warn с датой, "
+                   "30 дн. — без срока",
+                   r_ip["level"] == "warn" and any("IP" in x for x in r_ip["issues"])
+                   and any("через 10 дн. (2026-10-11)" in x for x in r_ip["issues"])
+                   and r_30["level"] == "warn" and not any("истекает" in x
+                                                          for x in r_30["issues"]), failures)
+            tr = {"readOnly": 0, "permissions": {"Spot": ["SpotTrade"]}, "ips": ["1.2.3.4"],
+                  "deadlineDay": -1}
+            _check("ключ trade (демо): только Spot с IP — ok; лишние права, без IP, вывод — "
+                   "danger; только чтение — warn",
+                   bybit.check_key(tr, "trade")["level"] == "ok"
+                   and bybit.check_key({**tr, "permissions": {"Spot": ["SpotTrade"],
+                                                              "ContractTrade": ["Order"]}},
+                                       "trade")["level"] == "danger"
+                   and bybit.check_key({**tr, "ips": []}, "trade")["level"] == "danger"
+                   and bybit.check_key({**tr, "permissions": {"Spot": ["SpotTrade"],
+                                                              "Wallet": ["Withdraw"]}},
+                                       "trade")["level"] == "danger"
+                   and bybit.check_key({**tr, "readOnly": 1}, "trade")["level"] == "warn",
+                   failures)
+
+            class _Cli:
+                def __init__(self, info=None, err=None):
+                    self.info, self.err = info, err
+
+                def api_key_info(self):
+                    if self.err:
+                        raise self.err
+                    return self.info
+            kc_ok = keycheck.run(c, client=_Cli(ok_info), base=base, now=now)
+            _check("самопроверка: итог записан, читается в течение суток, вчерашний — нет",
+                   kc_ok["level"] == "ok" and keycheck.load(base, now + 3600)["level"] == "ok"
+                   and keycheck.load(base, now + 40 * 3600) is None
+                   and keycheck.line(kc_ok).startswith("ключ Bybit: только чтение"), failures)
+            kc_err = keycheck.run(c, client=_Cli(err=bybit.BybitError("10003", 10003)),
+                                  base=base, now=now)
+            c_nokey = Config({**d, "api_keys": {**d["api_keys"], "bybit_key": "",
+                                                "bybit_secret": ""}})
+            _check("самопроверка: Bybit не ответил — «⚠ … не проверен»; ключа нет — None и "
+                   "старый итог удалён",
+                   kc_err["level"] == "error"
+                   and keycheck.line(kc_err).startswith("⚠ ключ Bybit: не проверен")
+                   and keycheck.run(c_nokey, base=base, now=now) is None
+                   and keycheck.load(base, now) is None, failures)
+
+            # (д) сторож прогона: оборвался — одно сообщение; дошёл до конца — молчим
+            sp = base / runguard.STATE
+            sp.write_text(f"start {now - 600:.0f} logs/daily_x.log\nstep quality {now - 600:.0f}"
+                          f"\nstep scan {now - 590:.0f}\nstep sca", encoding="utf-8")
+            sent = []
+            ra1 = runguard.alert(c, base=base, now=now, why="сигнал TERM",
+                                 send=lambda t: sent.append(t) or True)
+            ra2 = runguard.alert(c, base=base, now=now, send=lambda t: sent.append(t) or True)
+            _check("прогон убит на scan: одно сообщение с шагом и логом, повтор — тишина",
+                   ra1[0] == 0 and ra2[0] == 0 and len(sent) == 1 and "<b>scan</b>" in sent[0]
+                   and "daily_x.log" in sent[0] and "сигнал TERM" in sent[0]
+                   and "alerted" in sp.read_text(encoding="utf-8"), failures)
+            sp.write_text(f"start {now:.0f} l\nstep brief {now:.0f}\nend {now:.0f} 0\n",
+                          encoding="utf-8")
+            ra3 = runguard.alert(c, base=base, now=now, send=lambda t: sent.append(t) or True)
+            sp.write_text(f"start {now:.0f} l\nstep watch {now:.0f}\n", encoding="utf-8")
+            ra4 = runguard.alert(c, base=base, now=now, send=lambda t: False)
+            ra5 = runguard.alert(c, base=base, now=now, send=lambda t: sent.append(t) or True)
+            _check("сторож: дошёл до «end» — молчит; не отправилось — код 1 и повтор потом",
+                   ra3[0] == 0 and len(sent) == 2 and ra4[0] == 1 and ra5[0] == 0
+                   and "<b>watch</b>" in sent[1], failures)
+            (base / runguard.PREV).write_text(f"start {now:.0f} l\nstep scan {now:.0f}\n"
+                                              f"signal TERM {now:.0f}\n", encoding="utf-8")
+            prev_cut = runguard.prev_line(base)
+            (base / runguard.PREV).write_text(f"start {now:.0f} l\nend {now:.0f} 0\n",
+                                              encoding="utf-8")
+            _check("сводка: прошлый прогон оборвался — строка с шагом и сигналом; дошёл — пусто",
+                   "оборвался на шаге scan, сигнал TERM" in prev_cut
+                   and runguard.prev_line(base) == "", failures)
+
+            # (е) длинная сводка: части ≤ лимита, теги закрыты, текст не потерян
+            long = ("<b>☀️ шапка</b>\n\n" + "\n".join(
+                f"• <b>COIN{i:02d}</b> <i>{'x' * 70}</i> &lt;тег&gt; 🟢" for i in range(60))
+                + "\n<b>блок\nв две строки</b>\n\n" + "y" * 5000)
+            parts = tg.split_html(long)
+            bal = all(p.count(f"<{t}>") == p.count(f"</{t}>") for p in parts for t in ("b", "i"))
+
+            def flat(s: str) -> str:
+                return re.sub(r"\s+", "", tg.strip_html(s))
+            _check("split_html: каждая часть ≤ лимита, теги закрыты, текст целиком",
+                   len(parts) >= 3 and all(tg.vis_len(p) <= tg.SPLIT_AT for p in parts) and bal
+                   and "".join(flat(p) for p in parts) == flat(long)
+                   and tg.split_html("<b>коротко</b>") == ["<b>коротко</b>"], failures)
+            posts = []
+            tg._post = lambda token, method, data, ctype, timeout=30: (
+                posts.append(urllib.parse.parse_qs(data.decode())) or {"ok": True})
+            ok_long = tg.send_message("T", "42", long, silent=True,
+                                      buttons=[[("Bybit", "https://bybit.com")]])
+            _check("send_message: длинное — частями «(часть i/n)», каждая ≤ 4096, кнопки у "
+                   "последней",
+                   ok_long and len(posts) == len(parts)
+                   and all(tg.vis_len(p["text"][0]) <= tg.TEXT_MAX for p in posts)
+                   and "(часть 1/" in posts[0]["text"][0]
+                   and "reply_markup" in posts[-1] and "reply_markup" not in posts[0], failures)
+
+            # сводка дня в масштабе 10 карточек + 20 позиций (> 4096) уходит целиком
+            from scanner.models import Candidate
+            day = d0
+
+            def pos_row(i, paper):
+                return {"position": {"symbol": f"COIN{i:02d}", "entry_price": 0.012345,
+                                     "qty": 1000.0, "base_low": 0.0101, "is_paper": int(paper),
+                                     "status": "open"},
+                        "last_price": 0.011111, "last_ts": day - 86400, "hwm": 0.013,
+                        "pnl": {"pnl_pct": -10.0, "pnl_usdt": -1.23}, "realized_usdt": 0.0,
+                        "held_days": 40, "triggered": set(),
+                        "spark_prices": [0.01 + j * 1e-4 for j in range(30)]}
+            def pick(sym, score):
+                return Candidate(source="t", track="A", symbol=sym, zone="ПРУЖИНА/ДНО",
+                                 score=score, confidence=0.9)
+            big = {"scan": {"ran": True, "ok": True, "elapsed_min": 25.0, "watchlist": 83},
+                   "watch_ok": True, "market": {},
+                   "muted": [pick(f"MUTE{i:02d}", 72) for i in range(5)],
+                   "near": [pick(f"NEAR{i:02d}", 66) for i in range(3)],
+                   "new": [pick(f"PICK{i:02d}", 75) for i in range(10)],
+                   "positions": [pos_row(i, i >= 20) for i in range(40)],
+                   "signals_today": [{"symbol": f"COIN{i:02d}", "label": "фикс 33%",
+                                      "is_paper": 0} for i in range(12)],
+                   "unavailable": ["onchain"], "dev_github": "62 из 83",
+                   "executor": {"books": {"R": {"open": 12, "closed": 3, "pnl": -4.2,
+                                                "label": "правила", "emoji": "📏"}},
+                                "shadow": {}, "opened": [f"PICK{i:02d}" for i in range(4)],
+                                "shadowed": [(f"PICK{i:02d}", "нижняя четверть по обороту "
+                                              "(412-е место из 520); перегрев рынка")
+                                             for i in range(4, 10)],
+                                "rejected": [(f"REJ{i}", "нет на Bybit spot")
+                                             for i in range(6)], "fills": 3, "sells": []}}
+            brief = tg.format_brief(big, cfg, now=day + 6 * 3600)
+            posts.clear()
+            ok_brief = tg.send_message("T", "42", brief, silent=True)
+            _check(f"сводка дня {tg.vis_len(brief)} симв. (> 4096) уходит частями, все ≤ 4096",
+                   tg.vis_len(brief) > tg.TEXT_MAX and ok_brief and len(posts) >= 2
+                   and all(tg.vis_len(p["text"][0]) <= tg.TEXT_MAX for p in posts), failures)
+
+            # (ж) диск полон: print в лог бросает ENOSPC — сводка всё равно уходит
+            calls = []
+            tg._post = lambda token, method, *a, **k: calls.append(method) or {"ok": True}
+
+            class _Full:
+                def write(self, s):
+                    raise OSError(errno.ENOSPC, "No space left on device")
+
+                def flush(self):
+                    pass
+            sys.stdout = _Full()
+            try:
+                rc_b = run_cli.cmd_brief(types.SimpleNamespace(
+                    config=str(cpath), notify=True, test=False, scan_exit=0, watch_exit=0,
+                    backup_exit=0, sync_exit=0, exec_exit=0, report_exit=0, quality_exit=0))
+            except OSError as e:
+                rc_b = e
+            finally:
+                sys.stdout = real_out
+            _check("ENOSPC в логе не роняет сводку: код 0, sendMessage был", rc_b == 0
+                   and "sendMessage" in calls, failures)
+
+            # (з) report: флаги недели — только после доставки
+            ps = PositionStore(db)
+            ps.add("GRAM", 1.5, 66.7, paper=True, entry_ts=time.time() - 30 * 86400)
+            ps.close_db()
+
+            def report(resp, **kw):
+                tg._post = lambda *a, **k: resp
+                a = types.SimpleNamespace(config=str(cpath), notify=False, if_due=False,
+                                          milestone_weeks=4)
+                for k, v in kw.items():
+                    setattr(a, k, v)
+                sys.stdout = io.StringIO()           # текст сводки в лог не нужен
+                try:
+                    rc = run_cli.cmd_report(a)
+                finally:
+                    sys.stdout = real_out
+                p = PositionStore(db)
+                try:
+                    return rc, p.system_flag("weekly_report"), p.system_flag("milestone_4w")
+                finally:
+                    p.close_db()
+            fail_resp = {"ok": False, "error_code": 400, "description": "Bad Request: chat not found"}
+            r_view = report({"ok": True})
+            r_due = report({"ok": True}, if_due=True)
+            r_fail = report(fail_resp, if_due=True, notify=True)
+            r_sent = report({"ok": True}, if_due=True, notify=True)
+            _check("report: просмотр и --if-due без --notify флагов не ставят; сбой отправки — "
+                   "код 1 без флагов; доставлено — флаг недели",
+                   r_view == (0, False, False) and r_due == (0, False, False)
+                   and r_fail[:2] == (1, False) and r_sent[:2] == (0, True), failures)
+
+            # (и) ключи в config.json не принимаются
+            leak = copy.deepcopy(_json.loads((root / "config.json").read_text(encoding="utf-8")))
+            leak["api_keys"]["dune"] = "SECRET-123"
+            lp = T / "leak.json"
+            lp.write_text(_json.dumps(leak, ensure_ascii=False), encoding="utf-8")
+            os.environ.pop("DUNE_API_KEY", None)
+            sys.stderr, real_err = io.StringIO(), sys.stderr
+            try:
+                cl = _load(str(lp))
+                shipped = _load()
+            finally:
+                sys.stderr = real_err
+            _check("config.json: ключ в файле не используется, предупреждение; в репозитории "
+                   "ключей нет",
+                   cl.get("api_keys.dune") == "" and "dune" in (cl.get("_config_warnings")
+                                                                 or [""])[0]
+                   and not shipped.get("_config_warnings"), failures)
+
+            # (к) сводка дня: строки защиты под шапкой
+            st0 = {"scan": {"ran": True, "ok": True, "elapsed_min": 20.0, "watchlist": 80},
+                   "watch_ok": True, "market": {}, "new": [], "muted": [], "near": [],
+                   "positions": [], "signals_today": [], "unavailable": [], "dev_github": None}
+            gd = {"halt": {"reason": "тест", "ts": now, "by": "telegram"},
+                  "key": {"level": "danger", "issues": ["у ключа есть право ВЫВОДА"],
+                          "facts": []},
+                  "prev_run": "⚠ прошлый прогон (01.10 08:00) оборвался на шаге scan",
+                  "poll_stale": "", "timeouts": ["scan"], "report_fail": True,
+                  "config_warnings": ["config.json: ключи"], "disk_low": 500 * 1024 ** 2}
+            txt = tg.format_brief({**st0, "guard": gd, "backup": "suspect"}, cfg, now=now)
+            ln = txt.split("\n")
+            plain = tg.format_brief(st0, cfg, now=now)
+            okk = tg.format_brief({**st0, "guard": {"key": {"level": "ok", "facts": []}}}, cfg,
+                                  now=now)
+            _check("сводка: таймаут, сбой report и подозрительный бэкап — в шапке; стоп-кран — "
+                   "второй строкой; ключ с выводом — жирно; диск, прошлый прогон, config",
+                   "⏱ убит по таймауту: scan" in ln[0] and "недельная сводка не ушла" in ln[0]
+                   and "база меньше прошлой" in ln[0] and "⛔ исполнитель остановлен" in ln[1]
+                   and "resume" in ln[1] and "<b>⛔ ключ Bybit" in txt
+                   and "оборвался на шаге scan" in txt and "на диске свободно" in txt
+                   and "config.json: ключи" in txt, failures)
+            _check("сводка: без проблем — строк защиты нет; ключ ок — «ключ Bybit ✓» в подвале",
+                   "⛔" not in plain and "⏱" not in plain and "ключ Bybit" not in plain
+                   and "ключ Bybit ✓" in okk.split("\n")[-1], failures)
+            control.set_halt("из brief_state", "selftest", base, now)
+            bs = deliver.brief_state(c, now=now, data_dir=base, scan_exit=124, backup_exit=137,
+                                     report_exit=1)
+            control.clear_halt(base)
+            gb = bs["guard"]
+            _check("brief_state: стоп-кран, таймауты (124/137), сбой report — из data/ и кодов",
+                   gb["halt"]["reason"] == "из brief_state" and gb["timeouts"] == ["scan", "backup"]
+                   and gb["report_fail"] and not gb["quality_fail"], failures)
+    finally:
+        tg._post, tg._sleep, sys.stdout = real_post, real_sleep, real_out
+        for k, v in env_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # (л) daily_run.sh и юниты: замок, таймаут у каждого шага, сторож, «end» после сводки
+    sh = (root / "scripts" / "daily_run.sh").read_text(encoding="utf-8")
+    unit = (root / "scripts" / "systemd" / "accumulation-scanner.service").read_text(
+        encoding="utf-8")
+    steps = re.findall(r"^run_step (\w+) (\d+) ", sh, re.M)
+    hours = re.search(r"^TimeoutStartSec=(\d+)h", unit, re.M)
+    _check("daily_run.sh: 8 шагов, у каждого таймаут; сумма (+60 с KILL) < TimeoutStartSec",
+           {n for n, _ in steps} == {"quality", "scan", "sync", "watch", "execute", "report",
+                                     "backup", "brief"}
+           and "timeout --kill-after=60 \"$limit\" python3" in sh and hours
+           and sum(int(s) + 60 for _, s in steps) < int(hours.group(1)) * 3600, failures)
+    _check("daily_run.sh: flock до записи состояния, trap TERM → run.py killed, «end» после "
+           "сводки; юнит: OnFailure=scanner-alert",
+           0 < sh.find("flock -n 9") < sh.find("printf 'start")
+           and "trap 'on_signal TERM' TERM" in sh and "run.py killed" in sh
+           and sh.find("printf 'end") > sh.find("run_step brief")
+           and "--report-exit" in sh and "--quality-exit" in sh
+           and "OnFailure=scanner-alert.service" in unit
+           and (root / "scripts" / "systemd" / "scanner-alert.service").exists(), failures)
+    ctl_t = (root / "scripts" / "systemd" / "scanner-control.timer").read_text(encoding="utf-8")
+    ctl_s = (root / "scripts" / "systemd" / "scanner-control.service").read_text(encoding="utf-8")
+    _check("таймер команд: раз в 5 минут, run.py control",
+           "OnCalendar=*:0/5" in ctl_t and "run.py control" in ctl_s, failures)
+    sec = (root / "scripts" / "vps_security_check.sh").read_text(encoding="utf-8")
+    writes = re.findall(r"\b(systemctl (?:restart|reload|stop|start|enable|disable)|ufw "
+                        r"(?:allow|deny|delete|enable|disable)|sed -i|rm -|chmod|chown|useradd|"
+                        r"usermod|(?<!/)passwd |tee )|>\s*/etc", sec)    # /etc/passwd читаем
+    _check("vps_security_check.sh — только чтение (нет команд, меняющих систему)",
+           writes == [], failures)
+
+
 def main() -> int:
     cfg = load_config()
     failures: list[str] = []
     print("=== SELFTEST (офлайн, без сети) ===\n")
+    # Стоп-кран, состояние прогона, итог проверки ключа — во временном каталоге: боевые
+    # data/HALT и data/bybit_key.json на сервере не должны влиять на тесты (и наоборот).
+    import tempfile
+    from pathlib import Path as _P
+    from scanner import control
+    data_tmp = tempfile.TemporaryDirectory(prefix="selftest-data-")
+    control.DATA = _P(data_tmp.name)
     test_filters(cfg, failures)
     print()
     test_track_q(cfg, failures)
@@ -3528,6 +4014,9 @@ def main() -> int:
     print()
     test_github_levels(cfg, failures)
     print()
+    test_ops_guard(cfg, failures)
+    print()
+    data_tmp.cleanup()
     if failures:
         print(f"РЕЗУЛЬТАТ: {_FAIL} — провалено {len(failures)}: {failures}")
         return 1
