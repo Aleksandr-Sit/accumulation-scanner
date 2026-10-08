@@ -176,6 +176,14 @@
     "weekly_report_weekday": 0
   },
 
+  "backup": {
+    "_comment": "run.py backup (scanner/backup.py). Хранятся keep_daily самых новых копий (--keep переопределяет) + самая новая копия каждой из последних keep_weekly ISO-недель и keep_monthly календарных месяцев, где копии есть. Защита от пустой базы: в каждой копии считаются строки таблиц-журналов (runs, alert_log, positions, position_events, market_daily, dry_positions, dry_orders, exchange_fills — код из них не удаляет) и пишутся в <каталог>/backups.json; меньше, чем в последней целой копии, или таблицы нет — копия подозрительная: пишется, но старые не удаляются и в Telegram она не уходит (код 4). Уменьшил базу намеренно — run.py backup --accept-shrink. В Telegram раз в неделю уходит тонкая копия: candidates и candidate_metrics только за последние telegram_candidates_days дней (candidates — ~95% базы, полная копия растёт ~0.5 МБ/день и к концу декабря 2026 переросла бы лимит 45 МБ); полные — только на сервере.",
+    "keep_daily": 14,
+    "keep_weekly": 8,
+    "keep_monthly": 6,
+    "telegram_candidates_days": 30
+  },
+
   "stage7_positions": {
     "_comment": "Профиль hodl: откуп у дна -> холд -> распределение в бычьей фазе. Горизонт 1-2 года ок. paper_auto: сканер сам открывает виртуальные позиции по топ-пружинам — фоновая статистика выходного контура; в риск-бюджет не входят.",
     "max_position_pct_of_capital": 10,

@@ -356,15 +356,15 @@ def test_backup(cfg, failures: list[str]) -> None:
         integ = con.execute("PRAGMA integrity_check").fetchone()[0]
         n_pos = con.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
         con.close()
-        _check("копия: scanner-YYYYMMDD-HHMM.db.gz, без временных файлов рядом",
+        _check("копия: scanner-YYYYMMDD-HHMM.db.gz и манифест, без временных файлов рядом",
                bk.NAME_RE.match(name) is not None and name.startswith("scanner-2026100")
-               and [p.name for p in out.iterdir()] == [name], failures)
+               and sorted(p.name for p in out.iterdir()) == sorted([name, bk.MANIFEST]), failures)
         _check("восстановление: gunzip -> integrity ok, 2 позиции, размер как у базы",
                integ == "ok" and n_pos == 2 and restored.stat().st_size == info["db_size"],
                failures)
-        _check("строка лога: backup ok, размер, сколько хранится",
-               bk.ok_line(info).startswith("backup ok: ") and "хранится 1 из 3" in bk.ok_line(info),
-               failures)
+        _check("строка лога: backup ok, размер, сколько хранится по ярусам",
+               bk.ok_line(info).startswith("backup ok: ") and "хранится 1 (последние 3 + "
+               "недельные 8 + месячные 6)" in bk.ok_line(info), failures)
 
         # Ротация: 5 копий при keep=3 -> 3 самые новые; чужие файлы не трогаются.
         (out / "notes.txt").write_text("x", encoding="utf-8")
@@ -423,13 +423,15 @@ def test_backup(cfg, failures: list[str]) -> None:
         last = infos[-1]
         now = time.time()
         r1 = bk.send_weekly(c, last, notify=True, now=now, send_document=doc())
-        _check("неделя: первая отправка -> документом, без звука, отметка записана",
+        thin = last["path"].name.replace(".db.gz", "-tg.db.gz")
+        _check("неделя: первая отправка -> тонкая копия документом, без звука, отметка записана",
                r1[0] == 0 and len(sent) == 1 and sent[0]["silent"] is True
-               and sent[0]["filename"] == last["path"].name
-               and sent[0]["data"] == last["path"].read_bytes() and flags() == 1, failures)
+               and sent[0]["filename"] == thin
+               and gzip.decompress(sent[0]["data"]).startswith(b"SQLite format 3\x00")
+               and flags() == 1, failures)
         cap = sent[0]["caption"]
         _check("подпись: дата, размер, как восстановить (gunzip → scanner.db)",
-               "Бэкап базы сканера" in cap and last["path"].name in cap and " КБ" in cap
+               "Бэкап базы сканера" in cap and thin in cap and " КБ" in cap
                and "gunzip -c" in cap and "scanner.db" in cap and not cap.startswith("🧪"),
                failures)
         r2 = bk.send_weekly(c, last, notify=True, now=now, send_document=doc())
@@ -470,6 +472,365 @@ def test_backup(cfg, failures: list[str]) -> None:
            in body and b"\x1f\x8bGZ" in body and b'name="disable_notification"' in body
            and ctype.startswith("multipart/form-data") and tmo >= 300, failures)
     _check("sendDocument: нет token -> не шлёт", no_token is False and len(posts) == 1, failures)
+
+
+def test_backup_guard(cfg, failures: list[str]) -> None:
+    print("Бэкап — пустая база не вытесняет копии, ярусы хранения, тонкая копия, восстановление:")
+    import argparse
+    import contextlib
+    import copy
+    import gzip
+    import html as _html
+    import io
+    import json as _json
+    import os
+    import re
+    import shutil
+    import sqlite3
+    import subprocess
+    import sys
+    import tempfile
+    from datetime import datetime as _dt, timedelta as _td
+    from pathlib import Path as _P
+    import run as _run
+    from scanner import backup as bk
+    from scanner import executor
+    from scanner.config import Config
+    from scanner.db import Store
+    from scanner.notify import telegram as tg
+    day = 86400
+    # i-й день от пн 05.10.2026, 10:00 местного: имена и ярусы не зависят от пояса машины
+    at = lambda i: (_dt(2026, 10, 5, 10) + _td(days=i)).timestamp()  # noqa: E731
+    fname = lambda ts: time.strftime("scanner-%Y%m%d-%H%M.db.gz", time.localtime(ts))  # noqa: E731
+    names = lambda out: {p.name for p in bk.list_backups(out)}  # noqa: E731
+    manifest = lambda out: _json.loads((out / bk.MANIFEST).read_text("utf-8"))  # noqa: E731
+
+    def build(fill) -> bytes:
+        """Файл базы, собранный один раз (схема с fsync на каждую таблицу — медленно)."""
+        with tempfile.TemporaryDirectory() as t:
+            p = _P(t) / "x.db"
+            Store(str(p)).close()
+            PositionStore(str(p)).close_db()
+            fill(str(p))
+            return p.read_bytes()
+
+    def fill_good(p):
+        """Живая база: 3 прогона, позиция, событие, таблицы пробного исполнителя."""
+        st = Store(p)
+        for _ in range(3):
+            st.finish_run(st.new_run("x"), 10, 5, 3, {})
+        st.close()
+        ps = PositionStore(p)
+        ps.add("GRAM", 1.0, 100, coin_id="gram", paper=True)
+        ps.set_system_flag("x")
+        ps.close_db()
+        executor.connect(p).close()
+
+    good_file, empty_file = build(fill_good), build(lambda p: None)
+    good_db = lambda db: db.write_bytes(good_file)  # noqa: E731
+    empty_db = lambda db: db.write_bytes(empty_file)  # noqa: E731 — файл подменён пустой схемой
+
+    def cands(con, run_id, n):
+        con.executemany("INSERT INTO candidates(run_id, symbol, coin_id, chain, address, name) "
+                        "VALUES (?,?,?,?,?,?)",
+                        [(run_id, f"S{i}", f"c{i}", "ethereum", os.urandom(20).hex(),
+                          os.urandom(40).hex()) for i in range(n)])
+
+    def conf(db):
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {"db_path": str(db), "watchlist_json": str(_P(db).parent / "w.json")}
+        d["api_keys"] = {"telegram_token": "T", "telegram_chat_id": "C"}
+        return Config(d)
+
+    got = []                                         # отправленные документы (сеть подменена)
+
+    def doc(token, chat, data, filename, caption, silent=False):
+        got.append({"data": data, "filename": filename, "caption": caption})
+        return True
+
+    def no_msg(token, chat, text, silent=False):     # текст вместо файла — тоже без сети
+        got.append("msg")
+        return True
+
+    # Пустая база: 3 целые копии, потом файл подменён пустой схемой -> 16 дней подряд копии
+    # подозрительные, ни одна целая не удалена.
+    with tempfile.TemporaryDirectory() as tmp:
+        db, out = _P(tmp) / "scanner.db", _P(tmp) / "backups"
+        good_db(db)
+        good = [bk.make_backup(db, out, now=at(i)) for i in range(3)]
+        good_bytes = [g["path"].read_bytes() for g in good]
+        empty_db(db)
+        sus = [bk.make_backup(db, out, now=at(i)) for i in range(3, 19)]
+        why = sus[0]["suspect"] or ""
+        _check("пустая база: 16 копий подряд подозрительные — runs 3 → 0, таблиц исполнителя "
+               "нет, эталон — последняя целая",
+               all(i["suspect"] for i in sus) and why.startswith("runs 3 → 0, positions 1 → 0")
+               and "dry_orders 0 → нет таблицы" in why
+               and {i["reference"] for i in sus} == {good[-1]["path"].name}, failures)
+        _check("пустая база: ничего не удалено, 3 целые копии на месте байт в байт, рядом 16 новых",
+               not any(i["removed"] for i in sus) and len(names(out)) == 19
+               and [g["path"].read_bytes() for g in good] == good_bytes, failures)
+        m = manifest(out)
+        _check("манифест: целые — suspect false со строками, подозрительные — true с причиной",
+               all(m[g["path"].name]["suspect"] is False for g in good)
+               and m[good[0]["path"].name]["rows"]["runs"] == 3
+               and all(m[i["path"].name]["suspect"] is True
+                       and m[i["path"].name]["why"] == i["suspect"] for i in sus), failures)
+        try:
+            bk.make_backup(db, out, now=at(2) + 30)      # та же минута, что у последней целой
+            same = ""
+        except bk.BackupError as e:
+            same = str(e)
+        _check("подозрительная копия не затирает целую с тем же именем (та же минута)",
+               "не затираю" in same and good[2]["path"].read_bytes() == good_bytes[2], failures)
+        r = [bk.send_weekly(conf(db), sus[-1], notify=True, test=t, now=at(18), send_document=doc,
+                            send_message=no_msg) for t in (False, True)]
+        _check("подозрительная копия в Telegram не уходит (и с --test): код 4, ничего не ушло",
+               [x[0] for x in r] == [bk.EXIT_SUSPECT] * 2 and not got
+               and "подозрительная" in r[0][1], failures)
+
+        # --accept-shrink: база уменьшена намеренно — копия становится эталоном, ротация идёт.
+        acc = bk.make_backup(db, out, now=at(19), accept_shrink=True)
+        _check("--accept-shrink: не подозрительная, уменьшение записано, ротация пошла: "
+               "05–10.10 удалены, остались 14 последних",
+               acc["suspect"] is None and (acc["accepted"] or "").startswith("runs 3 → 0")
+               and sorted(acc["removed"]) == sorted(fname(at(i)) for i in range(6))
+               and names(out) == {fname(at(i)) for i in range(6, 20)}
+               and manifest(out)[acc["path"].name]["why"].startswith("принято --accept-shrink"),
+               failures)
+        nxt = bk.make_backup(db, out, now=at(20))
+        _check("после --accept-shrink эталон — принятая копия: следующая не подозрительная, "
+               "записей удалённых копий в манифесте нет",
+               nxt["suspect"] is None and nxt["reference"] == acc["path"].name
+               and set(manifest(out)) == names(out), failures)
+
+    # run.py backup: подозрительная копия -> код 4 и строка «что делать»; --accept-shrink -> 0.
+    with tempfile.TemporaryDirectory() as tmp:
+        db, out = _P(tmp) / "scanner.db", _P(tmp) / "backups"
+        good_db(db)
+        bk.make_backup(db, out, now=time.time() - 2 * day)
+        empty_db(db)
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {"db_path": str(db), "watchlist_json": str(_P(tmp) / "w.json")}
+        d["api_keys"] = {}
+        cpath = _P(tmp) / "config.json"
+        cpath.write_text(_json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        runs = []
+        for accept in (False, True):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = _run.cmd_backup(argparse.Namespace(
+                    config=str(cpath), dir=str(out), keep=None, accept_shrink=accept,
+                    send_weekly=False, notify=False, test=False))
+            runs.append((rc, buf.getvalue()))
+    _check("run.py backup: пустая база -> код 4, «backup SUSPECT: runs 3 → 0 …» и подсказка "
+           "--accept-shrink",
+           runs[0][0] == bk.EXIT_SUSPECT == 4
+           and runs[0][1].startswith("backup SUSPECT: runs 3 → 0")
+           and "run.py backup --accept-shrink" in runs[0][1], failures)
+    _check("run.py backup --accept-shrink -> код 0, «уменьшение принято»",
+           runs[1][0] == 0 and "уменьшение принято" in runs[1][1], failures)
+
+    # Ярусы: ежедневные копии 15.08.2025–08.10.2026 (420 дней, 10:00 местного).
+    D = _dt
+    every = [D(2025, 8, 15, 10) + _td(days=i) for i in range(420)]
+    kept = bk.plan_retention([(f"{x:%Y-%m-%d}", x.timestamp()) for x in every], 14, 8, 6,
+                             now=D(2026, 10, 8, 12).timestamp())
+    want = (["2026-05-31", "2026-06-30", "2026-07-31", "2026-08-31"]             # месяцы
+            + ["2026-08-23", "2026-08-30", "2026-09-06", "2026-09-13", "2026-09-20"]  # недели
+            + [f"{D(2026, 9, 25) + _td(days=i):%Y-%m-%d}" for i in range(14)])     # последние
+    _check("ярусы за 420 дней: 14 последних + воскресенья 8 недель + концы 6 месяцев = 23 копии",
+           kept == set(want) and len(kept) == 23, failures)
+
+    def plan(dts, daily, weekly, monthly, now=None):
+        ent = [(f"{x:%Y-%m-%d %H:%M}", x.timestamp()) for x in dts]
+        return sorted(bk.plan_retention(ent, daily, weekly, monthly,
+                                        now=now or max(t for _, t in ent)))
+
+    _check("ярус недель: пропуски (сервер был выключен) не съедают ярус, из недели — новейшая",
+           plan([D(2026, 7, 20, 10), D(2026, 7, 22, 10), D(2026, 8, 26, 10), D(2026, 9, 30, 10),
+                 D(2026, 10, 1, 10)], 1, 3, 0)
+           == ["2026-07-22 10:00", "2026-08-26 10:00", "2026-10-01 10:00"], failures)
+    _check("ярус недель: ISO-неделя через Новый год (31.12.2026 и 02.01.2027 — одна неделя)",
+           plan([D(2026, 12, 31, 10), D(2027, 1, 2, 10), D(2027, 1, 4, 10)], 1, 3, 0)
+           == ["2027-01-02 10:00", "2027-01-04 10:00"], failures)
+    _check("ярус месяцев: граница по местному времени (30.09 23:30 — сентябрь, 01.10 00:30 — нет)",
+           plan([D(2026, 9, 30, 23, 30), D(2026, 10, 1, 0, 30), D(2026, 10, 2, 10)], 1, 0, 2)
+           == ["2026-09-30 23:30", "2026-10-02 10:00"], failures)
+    _check("последние 14: 15-я уходит; ярусы 0 — только последние",
+           plan([D(2026, 10, 1, 10) + _td(days=i) for i in range(15)], 14, 0, 0)
+           == [f"{D(2026, 10, 2, 10) + _td(days=i):%Y-%m-%d %H:%M}" for i in range(14)], failures)
+    _check("копия «из будущего» (часы были сбиты) остаётся и места в ярусе не занимает",
+           plan([D(2026, 10, 1, 10), D(2026, 10, 2, 10), D(2026, 10, 9, 10)], 1, 0, 0,
+                now=D(2026, 10, 3).timestamp()) == ["2026-10-02 10:00", "2026-10-09 10:00"],
+           failures)
+
+    # Тонкая копия для Telegram: кандидаты старше telegram_candidates_days убраны, прочее цело.
+    with tempfile.TemporaryDirectory() as tmp:
+        db, out = _P(tmp) / "scanner.db", _P(tmp) / "backups"
+        now = at(0)
+        st = Store(str(db))
+        old = st.conn.execute("INSERT INTO runs(ts) VALUES (?)", (now - 45 * day,)).lastrowid
+        new = st.conn.execute("INSERT INTO runs(ts) VALUES (?)", (now - 2 * day,)).lastrowid
+        cands(st.conn, old, 400)
+        cands(st.conn, new, 30)
+        st.conn.executemany("INSERT INTO candidate_metrics(run_id, ts, coin_id) VALUES (?,?,?)",
+                            [(old, now - 45 * day, "a")] * 50 + [(new, now - 2 * day, "b")] * 7)
+        st.conn.commit()
+        st.close()
+        ps = PositionStore(str(db))
+        ps.add("GRAM", 1.0, 100, coin_id="gram", paper=True)
+        ps.close_db()
+        info = bk.make_backup(db, out, now=now)
+        c = conf(db)
+        n0 = len(got)
+        r = bk.send_weekly(c, info, notify=True, test=True, now=now, max_bytes=info["size"] - 1,
+                           send_document=doc, send_message=no_msg)
+        sent = (got[-1] if len(got) > n0 and isinstance(got[-1], dict)
+                else {"data": b"", "filename": "", "caption": ""})
+        by_run = metrics = other = integ = None
+        if sent["data"]:                             # не ушло документом — проверки ниже FAIL
+            thin = _P(tmp) / "thin.db"
+            thin.write_bytes(gzip.decompress(sent["data"]))
+            con = sqlite3.connect(thin)
+            try:
+                q = lambda sql: con.execute(sql).fetchall()  # noqa: E731
+                by_run = dict(q("SELECT run_id, COUNT(*) FROM candidates GROUP BY run_id"))
+                metrics = q("SELECT coin_id, COUNT(*) FROM candidate_metrics GROUP BY coin_id")
+                other = (q("SELECT COUNT(*) FROM runs")[0][0],
+                         q("SELECT COUNT(*) FROM positions")[0][0])
+                integ = q("PRAGMA integrity_check")[0][0]
+            finally:
+                con.close()
+        _check("тонкая копия: кандидаты и метрики старше 30 дн. убраны, свежие, прогоны и позиции "
+               "целы, integrity ok",
+               by_run == {new: 30} and metrics == [("b", 7)] and other == (2, 1) and integ == "ok",
+               failures)
+        _check("тонкая копия: scanner-…-tg.db.gz (мимо NAME_RE), лимит — по ней, а не по полной",
+               r[0] == 0 and sent["filename"] == info["path"].name[:-6] + "-tg.db.gz"
+               and not bk.NAME_RE.match(sent["filename"]) and len(sent["data"]) < info["size"] - 1,
+               failures)
+        _check("тонкая копия: временные файлы убраны — в каталоге только копия и манифест",
+               sorted(p.name for p in out.iterdir()) == sorted([info["path"].name, bk.MANIFEST]),
+               failures)
+        cap = sent["caption"]
+        _check("подпись тонкой: «Тонкая копия», 30 дн., где полные копии и ярусы, ≤ 1024 видимых",
+               "Тонкая копия" in cap and "за последние 30 дн." in cap
+               and str(out) in _html.unescape(cap) and "последние 14, недельные за 8 нед., "
+               "месячные за 6 мес." in cap and len(tg.strip_html(cap)) <= tg.CAPTION_MAX, failures)
+
+        def boom(*a, **k):
+            raise OSError("нет места")
+
+        real, bk.make_thin = bk.make_thin, boom
+        try:
+            r2 = bk.send_weekly(c, info, notify=True, test=True, now=now, send_document=doc,
+                                send_message=no_msg)
+        finally:
+            bk.make_thin = real
+        _check("тонкая не вышла -> уходит полная (влезает), причина в логе, бэкап не падает",
+               r2[0] == 0 and "тонкая копия не вышла (OSError: нет места)" in r2[1]
+               and got[-1]["filename"] == info["path"].name
+               and got[-1]["data"] == info["path"].read_bytes()
+               and "Полная копия" in got[-1]["caption"], failures)
+
+    # Манифеста нет (первый прогон после выкатки: на сервере уже лежат копии) или он битый —
+    # эталон находится по самим копиям.
+    with tempfile.TemporaryDirectory() as tmp:
+        db, out = _P(tmp) / "scanner.db", _P(tmp) / "backups"
+        good_db(db)
+        first = bk.make_backup(db, out, now=at(0))
+        (out / bk.MANIFEST).unlink()
+        (out / fname(at(1))).write_bytes(gzip.compress(b"not a database " * 64))   # не база
+        (out / fname(at(2))).write_bytes(b"not gzip at all")                       # не gzip
+        boot = bk.make_backup(db, out, now=at(3))
+        e = manifest(out).get(first["path"].name) or {}
+        _check("манифеста нет: эталон — самая новая читаемая копия (битые пропущены), строки "
+               "посчитаны по распакованной, временных файлов нет",
+               boot["suspect"] is None and boot["reference"] == first["path"].name
+               and e.get("rows", {}).get("runs") == 3 and e.get("bootstrap") is True
+               and not [p for p in out.iterdir() if p.name.startswith(".")], failures)
+        res = []
+        for i, junk in enumerate(("{битый json", "[1, 2]", '{"scanner-20261001-1000.db.gz": 5}',
+                                  '{"scanner-20261001-1000.db.gz": {"rows": {"runs": "3"}}}')):
+            (out / bk.MANIFEST).write_text(junk, encoding="utf-8")
+            info = bk.make_backup(db, out, now=at(4 + i))
+            res.append(info["suspect"] is None and info["path"].name in manifest(out))
+        _check("битый или чужой backups.json не ломает бэкап: копия есть, манифест пересобран",
+               all(res), failures)
+        (out / bk.MANIFEST).unlink()
+        empty_db(db)
+        sus = bk.make_backup(db, out, now=at(9))
+        _check("манифеста нет, база пустая -> подозрительная по эталону из прежней копии",
+               (sus["suspect"] or "").startswith("runs 3 → 0") and sus["reference"] == fname(at(7)),
+               failures)
+
+    # Рецепт восстановления: журнал прерванной записи удаляется ДО распаковки, иначе SQLite при
+    # первом открытии «откатит» его поверх восстановленной копии.
+    with tempfile.TemporaryDirectory() as tmp:
+        proj, out = _P(tmp) / "proj", _P(tmp) / "backups"
+        proj.mkdir()
+        live = proj / "scanner.db"
+        now = at(0)
+        st = Store(str(live))
+        cands(st.conn, st.conn.execute("INSERT INTO runs(ts) VALUES (?)",
+                                       (now - day,)).lastrowid, 60)
+        st.conn.execute("CREATE TABLE filler (x TEXT)")
+        st.conn.executemany("INSERT INTO filler VALUES (?)", [("y" * 100,)] * 50)
+        st.conn.commit()
+        st.close()
+        info = bk.make_backup(live, out, now=now)
+        bk.send_weekly(conf(live), info, notify=True, test=True, now=now, send_document=doc,
+                       send_message=no_msg)
+        sent = got[-1]
+        # После копии база ушла вперёд, потом запись упала посреди транзакции: страницы уже
+        # пролились в файл, горячий журнал остался (os._exit — без отката).
+        st = Store(str(live))
+        cands(st.conn, st.conn.execute("INSERT INTO runs(ts) VALUES (?)", (now,)).lastrowid, 30)
+        st.conn.commit()
+        st.close()
+        child = ("import os, sqlite3, sys\n"
+                 "c = sqlite3.connect(sys.argv[1]); c.execute('PRAGMA cache_size=5')\n"
+                 "c.execute('BEGIN'); c.execute('DELETE FROM candidates')\n"
+                 "c.execute(\"UPDATE filler SET x='z'\"); os._exit(1)\n")
+        subprocess.run([sys.executable, "-c", child, str(live)], timeout=60)
+        journal = proj / "scanner.db-journal"
+        hot = journal.is_file() and journal.stat().st_size > 0
+        recipe = next((_html.unescape(b) for b in re.findall(r"<code>(.*?)</code>",
+                                                             sent["caption"], re.S)
+                       if "gunzip -c" in b), "")
+
+        def restore(where, skip_rm=False):
+            """Каталог проекта после сбоя + документ из Telegram; команды — строки подписи."""
+            where.mkdir()
+            for p in proj.iterdir():
+                shutil.copy(p, where / p.name)
+            (where / sent["filename"]).write_bytes(sent["data"])
+            for cmd in (line.split() for line in recipe.splitlines()):
+                if cmd[:2] == ["rm", "-f"] and not skip_rm:
+                    for f in cmd[2:]:
+                        (where / f).unlink(missing_ok=True)
+                elif cmd[:2] == ["gunzip", "-c"] and cmd[3:4] == [">"]:
+                    with gzip.open(where / cmd[2], "rb") as fi:
+                        (where / cmd[4]).write_bytes(fi.read())
+            try:
+                con = sqlite3.connect(where / "scanner.db")
+                try:
+                    return (con.execute("PRAGMA integrity_check").fetchone()[0],
+                            con.execute("SELECT COUNT(*) FROM candidates").fetchone()[0])
+                finally:
+                    con.close()
+            except sqlite3.DatabaseError as e:
+                return type(e).__name__, None
+
+        fixed, broken = restore(_P(tmp) / "a"), restore(_P(tmp) / "b", skip_rm=True)
+    _check("рецепт (подпись и docstring): журнал прерванной записи удаляется ДО распаковки",
+           0 <= recipe.find("rm -f scanner.db-journal scanner.db-wal scanner.db-shm")
+           < recipe.find("gunzip -c") and "rm -f scanner.db-journal" in bk.__doc__, failures)
+    _check("восстановление по подписи при горячем журнале: integrity ok, все 60 кандидатов",
+           hot and fixed == ("ok", 60), failures)
+    _check("без удаления журнала SQLite откатывает его поверх копии -> база испорчена",
+           hot and broken != ("ok", 60), failures)
 
 
 def test_antirug_evm(cfg, failures: list[str]) -> None:
@@ -3473,6 +3834,8 @@ def main() -> int:
     test_quality_refresh(cfg, failures)
     print()
     test_backup(cfg, failures)
+    print()
+    test_backup_guard(cfg, failures)
     print()
     test_bybit_sync(cfg, failures)
     print()
