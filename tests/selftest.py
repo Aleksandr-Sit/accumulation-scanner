@@ -4235,13 +4235,19 @@ def test_ops_guard(cfg, failures: list[str]) -> None:
             leak["api_keys"]["dune"] = "SECRET-123"
             lp = T / "leak.json"
             lp.write_text(_json.dumps(leak, ensure_ascii=False), encoding="utf-8")
-            os.environ.pop("DUNE_API_KEY", None)
+            # пустое, а не pop: иначе _load_dotenv вернёт ключ из боевого .env (на сервере он есть)
+            dune_env = os.environ.get("DUNE_API_KEY")
+            os.environ["DUNE_API_KEY"] = ""
             sys.stderr, real_err = io.StringIO(), sys.stderr
             try:
                 cl = _load(str(lp))
                 shipped = _load()
             finally:
                 sys.stderr = real_err
+                if dune_env is None:
+                    os.environ.pop("DUNE_API_KEY", None)
+                else:
+                    os.environ["DUNE_API_KEY"] = dune_env
             _check("config.json: ключ в файле не используется, предупреждение; в репозитории "
                    "ключей нет",
                    cl.get("api_keys.dune") == "" and "dune" in (cl.get("_config_warnings")
