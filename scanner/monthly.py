@@ -1,6 +1,7 @@
 """Месячная сводка: раз в месяц (1-го числа, шаг report ежедневного прогона, run.py report
 --if-due) — книги пробного исполнителя с начала против альтов, BTC и контрольной корзины
-по денежным потокам (scanner/benchmark.flow_pnl) и что книги сделали за прошлый месяц.
+по денежным потокам (scanner/benchmark.flow_pnl), что книги сделали за прошлый месяц и
+здоровье источников по неделям (scanner/health.py).
 
 Месяц — не статистика: позиций единицы, сравнение с рынком показывает знак, а не оценку.
 Время — локальное, как у недельной сводки (telegram.weekly_due).
@@ -41,12 +42,15 @@ def collect(cfg, now: float) -> dict[str, Any]:
     """Данные сводки: месяц, книги и тень (executor.weekly_books/weekly_shadow — с начала, по
     потокам), активность за месяц (executor.period_activity). Сбой блока — пустой блок и
     строка в errors: сводка уходит всё равно (это ещё и признак жизни)."""
-    from . import executor
+    from . import executor, health
     t0, t1, label = prev_month(now)
+    db = cfg["output"]["db_path"]
     out: dict[str, Any] = {"month": label, "t0": t0, "t1": t1, "books": [], "shadow": [],
-                           "activity": None, "errors": []}
+                           "activity": None, "health": None, "errors": []}
     for key, fn in (("books", executor.weekly_books), ("shadow", executor.weekly_shadow),
-                    ("activity", lambda c: executor.period_activity(c, t0, t1))):
+                    ("activity", lambda c: executor.period_activity(c, t0, t1)),
+                    ("health", lambda c: health.summarize(health.load(db, t0, t1) or [],
+                                                          t0, t1, 7))):
         try:
             out[key] = fn(cfg)
         except Exception as e:  # noqa: BLE001

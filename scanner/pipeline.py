@@ -207,6 +207,8 @@ def run_scan(cfg: Config, track: str = "all", limit: int | None = None) -> dict:
             chart = coingecko.closed_daily(coingecko.fetch_market_chart(http, c.coin_id, days, demo))
             age = closes.chart_age_days(chart, t0)
             stale = age is not None and age > max_chart_age
+            if age is not None and not stale and hasattr(http, "note_lag"):
+                http.note_lag("CoinGecko", age)    # опоздание дневной точки (scanner/health.py)
             if stale:
                 # Замёрзший ряд (монета умирает, CoinGecko перестал считать) — не «текущий».
                 c.flags.append("stale_chart")

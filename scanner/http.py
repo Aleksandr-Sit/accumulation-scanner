@@ -1,6 +1,9 @@
 """HTTP-клиент на stdlib: rate-limit по хосту, дисковый кэш, ретраи с backoff.
 
 Держит бесплатные тарифы в рамках лимитов и экономит вызовы между запусками.
+Считает по хостам запросы, сбои, коды ответов и ожидание повторов (stats), а closes.load
+отмечает отставание дневных закрытий (note_lag) — run.py пишет это в source_health
+(scanner/health.py) после каждого шага: тренд здоровья источников для сводок.
 """
 from __future__ import annotations
 
@@ -10,12 +13,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import weakref
 from pathlib import Path
 from typing import Any
 
 _RETRY_CODES = (429, 500, 502, 503, 504)
 _WAIT_429_MIN = 60.0   # окно лимита free-тарифов — минута; backoff 2→16 с его не переживает
 _WAIT_429_MAX = 90.0
+CLIENTS: "weakref.WeakSet[HttpClient]" = weakref.WeakSet()   # все клиенты процесса (health)
 
 
 def retry_wait(code: int, retry_after: str | None, backoff: float) -> float:
@@ -45,6 +50,21 @@ class HttpClient:
         # min интервал между вызовами хоста, сек
         self._min_interval = {h: 60.0 / max(1, n) for h, n in rate_limits_per_min.items()}
         self._last_call: dict[str, float] = {}
+        self.stats: dict[str, dict] = {}       # хост -> счётчики (_st)
+        self.lags: dict[str, list[int]] = {}   # источник закрытий -> lag_days позиций
+        CLIENTS.add(self)
+
+    def _st(self, host: str) -> dict:
+        """Счётчики хоста: req — запросов в сеть (логических, с повторами — один), ok,
+        fail — так и не ответил, cache — из кэша, codes — {код: попыток}: HTTP-коды, «net» —
+        сеть/таймаут, «retN» — ответ 200 с retCode N ≠ 0 (Bybit), wait_s — пауз перед повтором."""
+        return self.stats.setdefault(host, {"req": 0, "ok": 0, "fail": 0, "cache": 0,
+                                            "codes": {}, "wait_s": 0.0})
+
+    def note_lag(self, src: str, lag: int | None) -> None:
+        """Отставание дневного закрытия позиции от ожидаемого (closes.load), дней."""
+        if lag is not None:
+            self.lags.setdefault(src, []).append(int(lag))
 
     def _prune_cache(self) -> None:
         """Удаляет файлы кэша старше _PRUNE_AGE — иначе .cache растёт бесконечно."""
@@ -108,12 +128,15 @@ class HttpClient:
         if params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
 
+        host = urllib.parse.urlparse(url).netloc
+        st = self._st(host)
         if use_cache:
             cached = self._read_cache(url)
             if cached is not None:
+                st["cache"] += 1
                 return cached
-
-        host = urllib.parse.urlparse(url).netloc
+        st["req"] += 1
+        codes = st["codes"]
         req = urllib.request.Request(url, headers=headers or {})
         req.add_header("User-Agent", "accumulation-scanner/0.1")
         req.add_header("Accept", accept)
@@ -124,22 +147,34 @@ class HttpClient:
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     data = decode(resp.read())
+                st["ok"] += 1
+                rc = data.get("retCode") if isinstance(data, dict) else None
+                if isinstance(rc, int) and rc != 0:
+                    codes[f"ret{rc}"] = codes.get(f"ret{rc}", 0) + 1
                 if use_cache:
                     self._write_cache(url, data)
                 return data
             except urllib.error.HTTPError as e:
+                codes[str(e.code)] = codes.get(str(e.code), 0) + 1
                 if e.code in _RETRY_CODES and attempt < retries - 1:
-                    time.sleep(retry_wait(e.code, e.headers.get("Retry-After")
-                                          if e.headers else None, backoff))
+                    w = retry_wait(e.code, e.headers.get("Retry-After") if e.headers else None,
+                                   backoff)
+                    st["wait_s"] += w
+                    time.sleep(w)
                     backoff *= 2
                     continue
                 print(f"[http] {e.code} {url}")
+                st["fail"] += 1
                 return None
             except (urllib.error.URLError, TimeoutError, ValueError) as e:
+                codes["net"] = codes.get("net", 0) + 1
                 if attempt < retries - 1:
+                    st["wait_s"] += backoff
                     time.sleep(backoff)
                     backoff *= 2
                     continue
                 print(f"[http] fail {url}: {e}")
+                st["fail"] += 1
                 return None
+        st["fail"] += 1
         return None

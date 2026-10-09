@@ -101,6 +101,9 @@ def load(http, pos: dict, demo: str = "", now: float | None = None, days: int = 
                 "note": "; ".join(notes)}
     best = max(cands, key=lambda c: c["close_ts"][-1])     # при равенстве — первый (Bybit)
     lag = max(0, (exp - best["close_ts"][-1]) // DAY)
+    note_lag = getattr(http, "note_lag", None)      # здоровье источников (scanner/health.py)
+    if note_lag:
+        note_lag(best["src"], lag)
     if lag:
         notes.append(f"закрытие {close_label(exp)} ещё не вышло ({best['src']}), последнее — "
                      f"{close_label(best['close_ts'][-1])}")

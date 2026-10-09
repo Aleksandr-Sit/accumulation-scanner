@@ -750,6 +750,13 @@ def _report_weekly(args, cfg, pstore, now: float) -> int:
         stats["executor_shadow"] = executor.weekly_shadow(cfg)
     except Exception as e:  # noqa: BLE001
         print(f"[report] блок пробного исполнителя пропущен: {type(e).__name__}: {e}")
+    # Здоровье источников за неделю (scanner/health.py): сбои, 429/404, опоздание закрытий.
+    try:
+        from scanner import health
+        stats["health"] = health.summarize(
+            health.load(cfg["output"]["db_path"], week_ago, now) or [], week_ago, now, None)
+    except Exception as e:  # noqa: BLE001
+        print(f"[report] блок источников пропущен: {type(e).__name__}: {e}")
     text = telegram.format_weekly(stats, cfg)
     print(text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
     delivered = False
@@ -1198,7 +1205,28 @@ def main() -> int:
     args = p.parse_args()
     # лог прогона — stdout в logs/: полный диск не должен ронять шаг посреди работы
     sys.stdout, sys.stderr = _SafeStream(sys.stdout), _SafeStream(sys.stderr)
-    return args.func(args)
+    try:
+        return args.func(args)
+    finally:
+        _record_health(args)
+
+
+def _record_health(args) -> None:
+    """Счётчики источников шага (scanner/health.py) — в source_health; и при падении шага:
+    что сбоило перед падением, тоже важно. Сбой записи только в лог."""
+    if args.cmd == "selftest":
+        return
+    try:
+        from scanner import health
+        from scanner.http import CLIENTS
+        if not health.collect(CLIENTS):
+            return
+        cfg = load_config(getattr(args, "config", None))
+        n = health.record(cfg["output"]["db_path"], args.cmd, CLIENTS)
+        print(f"[health] источники: записано {n} строк (source_health)")
+    except Exception as e:  # noqa: BLE001
+        print(f"[health] счётчики источников не записаны: {type(e).__name__}: {e}")
+
 
 if __name__ == "__main__":
     sys.exit(main())

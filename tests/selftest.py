@@ -5220,6 +5220,162 @@ def test_monthly(cfg, failures: list[str]) -> None:
                and r_view == (0, r_ok[1]) and rc_due == 0 and calls == [], failures)
 
 
+def test_source_health(cfg, failures: list[str]) -> None:
+    print("Здоровье источников (scanner/health.py, счётчики HttpClient, source_health):")
+    import copy
+    import io
+    import json as _json
+    import sqlite3
+    import sys
+    import tempfile
+    import types
+    import urllib.error
+    from pathlib import Path as _P
+    import run as run_cli
+    from scanner import closes, health
+    from scanner import http as hmod
+    from scanner.config import Config
+    from scanner.notify import telegram as tg
+    D = 86400
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def err(code):
+        return urllib.error.HTTPError("http://x", code, "x", {}, None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        script: list = []
+
+        def fake_open(req, timeout=None):
+            x = script.pop(0)
+            if isinstance(x, Exception):
+                raise x
+            return _Resp(_json.dumps(x).encode())
+        real_open, real_sleep = hmod.urllib.request.urlopen, hmod.time.sleep
+        hmod.urllib.request.urlopen, hmod.time.sleep = fake_open, lambda s: None
+        try:
+            h = hmod.HttpClient(str(_P(tmp) / "cache"), 3600, 5, {})
+            script[:] = [err(429), {"retCode": 10006, "result": {}}]
+            r1 = h.get_json("https://api.bybit.com/v5/market/kline", use_cache=False)
+            script[:] = [err(404)]
+            r2 = h.get_json("https://api.github.com/repos/x/y", retries=3)
+            script[:] = [urllib.error.URLError("down")] * 3
+            r3 = h.get_json("https://api.llama.fi/x", retries=3)
+            script[:] = [{"a": 1}]
+            h.get_json("https://stablecoins.llama.fi/s")
+            h.get_json("https://stablecoins.llama.fi/s")      # из кэша
+        finally:
+            hmod.urllib.request.urlopen, hmod.time.sleep = real_open, real_sleep
+        by = h.stats
+        _check("http: 429 → повтор и ответ с retCode 10006: запрос 1, ok 1, коды 429 и ret10006, "
+               "ожидание учтено",
+               r1 == {"retCode": 10006, "result": {}}
+               and by["api.bybit.com"]["req"] == 1 and by["api.bybit.com"]["ok"] == 1
+               and by["api.bybit.com"]["codes"] == {"429": 1, "ret10006": 1}
+               and by["api.bybit.com"]["wait_s"] >= 60, failures)
+        _check("http: 404 — сбой без повтора; сеть 3 попытки — один сбой, net ×3; кэш отдельно",
+               r2 is None and by["api.github.com"]["fail"] == 1
+               and by["api.github.com"]["codes"] == {"404": 1}
+               and r3 is None and by["api.llama.fi"]["fail"] == 1
+               and by["api.llama.fi"]["codes"] == {"net": 3}
+               and by["stablecoins.llama.fi"]["req"] == 1
+               and by["stablecoins.llama.fi"]["cache"] == 1, failures)
+
+        # отставание закрытий: CoinGecko без точки дня → lag 1 отмечен у клиента
+        now = 1783987200 + 10 * D + 6 * 3600
+        chart = {"prices": [[(1783987200 + k * D) * 1000, 1.0 + k] for k in range(10)],
+                 "total_volumes": [[(1783987200 + k * D) * 1000, 5.0] for k in range(10)],
+                 "market_caps": []}
+        hc = hmod.HttpClient(str(_P(tmp) / "cache2"), 3600, 5, {})
+        hc.get_json = lambda *a, **k: chart
+        got = closes.load(hc, {"symbol": "XYO", "coin_id": "xyo"}, now=now)
+        _check("closes.load: опоздание закрытия CoinGecko отмечено у клиента (lag 1)",
+               got["lag_days"] == 1 and hc.lags == {"CoinGecko": [1]}, failures)
+
+        # запись, повторная запись не задваивает, чтение
+        db = str(_P(tmp) / "t.db")
+        t0 = 1783987200
+        w1 = types.SimpleNamespace(stats={"api.coingecko.com": {
+            "req": 100, "ok": 98, "fail": 2, "cache": 5, "codes": {"429": 3}, "wait_s": 180.0}},
+            lags={"CoinGecko": [0, 1, 2, 0]})
+        w2 = types.SimpleNamespace(stats={"api.bybit.com": {
+            "req": 50, "ok": 50, "fail": 0, "cache": 0, "codes": {}, "wait_s": 0.0},
+            "pro-api.coingecko.com": {"req": 10, "ok": 10, "fail": 0, "cache": 0, "codes": {},
+                                      "wait_s": 0.0}}, lags={"Bybit": [0, 0]})
+        n1 = health.record(db, "scan", [w1, w2], now=t0 + 3600)
+        n_again = health.record(db, "scan", [w1, w2], now=t0 + 3700)
+        health.record(db, "scan", [types.SimpleNamespace(stats={}, lags={"CoinGecko": [0, 0]})],
+                      now=t0 + D + 3600)                 # прогон без опозданий
+        health.record(db, "watch", [types.SimpleNamespace(
+            stats={"api.coingecko.com": {"req": 10, "ok": 10, "fail": 0, "cache": 0,
+                                         "codes": {}, "wait_s": 0.0}},
+            lags={"CoinGecko": [0]})], now=t0 + 8 * D)
+        rows = health.load(db, t0, t0 + 14 * D)
+        _check("record: строки http по хосту и lag по источнику; повтор того же процесса — 0 "
+               "строк; load читает, codes — словарь",
+               n1 == 5 and n_again == 0 and len(rows) == 8
+               and any(r["kind"] == "lag" and r["source"] == "CoinGecko" and r["req"] == 4
+                       and r["fail"] == 2 and r["lag_max"] == 2 for r in rows)
+               and any(r["codes"] == {"429": 3} for r in rows), failures)
+        sqlite3.connect(str(_P(tmp) / "empty.db")).close()
+        _check("load: нет файла или таблицы — None; таблица есть, строк нет — []",
+               health.load(str(_P(tmp) / "none.db"), 0, 1) is None
+               and health.load(str(_P(tmp) / "empty.db"), 0, 1) is None
+               and health.load(db, 0, 1) == [], failures)
+
+        s = health.summarize(rows, t0, t0 + 14 * D, 7)
+        cg = next(x for x in s["http"] if x["source"] == "CoinGecko")
+        lag_scan = next(g for g in s["lag"] if g["source"] == "CoinGecko" and g["step"] == "scan")
+        _check("summarize: хосты CoinGecko сведены, сбоивший — первым; тренд по неделям; "
+               "опоздание по шагу",
+               s["http"][0]["source"] == "CoinGecko" and cg["req"] == 120 and cg["fail"] == 2
+               and [b["fail"] for b in cg["buckets"]] == [2, 0]
+               and [b["req"] for b in cg["buckets"]] == [110, 10] and s["buckets"] == 2
+               and lag_scan["late"] == 2 and lag_scan["n"] == 6 and lag_scan["late_runs"] == 1
+               and lag_scan["runs"] == 2, failures)
+        lines = tg.source_health_lines(s, "за месяц")
+        txt = "\n".join(lines)
+        _check("текст: сбоивший источник с кодами, ожиданием и неделями; остальные «без сбоев»; "
+               "опоздание CoinGecko; Bybit без опозданий не показан",
+               "CoinGecko: сбоев 2 из 120 (2%) · 429 ×3 · ждали 3 мин · нед.: 2/110 · 0/10" in txt
+               and "без сбоев: Bybit 50 запр." in txt
+               and "CoinGecko (графики скана): закрытие дня не вышло к прогону у 2 из 6 (33%), "
+                   "в 1 из 2 прогонов, макс. 2 дн. · нед.: 33% · —" in txt
+               and "Bybit (" not in txt and tg.source_health_lines(None, "x") == []
+               and "🩺 <b>Источники</b>" in tg.format_monthly(
+                   {"month": "x", "books": [], "shadow": [], "activity": None, "errors": [],
+                    "health": s})
+               and tg.source_health_lines(health.summarize([], 0, 1, None), "x") == [],
+               failures)
+
+        # хук run.py: шаг пишет счётчики своих клиентов; selftest — нет
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {**d.get("output", {}), "db_path": str(_P(tmp) / "hook.db")}
+        c = Config(d)
+        real_load, real_clients, real_out = run_cli.load_config, hmod.CLIENTS, sys.stdout
+        run_cli.load_config = lambda p=None: c
+        try:
+            w = types.SimpleNamespace(stats={"api.bybit.com": {"req": 3, "ok": 2, "fail": 1,
+                                                               "cache": 0, "codes": {"503": 5},
+                                                               "wait_s": 30.0}}, lags={})
+            hmod.CLIENTS = [w]
+            sys.stdout = io.StringIO()
+            run_cli._record_health(types.SimpleNamespace(cmd="selftest", config=None))
+            run_cli._record_health(types.SimpleNamespace(cmd="execute", config=None))
+        finally:
+            run_cli.load_config, hmod.CLIENTS, sys.stdout = real_load, real_clients, real_out
+        cn = sqlite3.connect(str(_P(tmp) / "hook.db"))
+        got = cn.execute("SELECT step, source, req, fail, codes FROM source_health").fetchall()
+        cn.close()
+        _check("run.py: после шага счётчики в source_health (шаг execute); selftest не пишет",
+               got == [("execute", "api.bybit.com", 3, 1, '{"503": 5}')], failures)
+
+
 def main() -> int:
     cfg = load_config()
     failures: list[str] = []
@@ -5300,6 +5456,8 @@ def main() -> int:
     test_ops_guard(cfg, failures)
     print()
     test_monthly(cfg, failures)
+    print()
+    test_source_health(cfg, failures)
     print()
     data_tmp.cleanup()
     if failures:

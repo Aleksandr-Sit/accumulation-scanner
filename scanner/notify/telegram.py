@@ -1126,6 +1126,10 @@ def format_weekly(stats: dict, cfg) -> str:
     if exb:
         lines.append("")
         lines += exb
+    src = source_health_lines(stats.get("health"), "за неделю")
+    if src:
+        lines.append("")
+        lines += src
 
     # Одноразовая итоговая сводка на N-й неделе — с кумулятивом и call-to-decide.
     if stats.get("milestone"):
@@ -1149,6 +1153,63 @@ def format_weekly(stats: dict, cfg) -> str:
             remind += f" До итоговой сводки: {left} нед."
         lines.append(f"<i>{remind} Это форвард-тест стратегии на живом рынке.</i>")
     return "\n".join(lines)
+
+
+_LAG_WHERE = {"scan": "графики скана", "watch": "позиции"}
+
+
+def _codes_text(codes: dict) -> str:
+    """«429 ×12 · сеть ×2 · retCode 10006 ×1» — до 4 самых частых."""
+    def name(c: str) -> str:
+        return "сеть" if c == "net" else (f"retCode {c[3:]}" if c.startswith("ret") else c)
+    top = sorted(codes.items(), key=lambda kv: (-kv[1], kv[0]))[:4]
+    return " · ".join(f"{name(c)} ×{n}" for c, n in top)
+
+
+def _share(a: float, b: float) -> str:
+    return f"{a / b * 100:.0f}%" if b else "—"
+
+
+def source_health_lines(s: dict | None, period: str) -> list[str]:
+    """«🩺 Источники» (scanner/health.summarize): сбоившие источники — строкой с кодами,
+    ожиданием и трендом по неделям (если корзин > 1), остальные — одной строкой «без сбоев»;
+    опоздание дневных закрытий — у CoinGecko всегда, у остальных — если было. Данных нет —
+    пусто."""
+    if not s or not (s.get("http") or s.get("lag")):
+        return []
+    weeks = (s.get("buckets") or 0) > 1
+    out = [f"🩺 <b>Источники</b> {period}:"]
+    clean = []
+    for h in s.get("http") or []:
+        if not (h["fail"] or h["codes"]):
+            clean.append(h)
+            continue
+        line = (f"{_esc(h['source'])}: сбоев {h['fail']} из {h['req']} "
+                f"({_share(h['fail'], h['req'])})")
+        if h["codes"]:
+            line += f" · {_codes_text(h['codes'])}"
+        if h["wait_s"] >= 60:
+            line += f" · ждали {h['wait_s'] / 60:.0f} мин"
+        if weeks:
+            line += " · нед.: " + " · ".join(f"{b['fail']}/{b['req']}" for b in h["buckets"])
+        out.append(line)
+    if clean:
+        out.append("без сбоев: " + ", ".join(f"{_esc(h['source'])} {h['req']}" for h in clean)
+                   + " запр.")
+    for g in s.get("lag") or []:
+        if not (g["late"] or g["source"] == "CoinGecko"):
+            continue
+        where = _LAG_WHERE.get(g["step"], g["step"])
+        line = (f"{_esc(g['source'])} ({_esc(where)}): закрытие дня не вышло к прогону у "
+                f"{g['late']} из {g['n']} ({_share(g['late'], g['n'])}), в {g['late_runs']} из "
+                f"{g['runs']} прогонов" + (f", макс. {g['lag_max']} дн." if g["late"] else ""))
+        if weeks:
+            line += " · нед.: " + " · ".join(_share(b["late"], b["n"]) for b in g["buckets"])
+        out.append(line)
+    out.append("<i>Сбой — не ответил после повторов; 429 — лимит запросов; 404 у GitHub — "
+               "обычно нет репозитория. Опоздавшее закрытие — день не оценивается до "
+               "следующего прогона.</i>")
+    return out
 
 
 def _month_book_line(b: dict) -> str:
@@ -1197,11 +1258,13 @@ def format_monthly(stats: dict, cfg=None) -> str:
         lines.append(f"За месяц: {' · '.join(parts)}{tail}")
     for e in stats.get("errors") or []:
         lines.append(f"⚠ блок не посчитан: {_esc(e)[:200]}")
-    for block in ("sources", "checklist"):          # здоровье источников, чек-лист решений
-        extra = stats.get(block) or []
-        if extra:
-            lines.append("")
-            lines += extra
+    src = source_health_lines(stats.get("health"), "за месяц (нед. — сбои/запросы по неделям)")
+    if src:
+        lines.append("")
+        lines += src
+    if stats.get("checklist"):                      # чек-лист решений
+        lines.append("")
+        lines += stats["checklist"]
     lines.append("")
     lines.append(f"<i>{FLOW_NOTE} За месяц позиций единицы — это знак, а не оценка отбора.</i>")
     return "\n".join(lines)
