@@ -137,6 +137,21 @@ def run_books(eps: list[dict]) -> dict[str, list[dict]]:
             for b, (sell, stop) in BOOKS.items()}
 
 
+def run_books_exec(eps: list[dict]) -> dict[str, list[dict]]:
+    """Те же книги на модели исполнителя после блока C (ladder_dca_study.simulate_exec, все
+    EXEC_RULES). Эпизоды, где исполнитель отказал бы (цена входа ниже стопа), выпадают."""
+    out: dict[str, list[dict]] = {}
+    for b, (sell, _stop) in BOOKS.items():
+        rows = []
+        for ep in eps:
+            r = L.simulate_exec(ep["seg"], ep["e"], sell, budget=BUDGET, horizon=HORIZON,
+                                rules=L.EXEC_ALL)
+            if r:
+                rows.append(dict(r, ep=ep))
+        out[b] = rows
+    return out
+
+
 def stats(rows: list[dict]) -> dict:
     if not rows:
         return {}
@@ -392,6 +407,12 @@ def main() -> int:
     buckets(res, thr, results.setdefault("buckets", {}))
     print(f"\n=== 2. Фильтры [{time.time()-t0:.0f} с] ===")
     filters(res, thr, results.setdefault("filters", {}))
+
+    print(f"\n=== 2б. Фильтры на модели исполнителя после блока C (тейк 0.33 с минимумом $5, "
+          f"защёлка трейла, лоу базы 30, вход от open, пыль) [{time.time()-t0:.0f} с] ===")
+    rex = run_books_exec(eps)
+    filters(rex, {b: top_threshold(rows) for b, rows in rex.items()},
+            results.setdefault("filters_exec", {}))
 
     # портфель — все эпизоды (у недосчитанных хвостов span короче, слот освобождается раньше)
     res_all = run_books(eps_all)

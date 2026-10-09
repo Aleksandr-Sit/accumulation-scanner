@@ -17,6 +17,15 @@ stage8_exit целиком, H — только стоп −25%; 15 слотов 
 закрытия дня выхода, комиссия 0.15% на вход и на выход. Лестница вкладывает деньги
 постепенно, бенчмарк — сразу: в растущем рынке это в пользу бенчмарка, в падающем — против.
 
+После блока C (09.10.2026, раздел «ПОСЛЕ БЛОКА C»): та же книга «как исполнитель», приводимая
+к проду по шагам STEPS — бенчмарк по денежным потокам (scanner/benchmark.flow_pnl, как
+месячная сводка: каждая ступень покупает ту же сумму в рынок в тот же день, продажа — ту же
+долю), правила исполнения (ladder_dca_study.simulate_exec, EXEC_RULES), кулдаун 90 дн. от
+взятого входа по всем дням сигнала (а не эпизоды через 90 дн. от сигнала), свободный USDT
+книги $1500, без горизонта (открытые в конце данных — по последнему закрытию), детектор
+зоны прода. Шаг «было» обязан повторить замер 08.10; разброс по случайному порядку
+сигналов и вклад 10 лучших позиций — мерила хрупкости.
+
 Оговорки: архив только Binance; пружина — исследовательский детектор, а не балл ≥ 70;
 эпизоды коррелированы; пороги частично in-sample. Индекс альтов взвешен по капе — его
 нельзя купить один в один, это ориентир «рынок альтов в целом».
@@ -26,6 +35,7 @@ stage8_exit целиком, H — только стоп −25%; 15 слотов 
 """
 from __future__ import annotations
 
+import heapq
 import json
 import random
 import sqlite3
@@ -40,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import junk_filter_study as J  # noqa: E402
 import ladder_dca_study as L  # noqa: E402
+from scanner.benchmark import flow_pnl  # noqa: E402
 
 OUT = Path(__file__).resolve().parent / "portfolio_vs_market_results.json"
 DAY = 86400
@@ -165,6 +176,184 @@ def mean_runs(runs: list[dict]) -> dict:
     return out
 
 
+# ---------------------------------------------------------------- как исполнитель (блок C)
+
+CAPITAL = 1500.0                 # executor.capital_usdt — виртуальный счёт книги
+COOLDOWN_DAYS = 90               # executor.reentry_cooldown_days, от входа (created_ts)
+EXEC_POLICY = (lambda ep: ep["share"] <= VOL_BOTTOM_SHARE and ep["hot"] == 0,
+               lambda ep: ep["share"] > ILLIQUID_SHARE)
+# Шаги приведения к проду: (ключ, подпись, эпизоды, правила simulate_exec, горизонт,
+# кулдаун от взятого входа, проверка свободного USDT, бенчмарк по потокам).
+STEPS = [
+    ("s0", "было: замер 08.10 (сумма в рынок сразу)", "e90", None, 365, False, False, False),
+    ("s1", "+ бенчмарк по денежным потокам", "e90", None, 365, False, False, True),
+    ("s2", "+ правила исполнения (EXEC_RULES)", "e90", "all", 365, False, False, True),
+    ("s3", "+ кулдаун 90 дн. от взятого входа", "every", "all", 365, True, False, True),
+    ("s4", "+ свободный USDT книги ($1500)", "every", "all", 365, True, True, True),
+    ("s5", "+ без горизонта 365 дн.", "every", "all", None, True, True, True),
+    ("s6", "+ детектор зоны прода (0.70, 29 дн.)", "prod", "all", None, True, True, True),
+]
+
+
+def exec_book(cands: list[dict], sim, take, quota, *, cooldown: bool, cash: bool,
+              order: str = "rank", seed: int = 0) -> list[tuple[dict, dict]]:
+    """Книга исполнителя по дням сигналов: слот занят до выхода (одна позиция на монету,
+    не больше J.SLOTS, квота неликвида), кулдаун — COOLDOWN_DAYS от прошлого ВЗЯТОГО входа
+    по монете (cooldown=False — его заменяет шаг эпизодов 90 дн. от сигнала, как раньше),
+    cash — свободный USDT книги (CAPITAL + выручка − траты − резерв лимиток) не меньше
+    стоимости лестницы. risk_check исполнителя (экспозиция по вложенному ≤ 30% / 60% × $1500
+    = $750) при 15 × $50 не строже лимита монет — отдельно не считается.
+    sim(ep) -> строка simulate_exec | None (отказ плана). -> [(эпизод, строка)]."""
+    rnd = random.Random(seed)
+    by_day: dict[int, list[dict]] = {}
+    for ep in cands:
+        by_day.setdefault(ep["day"], []).append(ep)
+    held: list[tuple[int, bool, str]] = []
+    last: dict[str, int] = {}
+    events: list[tuple[int, float]] = []
+    free = CAPITAL
+    taken = []
+    for day in sorted(by_day):
+        held = [x for x in held if x[0] > day]
+        while events and events[0][0] <= day:
+            free += heapq.heappop(events)[1]
+        cc = [ep for ep in by_day[day] if take(ep)]
+        if order == "rank":
+            cc.sort(key=lambda ep: ep["rank"])
+        else:
+            rnd.shuffle(cc)
+        for ep in cc:
+            coin = ep["seg"]["sym"].split("#")[0]
+            if any(x[2] == coin for x in held):
+                continue
+            if cooldown and coin in last and day < last[coin] + COOLDOWN_DAYS * DAY:
+                continue
+            in_q = quota is not None and quota(ep)
+            if len(held) >= J.SLOTS or (in_q and sum(1 for x in held if x[1]) >= ILLIQUID_SLOTS):
+                continue
+            r = sim(ep)
+            if r is None:
+                continue
+            if cash:
+                need = -r["cash"][0][1]
+                if free + 1e-9 < need:
+                    continue
+                ts = ep["seg"]["ts"]
+                free -= need
+                for d, v in r["cash"][1:]:
+                    heapq.heappush(events, (ts[d], v))
+            held.append((day + max(r["span"], 1) * DAY, in_q, coin))
+            last[coin] = day
+            taken.append((ep, r))
+    return taken
+
+
+def evaluate_flows(taken: list[tuple[dict, dict]], alt: dict, btc: dict) -> dict:
+    """Как evaluate, плюс бенчмарк по денежным потокам (scanner/benchmark.flow_pnl, как
+    месячная сводка): каждая покупка — та же сумма в рынок в тот же день, продажа — та же
+    доля, комиссия FEE на вход и выход, остаток — по уровню дня выхода."""
+    rows = []
+    for ep, r in taken:
+        spent = r["spent"]
+        if spent <= 0:
+            continue
+        ts = ep["seg"]["ts"]
+        d0 = ep["day"]
+        d1 = d0 + max(r["span"], 1) * DAY
+        la, lb = bench_pnl(spent, alt, d0, d1), bench_pnl(spent, btc, d0, d1)
+        flows = [{"ts": ts[d], "side": sd, "usd": usd, "frac": fr} for d, sd, usd, fr in r["flows"]]
+        fa = flow_pnl(flows, lambda t: at(alt, t), d1, FEE)
+        fb = flow_pnl(flows, lambda t: at(btc, t), d1, FEE)
+        if None in (la, lb, fa, fb):
+            continue
+        rows.append({"d0": d0, "d1": d1, "spent": spent, "pnl": r["pnl"], "alt": fa, "btc": fb,
+                     "alt_lump": la, "btc_lump": lb, "cycle": ep["cycle"], "how": r["how"],
+                     "days": max(r["span"], 1)})
+    if not rows:
+        return {}
+    s = lambda k, rr=rows: sum(x[k] for x in rr)  # noqa: E731
+    exc = [(x["pnl"] - x["alt"]) / x["spent"] for x in rows]
+    cyc = {}
+    for c in sorted({x["cycle"] for x in rows}):
+        rr = [x for x in rows if x["cycle"] == c]
+        cyc[c] = {"n": len(rr), "spent": s("spent", rr), "pnl": s("pnl", rr),
+                  "alt": s("alt", rr), "btc": s("btc", rr)}
+    years = (max(x["d1"] for x in rows) - min(x["d0"] for x in rows)) / DAY / 365
+    hows: dict[str, int] = {}
+    for x in rows:
+        hows[x["how"]] = hows.get(x["how"], 0) + 1
+    return {"n": len(rows), "spent": s("spent"), "pnl": s("pnl"), "alt": s("alt"),
+            "btc": s("btc"), "alt_lump": s("alt_lump"), "btc_lump": s("btc_lump"),
+            "beat_alt_share": sum(1 for x in rows if x["pnl"] > x["alt"]) / len(rows),
+            "excess_med": statistics.median(exc), "years": years,
+            "avg_capital": sum(x["spent"] * x["days"] for x in rows) / (years * 365),
+            "hows": hows, "held_2y": sum(1 for x in rows if x["days"] > 730), "cycles": cyc}
+
+
+def exec_steps(cands: dict[str, list[dict]], alt: dict, btc: dict, t0: float) -> dict:
+    """Приведение замера к исполнителю по шагам STEPS, книги R и H независимо."""
+    out: dict = {}
+    cache: dict = {}
+    for b, (sell, _stop) in J.BOOKS.items():
+        name = "R правила" if b == "R" else "H держать"
+        print(f"\n--- книга {name}, отбор «как исполнитель», {J.SLOTS} × ${J.BUDGET:g}")
+        print(f"  {'шаг':44} {'поз.':>5} {'вложено':>8} {'P&L':>7} {'альты':>7} {'BTC':>7} "
+              f"{'P&L−альты':>9} {'P&L−BTC':>8} {'лучше альт':>10} {'работало $':>10}")
+        for key, label, src, rules, hz, cool, cash, flows in STEPS:
+            rr = L.EXEC_ALL if rules == "all" else None
+
+            def sim(ep, rr=rr, hz=hz, sell=sell, b=b):
+                k = (b, ep["seg"]["sym"], ep["e"], rr is not None, hz)
+                if k not in cache:
+                    cache[k] = L.simulate_exec(ep["seg"], ep["e"], sell, budget=J.BUDGET,
+                                               horizon=hz, rules=rr)
+                return cache[k]
+            taken = exec_book(cands[src], sim, *EXEC_POLICY, cooldown=cool, cash=cash)
+            last_taken = taken
+            m = evaluate_flows(taken, alt, btc)
+            if not flows:
+                m = {**m, "alt": m["alt_lump"], "btc": m["btc_lump"]}
+            m["label"] = label
+            out.setdefault(b, {})[key] = m
+            print(f"  {label:44} {m['n']:>5} {m['spent']:>7.0f}$ {m['pnl']:>+6.0f}$ "
+                  f"{m['alt']:>+6.0f}$ {m['btc']:>+6.0f}$ {m['pnl'] - m['alt']:>+8.0f}$ "
+                  f"{m['pnl'] - m['btc']:>+7.0f}$ {m['beat_alt_share'] * 100:>9.0f}% "
+                  f"{m['avg_capital']:>9.0f}$  [{time.time() - t0:.0f} с]")
+        fin = out[b][STEPS[-1][0]]
+        # хрупкость: тот же финальный шаг при случайном порядке сигналов внутри дня
+        key, _l, src, rules, hz, cool, cash, _f = STEPS[-1]
+        runs = []
+        for sd in range(J.SEEDS):
+            def sim(ep, hz=hz, sell=sell, b=b):
+                k = (b, ep["seg"]["sym"], ep["e"], True, hz)
+                if k not in cache:
+                    cache[k] = L.simulate_exec(ep["seg"], ep["e"], sell, budget=J.BUDGET,
+                                               horizon=hz, rules=L.EXEC_ALL)
+                return cache[k]
+            m = evaluate_flows(exec_book(cands[src], sim, *EXEC_POLICY, cooldown=cool,
+                                         cash=cash, order="random", seed=sd), alt, btc)
+            runs.append((m["pnl"], m["pnl"] - m["alt"], m["pnl"] - m["btc"]))
+        fin["random_order"] = {"seeds": J.SEEDS,
+                               "pnl": [min(r[0] for r in runs), max(r[0] for r in runs)],
+                               "vs_alt": [min(r[1] for r in runs), max(r[1] for r in runs)],
+                               "vs_btc": [min(r[2] for r in runs), max(r[2] for r in runs)],
+                               "vs_alt_mean": statistics.fmean(r[1] for r in runs),
+                               "beat_alt_runs": sum(1 for r in runs if r[1] > 0)}
+        ro = fin["random_order"]
+        tops = sorted((r["pnl"] for _, r in last_taken), reverse=True)
+        fin["top10_pnl"] = sum(tops[:10])
+        print(f"      случайный порядок сигналов ({J.SEEDS}): P&L {ro['pnl'][0]:+.0f}…"
+              f"{ro['pnl'][1]:+.0f}$, P&L−альты {ro['vs_alt'][0]:+.0f}…{ro['vs_alt'][1]:+.0f}$ "
+              f"(лучше альтов в {ro['beat_alt_runs']} из {J.SEEDS}), P&L−BTC {ro['vs_btc'][0]:+.0f}…"
+              f"{ro['vs_btc'][1]:+.0f}$; 10 лучших позиций дают {fin['top10_pnl']:+.0f}$")
+        for c, v in fin["cycles"].items():
+            print(f"      {c:12} поз. {v['n']:>4}  вложено {v['spent']:>6.0f}$  P&L {v['pnl']:>+6.0f}$"
+                  f"  альты {v['alt']:>+6.0f}$  BTC {v['btc']:>+6.0f}$")
+        print("      выходы: " + ", ".join(f"{k} {v}" for k, v in sorted(fin["hows"].items()))
+              + f"; держались > 2 лет: {fin['held_2y']}")
+    return out
+
+
 def main() -> int:
     t0 = time.time()
     coins = L.load_archive()
@@ -217,6 +406,30 @@ def main() -> int:
     print("\n«альты»/«BTC» — та же вложенная сумма в рынок на тех же окнах (вход → выход позиции);"
           " «мед. избыток» — медиана (P&L − альты) / вложено по позициям; «в год» — Σ P&L / лет /"
           f" ${J.SLOTS * J.BUDGET:g} (простая); «работало $» — средняя сумма в позициях.")
+
+    # ---- после блока C: замер «как исполнитель» по шагам приведения к проду
+    src = L.signal_days(segs, ranks, hot, {"every": lambda f, cl, t: L.is_spring(f),
+                                           "prod": L.is_spring_prod})
+    for k in src:
+        src[k] = [ep for ep in src[k] if ep["cycle"] != "?"]
+        for ep in src[k]:
+            n = npairs.get(ep["day"]) or 0
+            ep["share"] = ep["rank"] / n if n else 1.0
+    src["e90"] = eps_all
+    print(f"\n=== ПОСЛЕ БЛОКА C: книги как исполнитель, по шагам приведения к проду ===\n"
+          f"  дней сигнала: детектор исследований {len(src['every'])}, детектор прода "
+          f"{len(src['prod'])} (эпизодов через 90 дн.: {len(eps_all)})  [{time.time() - t0:.0f} с]")
+    out["exec"] = exec_steps(src, alt, btc, t0)
+    for b in J.BOOKS:                    # шаг «было» — тот же расчёт, что таблица выше
+        a, z = out[b]["как исполнитель"], out["exec"][b]["s0"]
+        assert a["n"] == z["n"] and abs(a["pnl"] - z["pnl"]) < 1e-6 and \
+            abs(a["alt"] - z["alt"]) < 1e-6, f"{b}: шаг «было» разошёлся с замером ({a['pnl']} / {z['pnl']})"
+    out["exec"]["meta"] = {"rules": dict(L.EXEC_RULES), "capital": CAPITAL,
+                           "cooldown_days": COOLDOWN_DAYS,
+                           "signal_days": {k: len(v) for k, v in src.items()}}
+    print("\nПосле блока C «альты»/«BTC» — по денежным потокам (scanner/benchmark.flow_pnl): каждая"
+          " ступень покупает ту же сумму в рынок в тот же день, продажа книги продаёт ту же долю;"
+          " шаг «было» — вся вложенная сумма в рынок в день сигнала до дня выхода.")
     OUT.write_text(json.dumps(out, ensure_ascii=False, indent=1, default=float), encoding="utf-8")
     print(f"\nsaved -> {OUT.name} ({time.time() - t0:.0f} с)")
     return 0

@@ -25,12 +25,21 @@
 доход на свободный кэш (считается нулевым).
 
 Пороги сигнала — feature_study.is_spring (детектор исследований, cooldown 90д).
+
+Раздел 6 — модель пробного исполнителя после блока C (scanner/executor.py, 46c1740):
+simulate_exec = simulate для лестницы «до пола» + правила прода EXEC_RULES (защёлка трейла,
+тейк 0.33 с минимумом биржи, сетка tick/qty_step, пыль, делистинг, лоу базы 30, вход от
+open, лимитки «строго ниже»). Без правил копия обязана совпасть с simulate на всех эпизодах
+(assert); дальше — вклад каждого правила. Портфель книг (кулдаун от взятого входа, свободный
+USDT, без горизонта, детектор зоны прода is_spring_prod) и бенчмарк по денежным потокам —
+backtest/portfolio_vs_market.py. Что дневными свечами не повторить — в EXEC_RULES.
 Запуск из корня проекта:  python backtest/ladder_dca_study.py
 Результат: backtest/ladder_dca_results.json
 """
 from __future__ import annotations
 
 import json
+import math
 import random
 import statistics
 import sys
@@ -43,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from binance_archive import load as load_archive  # noqa: E402
 from feature_study import COOLDOWN, features, is_spring  # noqa: E402
+from scanner.ladder import round_step  # noqa: E402
 
 OUT = Path(__file__).resolve().parent / "ladder_dca_results.json"
 DAY = 86400
@@ -154,10 +164,36 @@ def load_hot() -> dict[int, int]:
         return {}
 
 
+def is_spring_prod(f: dict, cl: list[float], t: int) -> bool:
+    """Зона «ПРУЖИНА/ДНО» прода (scanner/stages/zone.py, config stage4_zone): сжатие ≤ 0.70
+    (а не 0.75), тренд — к цене 29 дн. назад (prices[-30]), а не 30. Окно 180 закрытий, база
+    сжатия до последних 30 доходностей, range_pos — как в features. Просадка — от максимума
+    закрытий Binance (у прода — ATH CoinGecko, интрадей и с первых торгов: не повторить)."""
+    tr = cl[t] / cl[t - 29] - 1 if cl[t - 29] > 0 else 0.0
+    return (f["dd_ath"] >= 0.70 and f["range_pos"] <= 0.5
+            and f["contr"] is not None and f["contr"] <= 0.70 and tr > -0.15)
+
+
+def _episode(s: dict, t: int, ranks, hot) -> dict:
+    cl, qv, ts = s["c"], s["qv"], s["ts"]
+    n, day = len(cl), ts[t]
+    return {
+        "seg": s, "e": t, "day": day,
+        "died2y": (not s["alive"] and not s["swap_end"] and n - 1 < t + HORIZON),
+        "age": t, "vol30": statistics.fmean(qv[t - 29:t + 1]),
+        "rank": ranks.get((s["sym"], day), 9999),
+        "hot": hot.get(day - DAY),
+        "cycle": next((c for c, a, b in CYCLES if a <= day < b), "?"),
+        "half": time.strftime("%Y", time.gmtime(day)) + ("H1" if time.gmtime(day).tm_mon <= 6 else "H2"),
+    }
+
+
 def build_episodes(segs, ranks, hot, mode: str) -> list[dict]:
+    """Эпизоды: mode "spring" — сигнал is_spring, следующий не раньше COOLDOWN дн. от сигнала;
+    "every90" — контроль без сигнала."""
     eps = []
     for s in segs:
-        cl, qv, ts = s["c"], s["qv"], s["ts"]
+        cl, qv = s["c"], s["qv"]
         n, t = len(cl), 200
         while t < n - 30:
             if mode == "spring":
@@ -165,18 +201,28 @@ def build_episodes(segs, ranks, hot, mode: str) -> list[dict]:
                 if not (f and is_spring(f)):
                     t += 1
                     continue
-            day = ts[t]
-            eps.append({
-                "seg": s, "e": t, "day": day,
-                "died2y": (not s["alive"] and not s["swap_end"] and n - 1 < t + HORIZON),
-                "age": t, "vol30": statistics.fmean(qv[t - 29:t + 1]),
-                "rank": ranks.get((s["sym"], day), 9999),
-                "hot": hot.get(day - DAY),
-                "cycle": next((c for c, a, b in CYCLES if a <= day < b), "?"),
-                "half": time.strftime("%Y", time.gmtime(day)) + ("H1" if time.gmtime(day).tm_mon <= 6 else "H2"),
-            })
+            eps.append(_episode(s, t, ranks, hot))
             t += COOLDOWN
     return eps
+
+
+def signal_days(segs, ranks, hot, detectors: dict) -> dict[str, list[dict]]:
+    """Все дни сигнала каждого детектора за один проход признаков: {имя: эпизоды}. Детектор —
+    (f, cl, t) -> bool. Кулдаун здесь не применяется: его считает портфель от взятого входа,
+    как прод (executor.reentry_cooldown_days от created_ts)."""
+    out: dict[str, list[dict]] = {k: [] for k in detectors}
+    for s in segs:
+        cl, qv = s["c"], s["qv"]
+        for t in range(200, len(cl) - 30):
+            f = features(cl, qv, t)
+            if not f:
+                continue
+            ep = None
+            for k, det in detectors.items():
+                if det(f, cl, t):
+                    ep = ep or _episode(s, t, ranks, hot)
+                    out[k].append(ep)
+    return out
 
 
 # ---------------------------------------------------------------- симуляция
@@ -339,6 +385,245 @@ def simulate(seg: dict, e: int, buy: dict, sell: dict, budget: float = 100.0,
             "how": how, "mae": mae, "small": small}
 
 
+# ---------------------------------------------------------------- модель исполнителя
+
+# Правила scanner/executor.py после блока C (46c1740), которыми он отличается от simulate.
+# Ключ -> что меняется. simulate_exec без правил (EXEC_OFF) повторяет simulate для лестницы
+# «до пола» (сверка — main, раздел 6); EXEC_ALL — исполнитель, насколько позволяют дневные
+# свечи Binance. Не моделируется (данных нет): вход по живой цене ~06:00 UTC (берём open
+# следующего дня — на 6 ч раньше), лимитки с 06:00 дня входа (дневной low с 00:00 — чуть
+# больше исполнений), настоящие tick/qty_step пар (синтетическая сетка, synth_rules).
+EXEC_RULES = [
+    ("base30", "лоу базы по 30 закрытиям, а не 31"),
+    ("anchor_open", "лестница от цены входа (open следующего дня), а не от закрытия сигнала; "
+                    "цена ≤ стопа — отказ, у пола — одна ступень (plan_ladder)"),
+    ("limit_strict", "лимитка покупки — low строго ниже цены, по цене лимитки"),
+    ("grid", "сетка биржи: лимитки вниз к tick, количество к qty_step, цель тейка вверх к tick"),
+    ("frac033", "доли тейков 0.33 (config stage8_exit.ladder), а не 1/3"),
+    ("same_day", "тейк продаёт и купленное в тот же день"),
+    ("latch", "защёлка трейла: взвод фактом закрытия ≥ +60% от средней, максимум — с взвода"),
+    ("sells", "продажи: вниз к qty_step, доля или остаток < минимума — весь остаток, остаток < "
+              "минимума — пыль не продаётся (оценка по закрытию), а не обмен с −5%"),
+    ("delist", "делистинг — продажа всего по последней цене без проверки минимума"),
+]
+EXEC_OFF = {k: False for k, _ in EXEC_RULES}
+EXEC_ALL = {k: True for k, _ in EXEC_RULES}
+PROD_LEVELS = [(0.5, 0.33), (1.5, 0.33)]       # config.json stage8_exit.ladder
+FLOOR_MARGIN = 1.05                             # scanner/ladder.FLOOR_MARGIN
+
+
+def synth_rules(px: float) -> tuple[float, float]:
+    """(tick, qty_step) для пары без истории правил: в архиве Binance шагов нет. Как у
+    типичной пары Bybit spot: цена — 4 значащие цифры (GRAM 1.5 → 0.001, LUNC 6e-5 → 1e-8),
+    шаг количества — не дороже цента."""
+    tick = float(f"1e{math.floor(math.log10(px)) - 3}")
+    step = float(f"1e{math.floor(math.log10(0.01 / px))}")
+    return tick, step
+
+
+def simulate_exec(seg: dict, e: int, sell: dict, *, budget: float = 50.0, steps: int = 5,
+                  stop_buf: float = INVAL_BUF, horizon: int | None = 365,
+                  rules: dict | None = None, valid: int = BUY_VALID,
+                  min_amt: float = MIN_ORDER) -> dict | None:
+    """Лестница «steps ступеней до пола» с выходами sell (R — levels+trail, H — levels=[]),
+    правила rules (ключи EXEC_RULES). horizon None — без горизонта, как прод: позиция,
+    открытая в конце данных, оценивается по последнему закрытию за вычетом комиссии выхода
+    (how «открыта»). None — исполнитель отказал бы (цена входа уже ниже стопа).
+    Сверх simulate: flows — исполнения для бенчмарка по денежным потокам (как
+    executor.fill_flows: день, Buy|Sell, $, доля монет), cash — движения свободного USDT
+    книги (резерв лестницы на входе, возврат снятых лимиток, выручка)."""
+    r = {**EXEC_OFF, **(rules or {})}
+    if sell.get("paired"):
+        raise ValueError("simulate_exec: парные продажи исполнитель не делает")
+    o, h, lo, c = seg["o"], seg["h"], seg["l"], seg["c"]
+    n = len(c)
+    end = n - 1 if horizon is None else min(e + horizon, n - 1)
+    base_low = min(c[max(0, e - (29 if r["base30"] else 30)):e + 1])
+    floor = base_low * (1 - INVAL_BUF)
+    stop_px = base_low * (1 - stop_buf)
+    p0 = o[e + 1] if r["anchor_open"] else c[e]
+    tick, qstep = synth_rules(p0) if r["grid"] else (0.0, 0.0)
+    nr = steps
+    bottom = floor * FLOOR_MARGIN
+    if r["anchor_open"]:
+        if p0 <= stop_px:
+            return None
+        if p0 <= bottom * 1.02:
+            nr = 1
+    per = budget / nr
+    orders: list[dict] = [{"mkt": e + 1, "px": None, "usd": per}]
+    if nr > 1:
+        gap = (p0 - bottom) / (nr - 1)
+        for k in range(1, nr):
+            px = p0 - k * gap
+            if r["grid"]:
+                px = round_step(px, tick)
+                q = round_step(per / px, qstep)
+                if q * px < min_amt:
+                    q = round_step(min_amt / px, qstep, up=True)
+                orders.append({"mkt": None, "px": px, "usd": q * px})
+            else:
+                orders.append({"mkt": None, "px": px, "usd": per})
+    levels = sell.get("levels") or []
+    if r["frac033"] and levels:
+        levels = PROD_LEVELS
+    trail = sell.get("trail")
+
+    held = bought_qty = cost = spent = proceeds = 0.0
+    li = 0
+    buys_open = True
+    cancel_day = None
+    hwm = 0.0
+    armed = None
+    below = 0
+    n_buys = n_sells = small = 0
+    first_day = None
+    exit_day, how = end, "horizon"
+    mae = 0.0
+    flows: list[tuple[int, str, float, float]] = []
+    cash: list[tuple[int, float]] = [(e + 1, -sum(od["usd"] for od in orders))]
+
+    def buy_fill(od, px, fee, d):
+        nonlocal held, bought_qty, cost, spent, n_buys, first_day
+        q = od["usd"] / px * (1 - fee)
+        held += q
+        bought_qty += q
+        cost += od["usd"]
+        spent += od["usd"]
+        n_buys += 1
+        od["done"] = True
+        first_day = d if first_day is None else first_day
+        flows.append((d, "Buy", od["usd"], 0.0))
+
+    def sell_out(q, px, fee, d):
+        nonlocal held, proceeds, n_sells
+        frac = min(q / held, 1.0) if held > 0 else 1.0
+        got = q * px * (1 - fee)
+        proceeds += got
+        held -= q
+        n_sells += 1
+        flows.append((d, "Sell", got, frac))
+        cash.append((d, got))
+
+    def sell_qty(q, px, fee, d) -> str:
+        """'' — продано, 'dust' — пыль, не продать (правило sells: остаётся в позиции)."""
+        nonlocal held, proceeds, small
+        if r["sells"]:
+            hr = round_step(held, qstep) if qstep else held
+            q = min(q, hr)
+            q = round_step(q, qstep) if qstep else q
+            if q * px < min_amt or (hr - q) * px < min_amt:
+                small += 1 if q < hr else 0
+                q = hr
+            if not (q > 0 and q * px >= min_amt):
+                return "dust"
+            sell_out(q, px, fee, d)
+            return ""
+        q = min(q, held)
+        if q <= 0:
+            return ""
+        if q * px < MIN_ORDER:
+            small += 1
+            q = held
+            if q * px < MIN_ORDER:              # пыль: конвертация остатков с потерей ~5%
+                got = q * px * 0.95
+                proceeds += got
+                flows.append((d, "Sell", got, 1.0))
+                cash.append((d, got))
+                held = 0.0
+                return ""
+        sell_out(q, px, fee, d)
+        return ""
+
+    def sold_out() -> bool:
+        return held < max(qstep, 1e-12) if r["sells"] else held <= 1e-12
+
+    for d in range(e + 1, end + 1):
+        held_start = held
+        if buys_open:
+            for od in orders:
+                if od.get("done"):
+                    continue
+                if od["mkt"] is not None:
+                    if od["mkt"] == d:
+                        buy_fill(od, o[d], TAKER, d)
+                elif d <= e + valid and (lo[d] < od["px"] if r["limit_strict"]
+                                         else lo[d] <= od["px"]):
+                    buy_fill(od, od["px"] if r["limit_strict"] else min(od["px"], o[d]),
+                             MAKER, d)
+            if d > e + valid and all(od.get("done") or od["mkt"] is None for od in orders):
+                buys_open = False
+                cancel_day = d
+        avail = held if r["same_day"] else held_start
+        if avail > 0 and li < len(levels):
+            avg = cost / bought_qty if bought_qty > 0 else p0
+            sellable = avail
+            while li < len(levels) and sellable > 0:
+                target = avg * (1 + levels[li][0])
+                if r["grid"]:
+                    target = round_step(target, tick, up=True)
+                if h[d] < target:
+                    break
+                q = min(levels[li][1] * bought_qty, sellable)
+                before = held
+                sell_qty(q, max(target, o[d]), MAKER, d)
+                sellable -= before - held
+                li += 1
+                if buys_open:
+                    buys_open = False
+                    cancel_day = d
+        if bought_qty > 0:
+            hwm = max(hwm, c[d])
+            if r["latch"] and armed is None and c[d] / (cost / bought_qty) - 1 >= \
+                    (trail[0] if trail else 9e9):
+                armed, hwm = d, c[d]
+            mtm = (proceeds + held * c[d]) / spent - 1 if spent > 0 else 0.0
+            mae = min(mae, mtm)
+        if stop_px is not None and held > 0:
+            below = below + 1 if c[d] < stop_px else 0
+            if below >= INVAL_CONFIRM:
+                sell_qty(held, c[d], TAKER, d)
+                exit_day, how = d, "стоп"
+                break
+        if trail and held > 0 and bought_qty > 0:
+            if r["latch"]:
+                fire = armed is not None and c[d] <= hwm * (1 - trail[1])
+            else:
+                avg = cost / bought_qty
+                fire = hwm >= avg * (1 + trail[0]) and c[d] <= hwm * (1 - trail[1])
+            if fire:
+                sell_qty(held, c[d], TAKER, d)
+                exit_day, how = d, "трейл"
+                break
+        if bought_qty > 0 and sold_out():
+            exit_day, how = d, "продано"
+            break
+    else:
+        dead = end == n - 1 and not seg["alive"]
+        if held > 0:
+            if dead and r["delist"]:
+                sell_out(held, c[end], TAKER, end)
+            elif horizon is None and not dead:
+                pass                              # открыта: оценка по закрытию ниже
+            else:
+                sell_qty(held, c[end], TAKER, end)
+        if horizon is None and not dead:
+            how = "открыта"
+        elif horizon is None or end < e + horizon:
+            how = ("конец данных" if seg["alive"] else
+                   "переименование" if seg["swap_end"] else "делистинг")
+    unfilled = sum(od["usd"] for od in orders if not od.get("done"))
+    if unfilled:
+        cash.append((min(cancel_day or exit_day, exit_day), unfilled))
+    mark = held * c[exit_day] * (1 - TAKER) if held > 0 else 0.0   # пыль или открытая
+    pnl = proceeds + mark - spent
+    return {"pnl": pnl, "rob": pnl / budget, "rod": pnl / spent if spent else 0.0,
+            "deployed": spent / budget, "n_buys": n_buys, "n_sells": n_sells,
+            "days": exit_day - (first_day or e), "span": exit_day - e, "budget": budget,
+            "how": how, "mae": mae, "small": small, "spent": spent, "exit_d": exit_day,
+            "flows": flows, "cash": cash, "mark": mark}
+
+
 # ---------------------------------------------------------------- отчёт
 
 def summarize(rows: list[dict]) -> dict:
@@ -413,6 +698,61 @@ def portfolio(rows: list[dict], k: int, n_iter: int = 4000, seed: int = 7) -> di
     return {"k": k, "med": res[m // 2], "p10": res[int(m * 0.1)], "p90": res[int(m * 0.9)],
             "p_loss": sum(1 for x in res if x < 0) / m,
             "p_loss20": sum(1 for x in res if x <= -0.20) / m}
+
+
+EXEC_BOOKS = {"R": SELL["прод +50/+150+трейл"], "H": {"levels": []}}
+
+
+def exec_section(eps: list[dict], t0: float, horizon: int = 365) -> dict:
+    """Книги исполнителя (5 × $10 до пола, стоп −25%) по эпизодам: сверка simulate_exec без
+    правил с simulate (копия обязана совпасть: P&L ± 1e-9, остальные поля — точно), затем
+    вклад каждого правила прода по отдельности и всех вместе."""
+    global HORIZON
+    keep, HORIZON = HORIZON, horizon              # simulate читает горизонт из модуля
+    floor5 = {"kind": "floor", "n": 5}
+    out: dict = {"horizon": horizon, "rules": dict(EXEC_RULES)}
+    print(f"\n=== 6. Как исполнитель после блока C: 5 × $10 до пола, стоп −25%, {horizon} дн. "
+          f"[{time.time()-t0:.0f} с] ===")
+    print(f"  {'книга / правило':58} {'n':>5} {'Σ P&L':>8} {'Δ к simulate':>12} {'сред.':>7} "
+          f"{'win':>5} {'p10':>6} {'p90':>6} {'стоп':>5}")
+    try:
+        for b, sell in EXEC_BOOKS.items():
+            ref = [simulate(ep["seg"], ep["e"], floor5, sell, budget=50.0) for ep in eps]
+            off = [simulate_exec(ep["seg"], ep["e"], sell, horizon=horizon) for ep in eps]
+            bad = sum(1 for a, m in zip(ref, off)
+                      if abs(a["pnl"] - m["pnl"]) > 1e-9 or any(
+                          a[k] != m[k] for k in ("n_buys", "n_sells", "days", "span", "how",
+                                                 "small", "deployed", "mae")))
+            assert bad == 0, f"{b}: simulate_exec без правил расходится с simulate в {bad} эп."
+            base = sum(r["pnl"] for r in ref)
+            blk = out.setdefault(b, {"check": f"{len(eps)}/{len(eps)}"})
+
+            def line(lab: str, rows: list[dict]) -> None:
+                rows = [r for r in rows if r]
+                p = sorted(r["pnl"] for r in rows)
+                n = len(p)
+                s = {"n": n, "pnl": sum(p), "delta": sum(p) - base, "mean": statistics.fmean(p) / 50,
+                     "win": sum(1 for x in p if x > 0) / n, "p10": p[int(n * 0.1)] / 50,
+                     "p90": p[int(n * 0.9)] / 50,
+                     "stop": sum(1 for r in rows if r["how"] == "стоп") / n}
+                blk[lab] = s
+                print(f"  {b} {lab:56} {n:>5} {s['pnl']:>+7.0f}$ {s['delta']:>+11.0f}$ "
+                      f"{s['mean'] * 100:>+6.1f}% {s['win'] * 100:>4.0f}% {s['p10'] * 100:>+5.0f}% "
+                      f"{s['p90'] * 100:>+5.0f}% {s['stop'] * 100:>4.0f}%")
+            print(f"  {b}: копия simulate_exec без правил = simulate в {len(eps)}/{len(eps)} эп.")
+            line("simulate (бэктест до блока C)", ref)
+            for k, _ in EXEC_RULES:
+                line(f"+ только {k}", [simulate_exec(ep["seg"], ep["e"], sell, horizon=horizon,
+                                                     rules={k: True}) for ep in eps])
+            line("все правила прода", [simulate_exec(ep["seg"], ep["e"], sell, horizon=horizon,
+                                                     rules=EXEC_ALL) for ep in eps])
+    finally:
+        HORIZON = keep
+    print("  (на бюджет $50; «Δ» — к simulate на тех же эпизодах; правила — EXEC_RULES; портфель"
+          " и бенчмарк по потокам — backtest/portfolio_vs_market.py)")
+    for k, v in EXEC_RULES:
+        print(f"    {k}: {v}")
+    return out
 
 
 def main() -> int:
@@ -551,6 +891,9 @@ def main() -> int:
         results["budget"][str(bud)] = s
         print(fmt(f"${bud}: {'4' if bud >= 40 else '3'} ступени по ${bud / (4 if bud >= 40 else 3):.0f} | прод", s)
               + f"  слитых мелких продаж: {s['small']}")
+
+    # ---- 6. как исполнитель (scanner/executor.py после блока C)
+    results["exec"] = exec_section(eps, t0)
 
     OUT.write_text(json.dumps(results, ensure_ascii=False, indent=1, default=float),
                    encoding="utf-8")
