@@ -1182,7 +1182,8 @@ def source_health_lines(s: dict | None, period: str) -> list[str]:
     clean = []
     for h in s.get("http") or []:
         if not (h["fail"] or h["codes"]):
-            clean.append(h)
+            if h["req"]:                        # только из кэша — в сеть не ходил
+                clean.append(h)
             continue
         line = (f"{_esc(h['source'])}: сбоев {h['fail']} из {h['req']} "
                 f"({_share(h['fail'], h['req'])})")

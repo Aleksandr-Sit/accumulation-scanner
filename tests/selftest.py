@@ -5347,6 +5347,10 @@ def test_source_health(cfg, failures: list[str]) -> None:
                and "CoinGecko (графики скана): закрытие дня не вышло к прогону у 2 из 6 (33%), "
                    "в 1 из 2 прогонов, макс. 2 дн. · нед.: 33% · —" in txt
                and "Bybit (" not in txt and tg.source_health_lines(None, "x") == []
+               and "без сбоев" not in " ".join(tg.source_health_lines(
+                   {"http": [{"source": "F&G", "req": 0, "ok": 0, "fail": 0, "cache": 3,
+                              "codes": {}, "wait_s": 0.0, "buckets": []}], "lag": [],
+                    "buckets": 0}, "x"))
                and "🩺 <b>Источники</b>" in tg.format_monthly(
                    {"month": "x", "books": [], "shadow": [], "activity": None, "errors": [],
                     "health": s})
@@ -5381,6 +5385,74 @@ def test_source_health(cfg, failures: list[str]) -> None:
             cn.close()
         _check("run.py: после шага счётчики в source_health (шаг execute); selftest не пишет",
                got == [("execute", "api.bybit.com", 3, 1, '{"503": 5}')], failures)
+
+
+def test_checklist(cfg, failures: list[str]) -> None:
+    print("Чек-лист решений (docs/DECISIONS.md, scanner/checklist.py):")
+    import tempfile
+    from datetime import datetime as _d
+    from pathlib import Path as _P
+    from scanner import checklist as ck
+    from scanner.notify import telegram as tg
+    doc = """# Решения
+
+| ID | Что | Сейчас | Когда | Как проверить |
+|----|-----|--------|-------|---------------|
+| L1 | Прогон <b>10.10</b> в `source_health` **важно** | не видели | 2026-10-10 | лог |
+| P1 | Порог `70` | 70 | после 20 закрытых | отчёт |
+| ✅ L2 | Сделано давно | — | 2026-09-01 | — |
+| ~~L3~~ | Зачёркнуто | — | 2026-09-02 | — |
+| Q1 | Квартальный перезамер | — | 2026-11-20, затем раз в квартал | скрипт |
+| Q2 | Через год | — | 2027-10-01 | — |
+
+| Порог | Значение |
+|-------|----------|
+| 2026-10-05 | без столбцов ID/Что/Когда — не читается |
+"""
+    items = ck.parse(doc)
+    by = {i["id"]: i for i in items}
+    _check("parse: строки таблицы с ID/Что/Когда, ✅ и ~~…~~ — закрыты, без даты — due None, "
+           "чужие таблицы пропущены",
+           sorted(by) == ["L1", "L2", "L3", "P1", "Q1", "Q2"]
+           and by["L2"]["done"] and by["L3"]["done"] and not by["L1"]["done"]
+           and by["P1"]["due"] is None
+           and by["Q1"]["due"] == _d(2026, 11, 20).timestamp(), failures)
+    now = _d(2026, 11, 1, 8).timestamp()
+    late, soon = ck.due_items(items, now)
+    _check("due_items: просрочено L1, в ближайший месяц Q1; закрытые, без даты и далёкие — нет",
+           [i["id"] for i in late] == ["L1"] and [i["id"] for i in soon] == ["Q1"], failures)
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _P(tmp) / "DECISIONS.md"
+        p.write_text(doc, encoding="utf-8")
+        lines = ck.reminder(now, p)
+        none = ck.reminder(_d(2026, 9, 1).timestamp(), _P(tmp) / "nope.md")
+        q = _P(tmp) / "q.md"
+        q.write_text("| ID | Что | Когда |\n|--|--|--|\n| A | x | 2027-01-01 |\n",
+                     encoding="utf-8")
+        quiet = ck.reminder(_d(2026, 9, 1).timestamp(), q)
+    txt = "\n".join(lines)
+    _check("reminder: просроченное и ближайшее с датой, HTML экранирован, без Markdown; "
+           "нет файла — ⚠; нечего напоминать — пусто",
+           "⏰ просрочено 10.10 · L1: Прогон &lt;b&gt;10.10&lt;/b&gt; в source_health важно" in txt
+           and "🗓 в этом месяце 20.11 · Q1" in txt and "P1" not in txt
+           and none and none[0].startswith("⚠") and quiet == [], failures)
+    _check("месячная сводка: блок чек-листа выводится",
+           "📋 <b>Чек-лист решений</b>" in tg.format_monthly(
+               {"month": "x", "books": [], "shadow": [], "activity": None, "errors": [],
+                "checklist": lines}), failures)
+    import copy
+    from scanner import monthly
+    from scanner.config import Config
+    with tempfile.TemporaryDirectory() as tmp:
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {**d.get("output", {}), "db_path": str(_P(tmp) / "none.db")}
+        st = monthly.collect(Config(d), _d(2026, 11, 1, 8).timestamp())
+    _check("monthly.collect: напоминание чек-листа из docs/DECISIONS.md на 01.11 есть",
+           (st["checklist"] or [""])[0].startswith("📋") and not st["errors"], failures)
+    real = ck.parse(ck.DOC.read_text(encoding="utf-8"))
+    _check("docs/DECISIONS.md: читается, есть открытые строки со сроком, ID уникальны",
+           any(not i["done"] and i["due"] for i in real)
+           and len({i["id"] for i in real}) == len(real), failures)
 
 
 def main() -> int:
@@ -5465,6 +5537,8 @@ def main() -> int:
     test_monthly(cfg, failures)
     print()
     test_source_health(cfg, failures)
+    print()
+    test_checklist(cfg, failures)
     print()
     data_tmp.cleanup()
     if failures:
