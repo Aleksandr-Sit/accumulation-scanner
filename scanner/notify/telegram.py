@@ -935,13 +935,14 @@ def _signal_text(stype: str, cfg) -> str:
         i = int(stype.split("_")[1])
         lad = cfg["stage8_exit"]["ladder"]
         return f"фикс {lad[i][1] * 100:.0f}%" if i < len(lad) else stype
-    return {"invalidation": "стоп", "trailing": "трейл"}.get(stype, stype)
+    return {"invalidation": "стоп", "trailing": "трейл", "delist": "делистинг"}.get(stype, stype)
 
 
 def executor_brief_lines(ex: dict | None, cfg) -> list[str]:
     """Блок сводки дня «🤖 Пробный исполнитель» (scanner/executor.brief_state): что поставил бы
     сегодня, что отсеяли фильтры (в тени) и почему, отказы, исполнения и продажи основной книги
-    за сутки, P&L книг и тени. Пусто — блока нет."""
+    за сутки, P&L книг и тени; «⚠ нет данных Bybit» — позиции, не тронутые из-за сбоя данных.
+    Пусто — блока нет."""
     if not ex:
         return []
     books = ex.get("books") or {}
@@ -951,6 +952,8 @@ def executor_brief_lines(ex: dict | None, cfg) -> list[str]:
     if not (active or ex.get("opened") or ex.get("rejected") or ex.get("shadowed")):
         return []
     out = ["🤖 <b>Пробный исполнитель</b> <i>(ордера не отправлялись)</i>"]
+    for pair, why in ex.get("nodata") or []:
+        out.append(f"⚠ нет данных Bybit: {_esc(pair)} ({_esc(why)}) — позиция ждёт данных")
     if ex.get("opened"):
         out.append("поставил бы лестницу: " + ", ".join(_esc(s) for s in ex["opened"]))
     if ex.get("shadowed"):

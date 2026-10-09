@@ -67,7 +67,24 @@ def fetch_daily_ohlcv(http: HttpClient, symbol: str, limit: int = 400) -> dict:
     data = http.get_json(f"{_BASE}/v5/market/kline",
                          params={"category": "spot", "symbol": symbol,
                                  "interval": "D", "limit": limit}, use_cache=False)
-    return parse_daily_ohlcv(data, int(time.time() * 1000))
+    out = parse_daily_ohlcv(data, int(time.time() * 1000))
+    err = api_error(data)
+    if err:                     # пусто из-за сбоя ≠ «свечей нет» (исполнитель не трогает позицию)
+        out["err"] = err
+    return out
+
+
+def api_error(data) -> str:
+    """Причина сбоя ответа публичного API: '' — ответ есть и retCode 0 (или его нет в ответе);
+    None — сеть/HTTP (get_json уже повторил запрос); retCode ≠ 0 — текст ошибки Bybit."""
+    if data is None:
+        return "нет ответа (сеть/HTTP)"
+    if not isinstance(data, dict):
+        return "ответ не JSON-объект"
+    rc = data.get("retCode", 0)
+    if rc not in (0, "0", None):
+        return f"retCode {rc}: {data.get('retMsg') or ''}".strip()
+    return ""
 
 
 def parse_daily_ohlcv(data, now_ms: int) -> dict:
@@ -79,16 +96,21 @@ def fetch_klines(http: HttpClient, symbol: str, interval: str, start_ms: int,
                  now_ms: int | None = None, max_pages: int = 20) -> dict:
     """Закрытые свечи спот-пары с start_ms до сейчас (oldest→newest): {ts (сек), o, h, l, c,
     v, qv}. interval — как в API ("60" — час). Запрос отдаёт не больше 1000 свечей, newest-
-    first, поэтому страницы идут назад по end, пока не дойдём до start_ms. Без кэша."""
+    first, поэтому страницы идут назад по end, пока не дойдём до start_ms. Без кэша.
+    Сбой любой страницы — ключ err (свечи до неё могут быть, но ряд неполный)."""
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     step = int(interval) * 60_000 if interval.isdigit() else _DAY_MS
     chunks: list[dict] = []
     end = now_ms
+    err = ""
     for _ in range(max_pages):
         data = http.get_json(f"{_BASE}/v5/market/kline",
                              params={"category": "spot", "symbol": symbol, "interval": interval,
                                      "start": int(start_ms), "end": int(end), "limit": 1000},
                              use_cache=False)
+        err = api_error(data)
+        if err:
+            break
         part = parse_klines(data, now_ms, step)
         if not part["ts"]:
             break
@@ -106,6 +128,8 @@ def fetch_klines(http: HttpClient, symbol: str, interval: str, start_ms: int,
             seen.add(t)
             for k in out:
                 out[k].append(part[k][i])
+    if err:
+        out["err"] = err
     return out
 
 
@@ -155,11 +179,19 @@ def same_coin(bybit_price: float | None, other_price: float | None,
     return abs(bybit_price / other_price - 1) <= tolerance
 
 
-def fetch_instrument(http: HttpClient, symbol: str) -> dict | None:
-    """Правила спот-пары: tickSize, basePrecision, minOrderQty/minOrderAmt, stTag, status."""
+def fetch_instrument(http: HttpClient, symbol: str, with_err: bool = False) -> dict | None:
+    """Правила спот-пары: tickSize, basePrecision, minOrderQty/minOrderAmt, stTag, status.
+    None — пары нет. with_err (исполнитель): сбой сети/API — {"err": причина}, а не None —
+    иначе сетевой сбой выглядел бы делистингом. Сверено 09.10.2026: нет пары — retCode 0 и пустой
+    list (kline на ту же пару — 10001 «Not supported symbols»; здесь тоже считаем «пары нет»)."""
     data = http.get_json(f"{_BASE}/v5/market/instruments-info",
                          params={"category": "spot", "symbol": symbol}, use_cache=False)
-    rows = (data or {}).get("result", {}).get("list", []) if isinstance(data, dict) else []
+    err = api_error(data)
+    if err:
+        if with_err and "not supported symbol" not in err.lower():
+            return {"err": err}
+        return None
+    rows = ((data.get("result") or {}).get("list") or [])
     if not rows:
         return None
     it = rows[0]

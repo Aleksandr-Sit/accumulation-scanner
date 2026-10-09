@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 
 from . import chart, telegram
+from ..executor import EXIT_NODATA
 from ..ladder import fmt_step, plan_ladder
 from ..sources import bybit, coingecko
 
@@ -338,7 +339,9 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
             # sync с Bybit: код шага из daily_run; ключа нет — шаг выходит с 0, пометки нет
             "sync_fail": bool(sync_exit),
             # пробный исполнитель: книги R/H и действия за сегодня (таблиц нет — None)
-            "executor": _executor_state(cfg, now), "exec_fail": bool(exec_exit)}
+            "executor": _executor_state(cfg, now),
+            # EXIT_NODATA — не падение: пары без данных Bybit в блоке исполнителя
+            "exec_fail": bool(exec_exit) and exec_exit != EXIT_NODATA}
 
 
 def _executor_state(cfg, now: float) -> dict | None:
