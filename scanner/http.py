@@ -13,14 +13,15 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import weakref
 from pathlib import Path
 from typing import Any
 
 _RETRY_CODES = (429, 500, 502, 503, 504)
 _WAIT_429_MIN = 60.0   # окно лимита free-тарифов — минута; backoff 2→16 с его не переживает
 _WAIT_429_MAX = 90.0
-CLIENTS: "weakref.WeakSet[HttpClient]" = weakref.WeakSet()   # все клиенты процесса (health)
+# Все клиенты процесса (scanner/health.py). Сильные ссылки: клиент шага — локальная переменная
+# cmd_*, к концу run.py main он уже собран бы сборщиком, и счётчики шага пропали бы.
+CLIENTS: list = []
 
 
 def retry_wait(code: int, retry_after: str | None, backoff: float) -> float:
@@ -52,7 +53,7 @@ class HttpClient:
         self._last_call: dict[str, float] = {}
         self.stats: dict[str, dict] = {}       # хост -> счётчики (_st)
         self.lags: dict[str, list[int]] = {}   # источник закрытий -> lag_days позиций
-        CLIENTS.add(self)
+        CLIENTS.append(self)
 
     def _st(self, host: str) -> dict:
         """Счётчики хоста: req — запросов в сеть (логических, с повторами — один), ok,

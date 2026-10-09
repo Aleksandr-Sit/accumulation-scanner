@@ -5360,18 +5360,25 @@ def test_source_health(cfg, failures: list[str]) -> None:
         real_load, real_clients, real_out = run_cli.load_config, hmod.CLIENTS, sys.stdout
         run_cli.load_config = lambda p=None: c
         try:
-            w = types.SimpleNamespace(stats={"api.bybit.com": {"req": 3, "ok": 2, "fail": 1,
-                                                               "cache": 0, "codes": {"503": 5},
-                                                               "wait_s": 30.0}}, lags={})
-            hmod.CLIENTS = [w]
+            hmod.CLIENTS = type(real_clients)()      # пустой контейнер того же типа
+
+            def step():                    # клиент шага — локальный, как в cmd_*
+                hx = hmod.HttpClient(str(_P(tmp) / "cache3"), 3600, 5, {})
+                hx.stats = {"api.bybit.com": {"req": 3, "ok": 2, "fail": 1, "cache": 0,
+                                              "codes": {"503": 5}, "wait_s": 30.0}}
+            step()
             sys.stdout = io.StringIO()
             run_cli._record_health(types.SimpleNamespace(cmd="selftest", config=None))
             run_cli._record_health(types.SimpleNamespace(cmd="execute", config=None))
         finally:
             run_cli.load_config, hmod.CLIENTS, sys.stdout = real_load, real_clients, real_out
         cn = sqlite3.connect(str(_P(tmp) / "hook.db"))
-        got = cn.execute("SELECT step, source, req, fail, codes FROM source_health").fetchall()
-        cn.close()
+        try:
+            got = cn.execute("SELECT step, source, req, fail, codes FROM source_health").fetchall()
+        except sqlite3.OperationalError:          # таблицы нет — шаг ничего не записал
+            got = None
+        finally:
+            cn.close()
         _check("run.py: после шага счётчики в source_health (шаг execute); selftest не пишет",
                got == [("execute", "api.bybit.com", 3, 1, '{"503": 5}')], failures)
 
