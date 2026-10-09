@@ -1326,6 +1326,13 @@ def test_market_regime(cfg, failures: list[str]) -> None:
     h = regime.hot_flags(f, cfg)
     _check("перегрев: 2 из 4 доступных = 0.5", h["score"] == 0.5 and h["n_lit"] == 2, failures)
     _check("мало доступных флагов -> score None", regime.hot_flags({"fng30": 80}, cfg)["score"] is None, failures)
+    # дно 2022: OI в монетах высокий (цена падает), остальное холодное — это не перегрев
+    bottom = {"alt_vs_sma200": -0.4, "altbtc_chg90": -0.1, "fng30": 25, "fund30": 0.002,
+              "mvrv_btc": 0.9, "mvrv_eth": 0.8, "breadth200": 10, "oi_rel365": 1.6}
+    hb = regime.hot_flags(bottom, cfg)
+    _check("OI BTC в монетах — не флаг перегрева: дно 2022 (OI ×1.6) — 0 из 7",
+           "oi_rel365" not in (cfg.get("market_regime.hot_flags", {}) or {})
+           and hb["n_lit"] == 0 and hb["avail"] == 7, failures)
     line = regime.context_line({**ctx, "btc_dd": 0.33})
     _check("строка контекста: альты, BTC, перегрев, F&G",
            "альты −40%" in line and "BTC −33%" in line and "перегрев 0/" in line

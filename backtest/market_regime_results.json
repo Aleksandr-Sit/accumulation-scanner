@@ -1,5 +1,5 @@
 {
- "generated": "2026-09-29",
+ "generated": "2026-10-09",
  "coins": 161,
  "springs": 1175,
  "entry": {
@@ -32,8 +32,8 @@
    "alt_no_hot": {
     "terciles": {
      "low": {
-      "n": 263,
-      "p365": 0.228,
+      "n": 265,
+      "p365": 0.23,
       "med_net": -0.327
      },
      "mid": {
@@ -42,14 +42,14 @@
       "med_net": 0.355
      },
      "high": {
-      "n": 216,
+      "n": 214,
       "p365": 0.5,
-      "med_net": 0.23
+      "med_net": 0.204
      }
     },
     "spread_high_minus_low_by_cycle": {
      "2020-22": 0.035,
-     "2023-25": 0.425
+     "2023-25": 0.433
     }
    },
    "mix_no_hot": {
@@ -78,24 +78,24 @@
    "alt_prod": {
     "terciles": {
      "low": {
-      "n": 270,
-      "p365": 0.248,
-      "med_net": -0.326
+      "n": 264,
+      "p365": 0.25,
+      "med_net": -0.327
      },
      "mid": {
-      "n": 263,
-      "p365": 0.449,
-      "med_net": 0.297
+      "n": 272,
+      "p365": 0.581,
+      "med_net": 0.346
      },
      "high": {
-      "n": 255,
-      "p365": 0.667,
-      "med_net": 0.383
+      "n": 252,
+      "p365": 0.52,
+      "med_net": 0.272
      }
     },
     "spread_high_minus_low_by_cycle": {
-     "2020-22": 0.151,
-     "2023-25": 0.441
+     "2020-22": 0.067,
+     "2023-25": 0.399
     }
    }
   },
@@ -104,159 +104,159 @@
     "hot_penalty": 1.0,
     "hot_warm_penalty": 1.0,
     "p_high": 0.5,
-    "p_low": 0.228,
-    "med_high": 0.23,
+    "p_low": 0.23,
+    "med_high": 0.204,
     "min_cycle_spread": 0.035,
     "spread": {
      "2020-22": 0.035,
-     "2023-25": 0.425
+     "2023-25": 0.433
     }
    },
    {
     "hot_penalty": 0.85,
     "hot_warm_penalty": 1.0,
-    "p_high": 0.53,
-    "p_low": 0.24,
-    "med_high": 0.303,
-    "min_cycle_spread": 0.085,
+    "p_high": 0.495,
+    "p_low": 0.236,
+    "med_high": 0.187,
+    "min_cycle_spread": 0.035,
     "spread": {
-     "2020-22": 0.085,
-     "2023-25": 0.416
+     "2020-22": 0.035,
+     "2023-25": 0.423
     }
    },
    {
     "hot_penalty": 0.85,
     "hot_warm_penalty": 0.9,
-    "p_high": 0.572,
-    "p_low": 0.232,
-    "med_high": 0.315,
-    "min_cycle_spread": 0.167,
+    "p_high": 0.511,
+    "p_low": 0.238,
+    "med_high": 0.251,
+    "min_cycle_spread": 0.049,
     "spread": {
-     "2020-22": 0.167,
+     "2020-22": 0.049,
      "2023-25": 0.426
     }
    },
    {
     "hot_penalty": 0.85,
     "hot_warm_penalty": 0.85,
-    "p_high": 0.585,
-    "p_low": 0.232,
-    "med_high": 0.314,
-    "min_cycle_spread": 0.143,
+    "p_high": 0.516,
+    "p_low": 0.236,
+    "med_high": 0.261,
+    "min_cycle_spread": 0.064,
     "spread": {
-     "2020-22": 0.143,
-     "2023-25": 0.432
+     "2020-22": 0.064,
+     "2023-25": 0.426
     }
    },
    {
     "hot_penalty": 0.75,
     "hot_warm_penalty": 1.0,
-    "p_high": 0.527,
+    "p_high": 0.495,
     "p_low": 0.242,
-    "med_high": 0.304,
-    "min_cycle_spread": 0.098,
+    "med_high": 0.187,
+    "min_cycle_spread": 0.035,
     "spread": {
-     "2020-22": 0.098,
+     "2020-22": 0.035,
+     "2023-25": 0.414
+    }
+   },
+   {
+    "hot_penalty": 0.75,
+    "hot_warm_penalty": 0.9,
+    "p_high": 0.511,
+    "p_low": 0.243,
+    "med_high": 0.251,
+    "min_cycle_spread": 0.041,
+    "spread": {
+     "2020-22": 0.041,
+     "2023-25": 0.414
+    }
+   },
+   {
+    "hot_penalty": 0.75,
+    "hot_warm_penalty": 0.85,
+    "p_high": 0.516,
+    "p_low": 0.244,
+    "med_high": 0.261,
+    "min_cycle_spread": 0.055,
+    "spread": {
+     "2020-22": 0.055,
+     "2023-25": 0.414
+    }
+   },
+   {
+    "hot_penalty": 0.75,
+    "hot_warm_penalty": 0.75,
+    "p_high": 0.52,
+    "p_low": 0.25,
+    "med_high": 0.272,
+    "min_cycle_spread": 0.067,
+    "spread": {
+     "2020-22": 0.067,
+     "2023-25": 0.399
+    }
+   },
+   {
+    "hot_penalty": 0.6,
+    "hot_warm_penalty": 1.0,
+    "p_high": 0.495,
+    "p_low": 0.247,
+    "med_high": 0.187,
+    "min_cycle_spread": 0.035,
+    "spread": {
+     "2020-22": 0.035,
+     "2023-25": 0.4
+    }
+   },
+   {
+    "hot_penalty": 0.6,
+    "hot_warm_penalty": 0.9,
+    "p_high": 0.511,
+    "p_low": 0.249,
+    "med_high": 0.251,
+    "min_cycle_spread": 0.041,
+    "spread": {
+     "2020-22": 0.041,
      "2023-25": 0.406
     }
    },
    {
-    "hot_penalty": 0.75,
-    "hot_warm_penalty": 0.9,
-    "p_high": 0.588,
+    "hot_penalty": 0.6,
+    "hot_warm_penalty": 0.85,
+    "p_high": 0.516,
     "p_low": 0.247,
-    "med_high": 0.323,
-    "min_cycle_spread": 0.191,
+    "med_high": 0.261,
+    "min_cycle_spread": 0.055,
     "spread": {
-     "2020-22": 0.191,
-     "2023-25": 0.417
-    }
-   },
-   {
-    "hot_penalty": 0.75,
-    "hot_warm_penalty": 0.85,
-    "p_high": 0.595,
-    "p_low": 0.24,
-    "med_high": 0.319,
-    "min_cycle_spread": 0.158,
-    "spread": {
-     "2020-22": 0.158,
-     "2023-25": 0.419
-    }
-   },
-   {
-    "hot_penalty": 0.75,
-    "hot_warm_penalty": 0.75,
-    "p_high": 0.667,
-    "p_low": 0.248,
-    "med_high": 0.383,
-    "min_cycle_spread": 0.151,
-    "spread": {
-     "2020-22": 0.151,
-     "2023-25": 0.441
-    }
-   },
-   {
-    "hot_penalty": 0.6,
-    "hot_warm_penalty": 1.0,
-    "p_high": 0.527,
-    "p_low": 0.231,
-    "med_high": 0.304,
-    "min_cycle_spread": 0.137,
-    "spread": {
-     "2020-22": 0.137,
-     "2023-25": 0.393
-    }
-   },
-   {
-    "hot_penalty": 0.6,
-    "hot_warm_penalty": 0.9,
-    "p_high": 0.588,
-    "p_low": 0.237,
-    "med_high": 0.323,
-    "min_cycle_spread": 0.207,
-    "spread": {
-     "2020-22": 0.207,
-     "2023-25": 0.409
-    }
-   },
-   {
-    "hot_penalty": 0.6,
-    "hot_warm_penalty": 0.85,
-    "p_high": 0.6,
-    "p_low": 0.24,
-    "med_high": 0.326,
-    "min_cycle_spread": 0.221,
-    "spread": {
-     "2020-22": 0.221,
-     "2023-25": 0.41
+     "2020-22": 0.055,
+     "2023-25": 0.406
     }
    },
    {
     "hot_penalty": 0.6,
     "hot_warm_penalty": 0.75,
-    "p_high": 0.682,
-    "p_low": 0.252,
-    "med_high": 0.4,
-    "min_cycle_spread": 0.188,
+    "p_high": 0.52,
+    "p_low": 0.254,
+    "med_high": 0.272,
+    "min_cycle_spread": 0.058,
     "spread": {
-     "2020-22": 0.188,
-     "2023-25": 0.435
+     "2020-22": 0.058,
+     "2023-25": 0.392
     }
    }
   ],
   "hot_cut_by_cycle": {
    "2020-22": {
-    "cold_p": 1.0,
-    "cold_n": 22,
-    "warm_p": 0.291,
-    "warm_n": 206
+    "cold_p": 0.408,
+    "cold_n": 142,
+    "warm_p": 0.279,
+    "warm_n": 86
    },
    "2023-25": {
-    "cold_p": 0.581,
-    "cold_n": 356,
-    "warm_p": 0.274,
-    "warm_n": 175
+    "cold_p": 0.569,
+    "cold_n": 383,
+    "warm_p": 0.25,
+    "warm_n": 148
    }
   }
  },
@@ -270,13 +270,13 @@
   },
   "B": {
    "n": 1175,
-   "mean": 0.203,
+   "mean": 0.204,
    "median": -0.043,
    "p25": -0.342,
    "win": 0.488
   },
-  "touched": 286,
-  "b_better": 214,
+  "touched": 284,
+  "b_better": 215,
   "by_cycle": {
    "2018-20": {
     "A": {
@@ -304,7 +304,7 @@
     },
     "B": {
      "n": 230,
-     "mean": 0.132,
+     "mean": 0.139,
      "median": -0.272,
      "p25": -0.362,
      "win": 0.422

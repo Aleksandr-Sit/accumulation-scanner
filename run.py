@@ -757,6 +757,10 @@ def cmd_market(args) -> int:
         vs = f"{v:.3f}" if isinstance(v, (int, float)) else "нет данных"
         print(f"  {mark} {regime.FLAG_LABELS.get(name, name):<18} {vs:>10}  "
               f"(порог {spec[0]} {spec[1]}, близко {spec[2] if len(spec) > 2 else '—'})")
+    oi = ctx.get("oi_rel365")
+    if "oi_rel365" not in flags and isinstance(oi, (int, float)):
+        print(f"     {'плечо (OI)':<18} {oi:>10.3f}  (справочно, не флаг: в монетах растёт при "
+              f"падении BTC — docs/OI_FLAG_REPORT.md)")
     return 0
 
 

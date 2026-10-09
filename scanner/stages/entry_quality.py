@@ -70,8 +70,8 @@ def spring_quality(candidate, cfg: Config) -> tuple[float, list[str]]:
         elif mdd <= 0.15:
             notes.append(f"⚠ BTC близко к ATH (−{mdd*100:.0f}%) — пружина = слабость к рынку (низкая P)")
 
-    # 1b) Перегрев рынка на входе (8 флагов): холодный рынок — P(+100) 59–77%,
-    #     хотя бы один флаг — 27–52%. «Тёплый» = горит, но ниже hot_threshold.
+    # 1b) Перегрев рынка на входе (7 флагов, без OI): холодный рынок — P(+100) 41–57%,
+    #     хотя бы один флаг — 25–28% (docs/OI_FLAG_REPORT.md). «Тёплый» = горит, но ниже hot_threshold.
     hs = getattr(candidate, "market_hot_score", None)
     if isinstance(hs, (int, float)) and hs > 0:
         lit = getattr(candidate, "market_hot_lit", None) or []

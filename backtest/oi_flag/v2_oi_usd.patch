@@ -1,0 +1,41 @@
+--- code_v0/scanner/regime.py	2026-10-08 13:47:28.000000000 +0400
++++ code_v2/scanner/regime.py	2026-10-09 11:20:50.357966800 +0400
+@@ -100,6 +100,29 @@
+                     put("alt_ex", d, alt)
+                     if btc_m > 0:
+                         put("altbtc", d, alt / btc_m)
++    # ЭКСПЕРИМЕНТ blockB V2: цена BTC для OI в USD. Bybit OI 1d — снимок на 00:00 UTC дня d,
++    # поэтому берём open дня d (= закрытие d−1) из кэша Binance BTCUSDT (только в копии).
++    try:
++        import json as _json
++        from pathlib import Path as _P
++        _root = _P(__file__).resolve().parent.parent / ".cache"
++        _px = None
++        for _f, _k in (("binance_1d_full/BTCUSDT.json", "o"), ("binance_1d/BTCUSDT.json", None)):
++            _fp = _root / _f
++            if _fp.exists():
++                _d = _json.loads(_fp.read_text())
++                if _k:
++                    _px = {int(t) // DAY * DAY: float(v) for t, v in zip(_d["ts"], _d[_k])}
++                else:   # только закрытия: open дня d ≈ close дня d−1
++                    _px = {int(t) // DAY * DAY + DAY: float(v) for t, v in zip(_d["ts"], _d["cl"])}
++                break
++        if _px:
++            S["btc_px"] = _px
++            for d, v in S.get("oi_btc", {}).items():
++                if d in _px:
++                    S.setdefault("oi_usd", {})[d] = v * _px[d]
++    except Exception as _e:   # noqa: BLE001
++        print(f"[V2] цена BTC недоступна: {_e}")
+     return S
+ 
+ 
+@@ -161,7 +184,7 @@
+         w = _window(S.get("funding_btc", {}), d, 30)
+         if len(w) >= 25:
+             f["fund30"] = sum(w) / len(w) * 100          # доля/8ч -> %/8ч
+-        oi = S.get("oi_btc", {})
++        oi = S.get("oi_usd", {})          # ЭКСПЕРИМЕНТ V2: OI в USD вместо монет
+         w = _window(oi, d, 365)
+         if oi.get(d) and len(w) >= 300:
+             f["oi_rel365"] = oi[d] / (sum(w) / len(w))
