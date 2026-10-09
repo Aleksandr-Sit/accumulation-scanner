@@ -4882,7 +4882,7 @@ def test_ops_guard(cfg, failures: list[str]) -> None:
             def report(resp, **kw):
                 tg._post = lambda *a, **k: resp
                 a = types.SimpleNamespace(config=str(cpath), notify=False, if_due=False,
-                                          milestone_weeks=4)
+                                          milestone_weeks=4, monthly=False)
                 for k, v in kw.items():
                     setattr(a, k, v)
                 sys.stdout = io.StringIO()           # текст сводки в лог не нужен
@@ -5001,6 +5001,225 @@ def test_ops_guard(cfg, failures: list[str]) -> None:
            writes == [], failures)
 
 
+def test_monthly(cfg, failures: list[str]) -> None:
+    print("Месячная сводка и бенчмарк по денежным потокам (scanner/monthly.py, benchmark.flow_pnl):")
+    import copy
+    import io
+    import sqlite3
+    import sys
+    import tempfile
+    import types
+    from datetime import datetime as _d
+    from pathlib import Path as _P
+    import run as run_cli
+    from scanner import benchmark as bm
+    from scanner import executor as ex
+    from scanner import monthly
+    from scanner.config import Config
+    from scanner.db import Store
+    from scanner.notify import telegram as tg
+    from scanner.positions import PositionStore
+    D, H, f = bm.DAY, 3600, bm.FEE
+    d0 = 1783987200                        # 2026-07-14 00:00 UTC
+
+    # (а) потоки: $10 по 100, $10 по 50, продажа половины по 80, остаток по 100
+    lv = {d0: 100.0, d0 + D: 50.0, d0 + 2 * D: 80.0, d0 + 3 * D: 100.0}
+    level = lambda ts: lv.get(bm.day_of(ts))  # noqa: E731
+    flows = [{"ts": d0 + H, "side": "Buy", "usd": 10.0, "frac": 0.0},
+             {"ts": d0 + D + H, "side": "Buy", "usd": 10.0, "frac": 0.0},
+             {"ts": d0 + 2 * D + H, "side": "Sell", "usd": 0.0, "frac": 0.5}]
+    u = 10 * (1 - f) / 100 + 10 * (1 - f) / 50
+    exp = u * 0.5 * 80 * (1 - f) + u * 0.5 * 100 * (1 - f) - 20
+    _check("потоки: та же сумма в те же дни, продажа той же долей, комиссия на вход и выход",
+           abs(bm.flow_pnl(flows, level, d0 + 3 * D) - exp) < 1e-9, failures)
+    sold_all = flows[:1] + [{"ts": d0 + D + H, "side": "Sell", "usd": 0.0, "frac": 1.0}]
+    _check("потоки: всё продано — уровень на конец окна не нужен; нет уровня на день потока — None",
+           abs(bm.flow_pnl(sold_all, level, d0 + 9 * D)
+               - (10 * (1 - f) / 100 * 50 * (1 - f) - 10)) < 1e-9
+           and bm.flow_pnl(flows, level, d0 + 9 * D) is None
+           and bm.flow_pnl([{**flows[0], "ts": d0 - D}], level, d0 + D) is None, failures)
+
+    # (б) ошибка executor 882: вся сумма в рынок с первого исполнения. Альты 400 → 600 после
+    # первой ступени, $10 до роста и $40 после: по потокам рынок дал ~+9.7%, а не +50%.
+    mkt = bm.market_points([{"day": d0 + i * D, "total_mcap": t, "btc_dominance": 50,
+                             "stables_usd": 100} for i, t in ((0, 1000), (1, 1400), (2, 1400))])
+    lad = [{"ts": d0 + H, "side": "Buy", "usd": 10.0, "frac": 0.0},
+           {"ts": d0 + D + H, "side": "Buy", "usd": 40.0, "frac": 0.0}]
+    o = {"id": 1, "symbol": "AAA", "start": d0 + H, "end": d0 + 2 * D, "cost": 50.0, "pnl": 0.0}
+    old = bm.compare_outcomes([o], mkt)
+    new = bm.compare_outcomes([{**o, "flows": lad}], mkt)
+    exp_alt = (10 * (1 - f) / 400 * 600 * (1 - f) + 40 * (1 - f) ** 2 - 50) / 50 * 100
+    _check("лестница: без потоков альты +50% (всё с первой ступени), по потокам ~+9.7%, BTC так же",
+           abs(old["alt_pct"] - 50) < 1e-9 and abs(new["alt_pct"] - exp_alt) < 1e-9
+           and abs(new["btc_pct"] - (10 * (1 - f) / 500 * 700 * (1 - f) + 40 * (1 - f) ** 2 - 50)
+                   / 50 * 100) < 1e-9
+           and abs(new["alt_usd"] - exp_alt / 2) < 1e-9 and new["n"] == 1, failures)
+
+    # (в) корзина по потокам: монеты A 100→150→200, B 100→50→100; уровень 1 → 1 → 1.5
+    t0, t1, t2 = d0, d0 + D, d0 + 2 * D
+    uni = {"runs": [(t0, 1, 5), (t1, 2, 5), (t2, 3, 5)], "wl_runs": [(t0, 1, 5)],
+           "watch": {1: {"a": ("A", 100.0), "b": ("B", 100.0)}},
+           "caps": {"a": ([t0, t1, t2], [100.0, 150.0, 200.0]),
+                    "b": ([t0, t1, t2], [100.0, 50.0, 100.0])}}
+    _check("корзина: уровень на входе 1.0, затем 1.0 и 1.5",
+           bm.basket_level(uni, t0, t0) == 1.0 and bm.basket_level(uni, t0, t1) == 1.0
+           and bm.basket_level(uni, t0, t2) == 1.5, failures)
+    row = {"start": t0, "end": t2, "cost": 20.0,
+           "flows": [{"ts": t0, "side": "Buy", "usd": 10.0, "frac": 0.0},
+                     {"ts": t1, "side": "Buy", "usd": 10.0, "frac": 0.0}]}
+    bk = bm.basket_for(uni, [row])
+    _check("корзина по потокам: обе ступени ×1.5 с комиссиями; без потоков — окно целиком",
+           abs(bk["basket_pct"] - (20 * (1 - f) * 1.5 * (1 - f) - 20) / 20 * 100) < 1e-9
+           and abs(bk["basket_usd"] - (20 * (1 - f) * 1.5 * (1 - f) - 20)) < 1e-9
+           and abs(bm.basket_for(uni, [{k: v for k, v in row.items() if k != "flows"}])
+                   ["basket_pct"] - 50) < 1e-9, failures)
+
+    # (г) исполнения из БД, активность месяца, книги по потокам
+    with tempfile.TemporaryDirectory() as tmp:
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {**d.get("output", {}), "db_path": str(_P(tmp) / "t.db")}
+        d["api_keys"] = {**d.get("api_keys", {}), "telegram_token": "T", "telegram_chat_id": "1"}
+        c = Config(d)
+        db = d["output"]["db_path"]
+        st = Store(db)
+        st.upsert_market({d0 + k * D: {"total_mcap": 1000 + 200 * k, "btc_dominance": 50,
+                                       "stables_usd": 100} for k in range(0, 40)})
+        st.close()
+        con = ex.connect(db)
+
+        def pos(book, pair, status, created, shadow=0, **kw):
+            cols = {"book": book, "pair": pair, "symbol": pair[:-4], "card_day": bm.day_of(created),
+                    "status": status, "created_ts": created, "shadow": shadow, **kw}
+            cur = con.execute(f"INSERT INTO dry_positions({','.join(cols)}) VALUES "
+                              f"({','.join('?' * len(cols))})", list(cols.values()))
+            return cur.lastrowid
+
+        def order(pid, book, side, status, qty, usd, fee, ts, kind="Market"):
+            con.execute("INSERT INTO dry_orders(link_id, position_id, book, pair, side, kind, "
+                        "status, qty, usd, fee_usdt, created_ts, filled_ts) VALUES "
+                        "(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (f"x{pid}-{side}-{ts}-{status}", pid, book, "AAAUSDT", side, kind,
+                         status, qty, usd, fee, ts, ts if status == "filled" else None))
+        m0 = d0 + 20 * D                   # «месяц» = [m0, m0 + 10 дн.)
+        pr = pos("R", "AAAUSDT", "open", m0 + H, qty=20.0, bought_qty=29.965, spent_usdt=20.0,
+                 proceeds_usdt=11.0, last_price=1.2, last_day=m0 + 3 * D, first_fill_ts=m0 + H)
+        order(pr, "R", "Buy", "filled", 10.0, 10.0, 0.015, m0 + H)
+        order(pr, "R", "Buy", "cancelled", 10.0, 0.0, 0.0, m0 + 2 * H, kind="Limit")
+        order(pr, "R", "Buy", "filled", 20.0, 10.0, 0.01, m0 + D, kind="Limit")
+        order(pr, "R", "Sell", "filled", 9.965, 11.0, 0.0165, m0 + 2 * D)
+        order(pr, "R", "Sell", "dust", 0.5, 0.0, 0.0, m0 + 3 * D)
+        ph = pos("H", "AAAUSDT", "closed", m0 + H, qty=0.0, bought_qty=9.985, spent_usdt=10.0,
+                 proceeds_usdt=8.0, last_price=0.8, last_day=m0 + 2 * D, first_fill_ts=m0 + H,
+                 closed_ts=m0 + 2 * D + H)
+        order(ph, "H", "Buy", "filled", 10.0, 10.0, 0.015, m0 + H)
+        order(ph, "H", "Sell", "filled", 9.985, 8.0, 0.012, m0 + 2 * D + H)
+        pos("R", "BBBUSDT", "open", m0 + 4 * D, shadow=1, shadow_why="bottom")
+        pos("R", "CCCUSDT", "rejected", m0 + 5 * D, reason="нет на Bybit spot")
+        pos("H", "CCCUSDT", "rejected", m0 + 5 * D, reason="нет на Bybit spot")
+        pos("R", "OLDUSDT", "closed", d0 + H, spent_usdt=10.0, first_fill_ts=d0 + H,
+            closed_ts=d0 + 2 * D)                   # до месяца: в активность не входит
+        con.commit()
+        fl = ex.fill_flows(con, pr)
+        con.close()
+        held = 10 * (1 - 0.0015) + 20 * (1 - 0.001)
+        _check("fill_flows: 2 покупки и продажа; доля = qty / монет на счёте (за вычетом "
+               "комиссии в монете); отменённая и пыль не в счёт",
+               [x["side"] for x in fl] == ["Buy", "Buy", "Sell"]
+               and [x["usd"] for x in fl[:2]] == [10.0, 10.0]
+               and abs(fl[2]["frac"] - 9.965 / held) < 1e-12, failures)
+        act = ex.period_activity(c, m0, m0 + 10 * D)
+        _check("активность месяца: R новых 1 (тень отдельно), H закрыто 1, продаж R 1 / H 1, "
+               "отказов 1 пара, старт — первое исполнение",
+               act["books"]["R"] == {"opened": 1, "shadow_opened": 1, "closed": 0, "sells": 1}
+               and act["books"]["H"] == {"opened": 1, "shadow_opened": 0, "closed": 1, "sells": 1}
+               and act["rejected"] == 1 and act["first_ts"] == d0 + H, failures)
+        wb = {b["key"]: b for b in ex.weekly_books(c)}
+        rr = next(r for r in wb["R"]["rows"] if r["id"] == pr)
+        exp_r = bm.flow_pnl(rr["flows"], bm._level(bm.load_market(db), 1), rr["end"])
+        _check("недельный/месячный блок: книга R против альтов по потокам её исполнений",
+               len(rr["flows"]) == 3 and abs(rr["alt_usd"] - exp_r) < 1e-9, failures)
+
+        # (д) когда слать: 1-го числа или позже, если в этом месяце ещё не было
+        ts = lambda *a: _d(*a).timestamp()  # noqa: E731
+        _check("месячная: первая — только в первые дни месяца; потом — раз в месяц, догоняет",
+               monthly.due(None, ts(2026, 11, 1, 8)) and monthly.due(None, ts(2026, 11, 3, 8))
+               and not monthly.due(None, ts(2026, 10, 10, 8))
+               and monthly.due(ts(2026, 10, 1, 8), ts(2026, 11, 20, 8))
+               and not monthly.due(ts(2026, 11, 1, 8, 5), ts(2026, 11, 20, 8)), failures)
+        p0, p1, lab = monthly.prev_month(ts(2026, 1, 5, 8))
+        _check("месяц сводки — прошлый: январь → «декабрь 2025»",
+               lab == "декабрь 2025" and p0 == ts(2025, 12, 1) and p1 == ts(2026, 1, 1), failures)
+
+        # (е) текст
+        empty = tg.format_monthly({"month": "сентябрь 2026", "books": [], "shadow": [],
+                                   "activity": None, "errors": ["books: KeyError: 'x'"]})
+        full = tg.format_monthly({"month": "октябрь 2026", "books": list(wb.values()),
+                                  "shadow": ex.weekly_shadow(c), "activity": act, "errors": []})
+        _check("текст: нет позиций — так и пишем, сбой блока — строкой ⚠",
+               "Месячная сводка</b> · сентябрь 2026" in empty
+               and "позиций ещё не было" in empty and "⚠ блок не посчитан: books" in empty,
+               failures)
+        _check("текст: R/H с $ против альтов, BTC и п.п.; активность месяца; пометка о потоках",
+               "📏 правила:" in full and "BTC" in full and "п.п. к альтам" in full
+               and "$" in full and "правила — новых 1, закрыто 0, продаж 1" in full
+               and "в тень 1" in full and "отказано парам: 1" in full
+               and "те же дни" in full and len(full) < 4096, failures)
+
+        # (ж) доставка: флаг monthly_report — только после отправки; --if-due — раз в месяц
+        real_load, real_out = run_cli.load_config, sys.stdout
+        run_cli.load_config = lambda p=None: c
+
+        def report(resp, **kw):
+            tg._post = lambda *a, **k: resp
+            a = types.SimpleNamespace(config=None, notify=True, if_due=False, monthly=True,
+                                      milestone_weeks=4)
+            for k, v in kw.items():
+                setattr(a, k, v)
+            sys.stdout = io.StringIO()
+            try:
+                rc = run_cli.cmd_report(a)
+            finally:
+                sys.stdout = real_out
+            p = PositionStore(db)
+            try:
+                return rc, p.last_event_ts(0, "monthly_report")
+            finally:
+                p.close_db()
+        try:
+            r_fail = report({"ok": False, "error_code": 400, "description": "Bad Request"})
+            r_ok = report({"ok": True, "result": {"message_id": 1}})
+            r_view = report({"ok": True}, notify=False)
+            calls: list = []
+            tg._post = lambda *a, **k: calls.append(a) or {"ok": True}
+            sys.stdout, ps_ = io.StringIO(), PositionStore(db)
+            try:
+                rc_due = run_cli._report_monthly(
+                    types.SimpleNamespace(notify=True, if_due=True, monthly=False), c,
+                    ps_, time.time())
+            finally:
+                sys.stdout = real_out
+                ps_.close_db()
+            real_due = monthly.due
+            monthly.due = lambda *a, **k: True   # «1-е число»: ежедневный report шлёт и её
+            try:
+                r_daily = report({"ok": True, "result": {"message_id": 2}}, if_due=True,
+                                 monthly=False)
+            finally:
+                monthly.due = real_due
+        finally:
+            run_cli.load_config = real_load
+        cn = sqlite3.connect(db)
+        n_monthly = cn.execute("SELECT COUNT(*) FROM position_events WHERE position_id=0 AND "
+                               "type='monthly_report'").fetchone()[0]
+        cn.close()
+        _check("ежедневный report --if-due в день месячной шлёт и её (флаг обновился)",
+               r_daily[0] == 0 and n_monthly == 2, failures)
+        _check("месячная: сбой отправки — код 1 без флага; доставлено — флаг; просмотр — без "
+               "флага; --if-due после отправки в этом месяце — не шлёт",
+               r_fail == (1, None) and r_ok[0] == 0 and r_ok[1] is not None
+               and r_view == (0, r_ok[1]) and rc_due == 0 and calls == [], failures)
+
+
 def main() -> int:
     cfg = load_config()
     failures: list[str] = []
@@ -5079,6 +5298,8 @@ def main() -> int:
     test_github_levels(cfg, failures)
     print()
     test_ops_guard(cfg, failures)
+    print()
+    test_monthly(cfg, failures)
     print()
     data_tmp.cleanup()
     if failures:

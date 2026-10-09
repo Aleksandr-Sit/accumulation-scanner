@@ -26,6 +26,7 @@ from .stages.exit import position_pnl
 
 DAY = 86400
 STALE_DAYS = 2      # рынок отстал от конца окна больше — помечаем датой (как в сводке дня)
+FEE = 0.0015        # комиссия бенчмарка по потокам на вход и выход (market-ордер, ladder.MARKET_FEE)
 
 
 def day_of(ts: float) -> int:
@@ -96,18 +97,62 @@ def compare_book(positions: list[dict], last: dict[int, dict], mkt: dict) -> dic
     return res
 
 
+def flow_pnl(flows: list[dict], level, end: float, fee: float = FEE) -> float | None:
+    """P&L бенчмарка по денежным потокам книги, USD. flows — исполнения позиции по времени:
+    {ts, side: Buy|Sell, usd, frac}. Покупка на usd — та же сумма в бенчмарк по его уровню
+    level(ts) в тот же день, с комиссией fee; продажа доли frac монет книги — та же доля
+    единиц бенчмарка, с комиссией; остаток оценивается на end за вычетом комиссии выхода
+    (как остаток книги в pnl_usdt). None — уровня на дату какого-то потока нет."""
+    units = spent = back = 0.0
+    for f in flows:
+        lv = level(f["ts"])
+        if not lv:
+            return None
+        if f["side"] == "Buy":
+            units += f["usd"] * (1 - fee) / lv
+            spent += f["usd"]
+        else:
+            sold = units * min(max(f["frac"], 0.0), 1.0)
+            units -= sold
+            back += sold * lv * (1 - fee)
+    lv = level(end) if units > 0 else 1.0
+    if not lv:
+        return None
+    return back + units * lv * (1 - fee) - spent
+
+
+def _level(mkt: dict, k: int):
+    """Уровень рынка на дату: k = 1 — альты, 2 — BTC (market_at)."""
+    def lv(ts: float) -> float | None:
+        m = market_at(mkt, ts)
+        return m[k] if m else None
+    return lv
+
+
 def compare_outcomes(outcomes: list[dict], mkt: dict) -> dict[str, Any]:
     """То же, что compare_book, для готовых окон {id, symbol, start, end, cost, pnl} (книги
-    пробного исполнителя считают их сами: scanner/executor.outcomes)."""
+    пробного исполнителя считают их сами: scanner/executor.outcomes). Окно с потоками
+    flows (исполнения лестницы и продаж) сравнивается по денежным потокам (flow_pnl): рынок
+    покупается теми же суммами в те же дни и продаётся той же долей — иначе лестница, которая
+    вкладывает деньги постепенно, сравнивалась бы с рынком, купленным целиком в день первой
+    ступени. Без flows — вся стоимость в рынок на start и до end (paper-позиции)."""
     rows = []
     for o in outcomes:
         m0 = market_at(mkt, o["start"])
         m1 = market_at(mkt, o["end"])
         if not (m0 and m1):
             continue
+        if o.get("flows"):
+            alt = flow_pnl(o["flows"], _level(mkt, 1), o["end"])
+            btc = flow_pnl(o["flows"], _level(mkt, 2), o["end"])
+            if alt is None or btc is None:
+                continue
+            alt_pct, btc_pct = alt / o["cost"] * 100, btc / o["cost"] * 100
+        else:
+            alt_pct, btc_pct = (m1[1] / m0[1] - 1) * 100, (m1[2] / m0[2] - 1) * 100
         rows.append({**o, "book_pct": o["pnl"] / o["cost"] * 100,
-                     "alt_pct": (m1[1] / m0[1] - 1) * 100,
-                     "btc_pct": (m1[2] / m0[2] - 1) * 100,
+                     "alt_pct": alt_pct, "btc_pct": btc_pct,
+                     "alt_usd": o["cost"] * alt_pct / 100, "btc_usd": o["cost"] * btc_pct / 100,
                      "market_day": m1[0]})
     out: dict[str, Any] = {"positions": len(outcomes), "n": len(rows), "rows": rows}
     if not rows:
@@ -120,6 +165,7 @@ def compare_outcomes(outcomes: list[dict], mkt: dict) -> dict[str, Any]:
     latest = max(rows, key=lambda r: r["end"])
     lag = day_of(latest["end"]) - latest["market_day"]
     out.update(cost=cost, pnl=pnl, book_pct=book, alt_pct=alt, btc_pct=btc,
+               alt_usd=sum(r["alt_usd"] for r in rows), btc_usd=sum(r["btc_usd"] for r in rows),
                diff_pp=book - alt, last_end=latest["end"], market_day=latest["market_day"],
                stale=lag > STALE_DAYS * DAY)
     return out
@@ -275,17 +321,44 @@ def basket(uni: dict, start: float, end: float) -> dict | None:
     return out
 
 
+def basket_level(uni: dict, start: float, ts: float, final: bool = False) -> float | None:
+    """Уровень корзины прогона входа позиции (start) на дату ts, 1.0 — на входе. Прогонов
+    после входа к ts ещё не было — 1.0; final (конец окна) — нужна посчитанная доходность
+    (как basket_for без потоков), иначе None; в середине окна все монеты выпали — по всем
+    встреченным (ret_seen)."""
+    b = basket(uni, start, ts)
+    if not b:
+        return None
+    if b["ret"] is not None:
+        return 1 + b["ret"] / 100
+    if final:
+        return None
+    if b["ret_seen"] is not None:
+        return 1 + b["ret_seen"] / 100
+    return 1.0
+
+
 def basket_for(uni: dict | None, rows: list[dict]) -> dict[str, Any]:
     """Корзина, взвешенная стоимостью позиций книги, по строкам compare_outcomes (окна
-    start..end): {basket_pct, basket_n} — basket_n позиций, где корзина посчитана; нет — {}."""
+    start..end): {basket_pct, basket_n} — basket_n позиций, где корзина посчитана; нет — {}.
+    Строка с потоками flows — по денежным потокам (flow_pnl, уровень — basket_level)."""
     if not uni:
         return {}
-    got = [(r["cost"], b["ret"]) for r in rows
-           for b in [basket(uni, r["start"], r["end"])] if b and b["ret"] is not None]
+
+    def ret(r: dict) -> float | None:
+        if r.get("flows"):
+            def lv(ts: float) -> float | None:
+                return basket_level(uni, r["start"], ts, final=ts >= r["end"])
+            usd = flow_pnl(r["flows"], lv, r["end"])
+            return None if usd is None else usd / r["cost"] * 100
+        b = basket(uni, r["start"], r["end"])
+        return b["ret"] if b else None
+    got = [(r["cost"], x) for r in rows for x in [ret(r)] if x is not None]
     cost = sum(c for c, _ in got)
     if not cost:
         return {}
-    return {"basket_pct": sum(c * x for c, x in got) / cost, "basket_n": len(got)}
+    return {"basket_pct": sum(c * x for c, x in got) / cost, "basket_n": len(got),
+            "basket_usd": sum(c * x for c, x in got) / 100}
 
 
 def book_split(book: dict) -> tuple[list[dict], list[dict]]:

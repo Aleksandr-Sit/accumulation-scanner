@@ -1197,7 +1197,8 @@ def outcomes(con, book: str, shadow: bool = False,
              sh: str = "COALESCE(shadow, 0)") -> list[dict]:
     """Окна и итоги позиций книги для сравнения с рынком: start — первое исполнение, end —
     закрытие позиции или конец последнего обработанного дня; cost — потрачено; why — причины
-    тени (ключи WHY_LABEL)."""
+    тени (ключи WHY_LABEL); flows — исполнения (fill_flows) для бенчмарка по денежным
+    потокам."""
     out = []
     for p in _rows(con, f"SELECT * FROM dry_positions WHERE book=? AND status!='rejected' "
                         f"AND spent_usdt>0 AND {sh}=?", (book, int(shadow))):
@@ -1207,8 +1208,28 @@ def outcomes(con, book: str, shadow: bool = False,
             continue
         out.append({"id": p["id"], "symbol": p["symbol"], "coin_id": p["coin_id"],
                     "start": p["first_fill_ts"], "end": end, "cost": p["spent_usdt"],
-                    "pnl": pnl_usdt(p),
+                    "pnl": pnl_usdt(p), "flows": fill_flows(con, p["id"]),
                     "why": [k for k in (p.get("shadow_why") or "").split(",") if k]})
+    return out
+
+
+def fill_flows(con, pid: int) -> list[dict]:
+    """Исполнения позиции по времени для бенчмарка: {ts, side, usd, frac}. Покупка — usd
+    потрачено (комиссия в монете), продажа — доля монет на счёте перед ней (frac): монет
+    прибавляет qty × (1 − комиссия), как _fill_buy. Пыль и отменённые не исполнялись."""
+    held = 0.0
+    out = []
+    for o in _rows(con, "SELECT side, qty, usd, fee_usdt, filled_ts FROM dry_orders WHERE "
+                        "position_id=? AND status='filled' AND filled_ts IS NOT NULL "
+                        "ORDER BY filled_ts, created_ts, rowid", (pid,)):
+        qty, usd = o["qty"] or 0.0, o["usd"] or 0.0
+        if o["side"] == "Buy":
+            held += qty * (1 - ((o["fee_usdt"] or 0.0) / usd if usd else 0.0))
+            out.append({"ts": o["filled_ts"], "side": "Buy", "usd": usd, "frac": 0.0})
+        else:
+            frac = min(qty / held, 1.0) if held > 0 else 1.0
+            held = max(held - qty, 0.0)
+            out.append({"ts": o["filled_ts"], "side": "Sell", "usd": usd, "frac": frac})
     return out
 
 
@@ -1253,6 +1274,49 @@ def _weekly(cfg, shadow: bool) -> list[dict]:
         out.append({"key": b, "label": bk["label"], "emoji": bk.get("emoji", "•"), **res,
                     "pnl_usd": sum(r["pnl"] for r in rs), "by_why": by})
     return out
+
+
+def period_activity(cfg, t0: float, t1: float) -> dict | None:
+    """Что книги сделали за [t0, t1) (месячная сводка): по книге {opened, closed, sells,
+    shadow_opened}, отказы — общим числом пар (обе книги отказывают одинаково), first_ts —
+    первое исполнение за всё время. Таблиц нет — None."""
+    from .benchmark import connect_ro
+    con = connect_ro(cfg["output"]["db_path"])
+    if con is None:
+        return None
+    con.row_factory = sqlite3.Row
+    try:
+        names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "dry_positions" not in names:
+            return None
+        sh = _shadow_col(con)
+        psh = sh.replace("shadow", "p.shadow")
+        books = {}
+        for b in settings(cfg)["books"]:
+            def n(sql: str, args=()) -> int:
+                return con.execute(sql, (b, *args)).fetchone()[0]
+            books[b] = {
+                "opened": n(f"SELECT COUNT(*) FROM dry_positions WHERE book=? AND "
+                            f"status!='rejected' AND {sh}=0 AND created_ts>=? AND created_ts<?",
+                            (t0, t1)),
+                "shadow_opened": n(f"SELECT COUNT(*) FROM dry_positions WHERE book=? AND "
+                                   f"status!='rejected' AND {sh}=1 AND created_ts>=? AND "
+                                   f"created_ts<?", (t0, t1)),
+                "closed": n(f"SELECT COUNT(*) FROM dry_positions WHERE book=? AND "
+                            f"status='closed' AND {sh}=0 AND closed_ts>=? AND closed_ts<?",
+                            (t0, t1)),
+                "sells": n(f"SELECT COUNT(*) FROM dry_orders o JOIN dry_positions p ON "
+                           f"p.id=o.position_id WHERE o.book=? AND o.side='Sell' AND "
+                           f"o.status='filled' AND {psh}=0 AND o.filled_ts>=? AND "
+                           f"o.filled_ts<?", (t0, t1))}
+        rejected = con.execute("SELECT COUNT(DISTINCT pair) FROM dry_positions WHERE "
+                               "status='rejected' AND created_ts>=? AND created_ts<?",
+                               (t0, t1)).fetchone()[0]
+        first = con.execute(f"SELECT MIN(first_fill_ts) FROM dry_positions WHERE "
+                            f"status!='rejected' AND {sh}=0").fetchone()[0]
+    finally:
+        con.close()
+    return {"books": books, "rejected": rejected, "first_ts": first}
 
 
 def weekly_books(cfg) -> list[dict]:

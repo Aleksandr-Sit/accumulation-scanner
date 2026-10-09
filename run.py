@@ -590,22 +590,63 @@ def cmd_card(args) -> int:
 
 
 def cmd_report(args) -> int:
-    """Недельная сводка форвард-теста. Без сети — из снапшотов/журнала."""
+    """Недельная сводка форвард-теста и месячная (1-го числа; --monthly — только она, сразу).
+    Без сети — из снапшотов/журнала. Код 1 — какая-то из сводок не доставлена."""
     import time as _t
     cfg = load_config(args.config)
     from scanner.positions import PositionStore
     from scanner.notify import telegram
     pstore = PositionStore(cfg["output"]["db_path"])
-
     now = _t.time()
-    if args.if_due:
+    try:
+        if args.monthly:
+            return _report_monthly(args, cfg, pstore, now)
+        rc = 0
         # Ежедневный прогон зовёт report каждый день, сводка уходит раз в неделю.
-        last = pstore.last_event_ts(0, "weekly_report")
-        if not telegram.weekly_due(last, now, cfg.get("stage6_telegram.weekly_report_weekday", 0)):
+        last = pstore.last_event_ts(0, "weekly_report") if args.if_due else None
+        if args.if_due and not telegram.weekly_due(
+                last, now, cfg.get("stage6_telegram.weekly_report_weekday", 0)):
             print(f"[report] сводка этой недели уже была "
                   f"({_t.strftime('%d.%m %H:%M', _t.localtime(last))}) — пропуск")
-            pstore.close_db()
+        else:
+            rc = _report_weekly(args, cfg, pstore, now)
+        if args.if_due:
+            rc = max(rc, _report_monthly(args, cfg, pstore, now))
+        return rc
+    finally:
+        pstore.close_db()
+
+
+def _report_monthly(args, cfg, pstore, now: float) -> int:
+    """Месячная сводка (scanner/monthly.py): с --if-due — только если пора (monthly.due),
+    флаг monthly_report — только после доставки, как у недельной."""
+    import time as _t
+    from scanner import monthly
+    from scanner.notify import telegram
+    if args.if_due and not args.monthly:
+        last = pstore.last_event_ts(0, "monthly_report")
+        if not monthly.due(last, now):
+            when = _t.strftime('%d.%m', _t.localtime(last)) if last else "—"
+            print(f"[report] месячная сводка не нужна (последняя {when})")
             return 0
+    stats = monthly.collect(cfg, now)
+    for e in stats["errors"]:
+        print(f"[report] месячная: блок не посчитан — {e}")
+    text = telegram.format_monthly(stats, cfg)
+    print(text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
+    if not args.notify:
+        return 0
+    ok = telegram.send_message(cfg.get("api_keys.telegram_token", ""),
+                               cfg.get("api_keys.telegram_chat_id", ""), text, silent=True)
+    print(f"[telegram] месячная сводка: {'ok' if ok else 'fail'}")
+    if ok:
+        pstore.set_system_flag("monthly_report", f"month={stats['month']}")
+    return 0 if ok else 1
+
+
+def _report_weekly(args, cfg, pstore, now: float) -> int:
+    """Недельная сводка: блоки paper, A/B, против рынка, пробный исполнитель."""
+    from scanner.notify import telegram
     week_ago = now - 7 * 86400
     # Близнецы B/S (A/B выхода и стопа) не входят в основные счётчики — только в блоки
     # сравнения.
@@ -723,7 +764,6 @@ def cmd_report(args) -> int:
         if milestone:
             pstore.set_system_flag("milestone_4w", f"week={week_no}")
         pstore.set_system_flag("weekly_report", f"week={week_no}")
-    pstore.close_db()
     return 1 if args.notify and not delivered else 0
 
 
@@ -1031,7 +1071,10 @@ def main() -> int:
                     help="на какой неделе выдать итоговую сводку (одноразово)")
     pr.add_argument("--if-due", action="store_true",
                     help="только если сводки этой недели ещё не было "
-                         "(stage6_telegram.weekly_report_weekday) — для ежедневного прогона")
+                         "(stage6_telegram.weekly_report_weekday) — для ежедневного прогона; "
+                         "плюс месячная, если в этом месяце её ещё не было")
+    pr.add_argument("--monthly", action="store_true",
+                    help="только месячная сводка (за прошлый месяц), сразу")
     pr.add_argument("--config", default=None)
     pr.set_defaults(func=cmd_report)
 
@@ -1156,7 +1199,6 @@ def main() -> int:
     # лог прогона — stdout в logs/: полный диск не должен ронять шаг посреди работы
     sys.stdout, sys.stderr = _SafeStream(sys.stdout), _SafeStream(sys.stderr)
     return args.func(args)
-
 
 if __name__ == "__main__":
     sys.exit(main())

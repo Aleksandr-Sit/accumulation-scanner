@@ -982,6 +982,11 @@ _WHY_SHORT = {"bottom": "нижняя четверть", "quota": "квота н
               "nodata": "нет данных рынка"}
 
 
+FLOW_NOTE = ("Альты, BTC и корзина куплены теми же суммами в те же дни, что исполнения книги, "
+             "и проданы той же долей, комиссия 0.15%. Корзина — все монеты watchlist прогона "
+             "входа поровну (по капе).")
+
+
 def _exec_book_line(b: dict) -> str:
     """Строка книги исполнителя: P&L против альтов (и корзины) на тех же окнах, позиции, $."""
     head = f"{b.get('emoji', '•')} {_esc(b.get('label', ''))}:"
@@ -1016,8 +1021,7 @@ def executor_weekly_block(books: list[dict], shadow: list[dict] | None = None) -
                     f"{_WHY_SHORT.get(k, _esc(k))} {d['n']} поз. "
                     + (_signed(d['pnl'] / d['cost'] * 100) if d.get("cost") else "—")
                     for k, d in by))
-    out.append("<i>Обе книги входят одинаково, разница — только выходы. Корзина — все монеты "
-               "watchlist того же прогона поровну (по капе, без комиссий).</i>")
+    out.append("<i>Обе книги входят одинаково, разница — только выходы. " + FLOW_NOTE + "</i>")
     if shadow:
         both = any(sum(d["n"] for d in (b.get("by_why") or {}).values()) > b["positions"]
                    for b in shadow)
@@ -1144,6 +1148,62 @@ def format_weekly(stats: dict, cfg) -> str:
         if left:
             remind += f" До итоговой сводки: {left} нед."
         lines.append(f"<i>{remind} Это форвард-тест стратегии на живом рынке.</i>")
+    return "\n".join(lines)
+
+
+def _month_book_line(b: dict) -> str:
+    """Строка книги месячной сводки: P&L с начала (% и $) против альтов, BTC и корзины."""
+    head = f"{b.get('emoji', '•')} {_esc(b.get('label', ''))}:"
+    usd = fmt_usd(b["pnl_usd"]) if isinstance(b.get("pnl_usd"), (int, float)) else ""
+    if not b.get("n"):
+        return f"{head} нет рынка на даты позиций ({b['positions']} поз.{', ' + usd if usd else ''})"
+    shown = [float(f"{b[k]:.1f}") for k in ("book_pct", "alt_pct")]
+    pp = f"{shown[0] - shown[1]:+.1f}".replace("-", "−")
+    bask = (f" · корзина {_signed(b['basket_pct'])}" if b.get("basket_pct") is not None
+            else "")
+    cnt = f"{b['n']} поз." if b["n"] == b["positions"] else f"{b['n']} из {b['positions']} поз."
+    return (f"{head} {_signed(b['book_pct'])}{' (' + usd + ')' if usd else ''} · альты "
+            f"{_signed(b['alt_pct'])} · BTC {_signed(b['btc_pct'])}{bask} → {pp} п.п. к альтам "
+            f"({cnt})")
+
+
+def format_monthly(stats: dict, cfg=None) -> str:
+    """Месячная сводка (scanner/monthly.collect): книги исполнителя с начала против рынка по
+    денежным потокам, тень, что сделано за месяц. Позиций нет — так и пишем: сводка
+    уходит всё равно (признак жизни раз в месяц)."""
+    lines = [f"<b>📅 Месячная сводка</b> · {_esc(stats.get('month', ''))}", ""]
+    books = [b for b in stats.get("books") or [] if b.get("positions")]
+    shadow = [b for b in stats.get("shadow") or [] if b.get("positions")]
+    act = stats.get("activity") or {}
+    first = act.get("first_ts")
+    since = f" с {datetime.fromtimestamp(first).strftime('%d.%m.%Y')}" if first else ""
+    if books or shadow:
+        lines.append(f"🤖 <b>Пробный исполнитель</b>{since}, итог с начала (5×$10 на монету, "
+                     f"ордера не отправлялись):")
+        lines += [_month_book_line(b) for b in books]
+        if shadow:
+            lines.append("👥 <b>Тень</b> — отсеяно фильтрами:")
+            lines += [_month_book_line(b) for b in shadow]
+    else:
+        lines.append("🤖 Пробный исполнитель: позиций ещё не было.")
+    acts = act.get("books") or {}
+    if acts:
+        names = {b.get("key"): b.get("label") for b in stats.get("books") or []}
+        parts = [f"{_esc(names.get(k) or k)} — новых {a['opened']}, закрыто {a['closed']}, "
+                 f"продаж {a['sells']}" for k, a in acts.items()]
+        shd = max((a.get("shadow_opened", 0) for a in acts.values()), default=0)
+        tail = (f" · в тень {shd}" if shd else "") + (
+            f" · отказано парам: {act['rejected']}" if act.get("rejected") else "")
+        lines.append(f"За месяц: {' · '.join(parts)}{tail}")
+    for e in stats.get("errors") or []:
+        lines.append(f"⚠ блок не посчитан: {_esc(e)[:200]}")
+    for block in ("sources", "checklist"):          # здоровье источников, чек-лист решений
+        extra = stats.get(block) or []
+        if extra:
+            lines.append("")
+            lines += extra
+    lines.append("")
+    lines.append(f"<i>{FLOW_NOTE} За месяц позиций единицы — это знак, а не оценка отбора.</i>")
     return "\n".join(lines)
 
 
