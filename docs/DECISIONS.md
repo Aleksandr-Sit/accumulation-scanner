@@ -23,8 +23,8 @@ G п.1–3 выкатаны; G п.4 (перезамер бэктеста под 
 
 | ID | Что | Сейчас | Когда | Как проверить |
 |----|-----|--------|-------|---------------|
-| L1 | Первый прогон исполнителя после блока C (46c1740) | не видели | 2026-10-10 | `logs/daily_2026-10-10_*.log`, `data/daily_run.state`: execute exit 0 или 4, нет Traceback и «исполнитель упал»; `select book,pair,status,reason,shadow,data_err,trail_armed_ts from dry_positions` — у GRAM (R/H) и LUNC (тень) нет ложного делистинга |
-| L2 | Таблица `source_health` пополняется каждым шагом | проба `market` на копии — 6 строк | 2026-10-10 | `select step,count(*) from source_health group by step` — есть scan, watch, execute (sync ходит в Bybit своим клиентом и не считается); в логе шагов «[health] источники: записано» |
+| ✅ L1 | Первый прогон исполнителя после блока C (46c1740) | проверено 10.10.2026 | 2026-10-10 | 10.10 (run 23, 06:00–06:20 UTC): все шаги exit 0, Traceback нет; execute exit 0; GRAM R/H open, last_day 09.10, data_err пусто; LUNC в тени open (bottom) — ложного делистинга нет; новая карточка BICO → лестница R/H 5 × $10, ступень 1 исполнена по 0.01966, лимитки 0.01842…0.01472, qty_step/tick из Bybit записаны |
+| ✅ L2 | Таблица `source_health` пополняется каждым шагом | проверено 10.10.2026 | 2026-10-10 | 10.10: source_health scan 13, watch 4, execute 1 строк; в логе «[health] источники: записано» у всех трёх шагов |
 | L3 | Недельная сводка: книги R/H по денежным потокам, тень, «🩺 Источники» | первая в новом виде | 2026-10-12 | сообщение в Telegram; флаг `weekly_report` в `position_events` (position_id 0) только после доставки |
 | L4 | Тонкая копия бэкапа в Telegram (блок D) | первая после D | 2026-10-12 | размер `.gz` в подписи, `/opt/backups/scanner/backups.json` |
 | L5 | Лимитки тени исполняются по часовым свечам | у основной книги 09.10 исполнились 2 | 2026-10-16 | `select * from dry_orders where link_id like 'shd-%' and status='filled'` |
