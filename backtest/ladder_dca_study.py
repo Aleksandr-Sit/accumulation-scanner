@@ -512,7 +512,10 @@ def simulate_exec(seg: dict, e: int, sell: dict, *, budget: float = 50.0, steps:
             hr = round_step(held, qstep) if qstep else held
             q = min(q, hr)
             q = round_step(q, qstep) if qstep else q
-            if q * px < min_amt or (hr - q) * px < min_amt:
+            up = round_step(min_amt / px, qstep, up=True) if qstep else min_amt / px
+            if r.get("sell_up") and q * px < min_amt and up < hr and (hr - up) * px >= min_amt:
+                q = up            # вариант А (min_order_study): доля дешевле минимума — до минимума
+            elif q * px < min_amt or (hr - q) * px < min_amt:
                 small += 1 if q < hr else 0
                 q = hr
             if not (q > 0 and q * px >= min_amt):
