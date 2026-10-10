@@ -4976,9 +4976,9 @@ def test_ops_guard(cfg, failures: list[str]) -> None:
         encoding="utf-8")
     steps = re.findall(r"^run_step (\w+) (\d+) ", sh, re.M)
     hours = re.search(r"^TimeoutStartSec=(\d+)h", unit, re.M)
-    _check("daily_run.sh: 8 шагов, у каждого таймаут; сумма (+60 с KILL) < TimeoutStartSec",
-           {n for n, _ in steps} == {"quality", "scan", "sync", "watch", "execute", "report",
-                                     "backup", "brief"}
+    _check("daily_run.sh: 9 шагов, у каждого таймаут; сумма (+60 с KILL) < TimeoutStartSec",
+           {n for n, _ in steps} == {"quality", "scan", "sync", "watch", "execute", "demo",
+                                     "report", "backup", "brief"}
            and "timeout --kill-after=60 \"$limit\" python3" in sh and hours
            and sum(int(s) + 60 for _, s in steps) < int(hours.group(1)) * 3600, failures)
     _check("daily_run.sh: flock до записи состояния, trap TERM → run.py killed, «end» после "
@@ -5455,6 +5455,474 @@ def test_checklist(cfg, failures: list[str]) -> None:
            and len({i["id"] for i in real}) == len(real), failures)
 
 
+class _FakeDemo:
+    """Демо-счёт Bybit для scanner/demo.py: те же методы, что bybit.TradeClient. Рыночный
+    ордер исполняется сразу по self.px, лимитка — сразу, если цена уже прошла (тейкер), иначе
+    ждёт move(); комиссия 0.1%: покупка — в монете, продажа — в USDT; баланс и блокировка под
+    лимитками — как на споте (не хватает — 170131); повтор orderLinkId — 170141, снять нечего —
+    170213; purge — ордер пропал (демо хранит 7 дней), admin_cancel — снят биржей."""
+
+    FEE = 0.001
+
+    def __init__(self, prices: dict, balances: dict | None = None):
+        self.px = dict(prices)
+        self.bal = {"USDT": 10000.0, **(balances or {})}
+        self.orders: dict = {}
+        self.creates: list = []
+        self.cancels: list = []
+        self.n = 0
+        self.fail_create = None
+        self.key = {"readOnly": 0, "ips": ["1.2.3.4"], "deadlineDay": -2,
+                    "permissions": {"Spot": ["SpotTrade"], "ContractTrade": ["Order", "Position"],
+                                    "Options": ["OptionsTrade"],
+                                    "Derivatives": ["DerivativesTrade"], "Wallet": []}}
+
+    def api_key_info(self) -> dict:
+        return dict(self.key)
+
+    def _locked(self, coin: str) -> float:
+        out = 0.0
+        for o in self.orders.values():
+            if o["status"] not in ("New", "PartiallyFilled") or o["type"] != "Limit":
+                continue
+            left = o["qty"] - o["cum"]
+            if coin == "USDT" and o["side"] == "Buy":
+                out += left * o["price"]
+            elif o["side"] == "Sell" and o["symbol"][:-4] == coin:
+                out += left
+        return out
+
+    def wallet_balance(self) -> dict:
+        return {c: {"balance": v, "usd": v, "locked": self._locked(c)}
+                for c, v in self.bal.items() if v}
+
+    def last_price(self, sym: str):
+        return self.px.get(sym)
+
+    def _fill(self, o: dict, price: float) -> None:
+        base = o["symbol"][:-4]
+        q = o["qty"] - o["cum"]
+        if o["side"] == "Buy":
+            fee = q * self.FEE
+            self.bal[base] = self.bal.get(base, 0.0) + q - fee
+            self.bal["USDT"] -= q * price
+            o["fee"][base] = o["fee"].get(base, 0.0) + fee
+        else:
+            fee = q * price * self.FEE
+            self.bal[base] -= q
+            self.bal["USDT"] += q * price - fee
+            o["fee"]["USDT"] = o["fee"].get("USDT", 0.0) + fee
+        o["cum"] += q
+        o["value"] += q * price
+        o["status"] = "Filled"
+
+    def create_order(self, symbol, side, order_type, qty, link, price=None, market_unit=None):
+        self.creates.append({"symbol": symbol, "side": side, "type": order_type, "qty": qty,
+                             "link": link, "price": price, "unit": market_unit})
+        if link in self.orders:
+            return {"retCode": 170141, "retMsg": "Duplicate clientOrderId.", "result": {}}
+        if self.fail_create:
+            return {"retCode": self.fail_create, "retMsg": "fail", "result": {}}
+        px = self.px[symbol]
+        q, p = float(qty), float(price) if price else None
+        quote = order_type == "Market" and side == "Buy" and market_unit == "quoteCoin"
+        value = q if quote else q * (p or px)
+        if value < 5:
+            return {"retCode": 170140, "retMsg": "Order value exceeded lower limit.", "result": {}}
+        base = symbol[:-4]
+        free = (self.bal["USDT"] - self._locked("USDT") if side == "Buy"
+                else self.bal.get(base, 0.0) - self._locked(base))
+        if free + 1e-9 < (value if side == "Buy" else q):
+            return {"retCode": 170131, "retMsg": "Insufficient balance.", "result": {}}
+        self.n += 1
+        o = {"symbol": symbol, "side": side, "type": order_type, "qty": value / px if quote else q,
+             "price": p, "status": "New", "cum": 0.0, "value": 0.0, "fee": {},
+             "id": str(self.n), "cancelType": ""}
+        self.orders[link] = o
+        if order_type == "Market":
+            self._fill(o, px)
+        elif (side == "Buy" and p >= px) or (side == "Sell" and p <= px):
+            self._fill(o, p)
+        return {"retCode": 0, "retMsg": "OK", "result": {"orderId": o["id"], "orderLinkId": link}}
+
+    def cancel_order(self, symbol, link):
+        self.cancels.append(link)
+        o = self.orders.get(link)
+        if not o or o["status"] not in ("New", "PartiallyFilled"):
+            return {"retCode": 170213, "retMsg": "Order does not exist.", "result": {}}
+        o["status"] = "Cancelled"
+        o["cancelType"] = "CancelByUser"
+        return {"retCode": 0, "retMsg": "OK", "result": {}}
+
+    def order(self, link):
+        o = self.orders.get(link)
+        if o is None:
+            return None
+        return {"orderLinkId": link, "orderId": o["id"], "orderStatus": o["status"],
+                "cumExecQty": repr(o["cum"]), "cumExecValue": repr(o["value"]),
+                "cumFeeDetail": {k: repr(v) for k, v in o["fee"].items()},
+                "cancelType": o["cancelType"]}
+
+    def move(self, sym: str, low: float, high: float, close: float) -> None:
+        for o in list(self.orders.values()):
+            if o["symbol"] != sym or o["type"] != "Limit" or o["status"] != "New":
+                continue
+            if o["side"] == "Buy" and low < o["price"]:
+                self._fill(o, o["price"])
+            elif o["side"] == "Sell" and high >= o["price"]:
+                self._fill(o, o["price"])
+        self.px[sym] = close
+
+    def purge(self, link: str) -> None:
+        self.orders.pop(link, None)
+
+    def admin_cancel(self, link: str) -> None:
+        self.orders[link]["status"] = "Cancelled"
+        self.orders[link]["cancelType"] = "CancelByAdmin"
+
+
+def test_demo(cfg, failures: list[str]) -> None:
+    print("Демо-счёт Bybit (блок F): зеркало пробного, тейки, выходы, потолки, ключ:")
+    import copy
+    import json as _json
+    import sqlite3
+    import tempfile
+    from pathlib import Path as _P
+    from scanner import bybit as bb
+    from scanner import demo as dm
+    from scanner import executor as ex
+    from scanner.config import Config
+    from scanner.notify import telegram as tg
+    D = ex.DAY
+    d0 = 1791590400                          # 2026-10-10 00:00 UTC
+    now0 = d0 + 6 * 3600 + 1800
+
+    def make_cfg(tmp: str, **demo) -> Config:
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {**d.get("output", {}), "db_path": str(_P(tmp) / "t.db"),
+                       "watchlist_json": str(_P(tmp) / "wl.json")}
+        d["demo"] = {**d.get("demo", {}), "since": "2026-10-10", "settle_s": 0, **demo}
+        return Config(d)
+
+    def dry_pos(c: Config, book: str, sym: str, created: float, *, usd1: float = 10.0,
+                limits=((0.93, 10.7), (0.87, 11.4), (0.81, 12.3), (0.74, 13.5)),
+                shadow: int = 0) -> int:
+        """Пробная позиция как после execute: ступень 1 исполнена по 1.0, лимитки стоят."""
+        con = ex.connect(c["output"]["db_path"])
+        cur = con.execute(
+            "INSERT INTO dry_positions(book, pair, symbol, card_day, status, created_ts, "
+            "base_low, stop_pct, min_amt, qty, bought_qty, spent_usdt, qty_step, tick, shadow) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (book, f"{sym}USDT", sym, ex.utc_day(created), "open", created, 0.95, 25, 5.0,
+             usd1 * 0.9985, usd1 * 0.9985, usd1, 0.1, 0.01, shadow))
+        pid = cur.lastrowid
+        con.execute("INSERT INTO dry_orders(link_id, position_id, book, pair, side, kind, step, "
+                    "price, qty, usd, status, created_ts, filled_ts) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"dry-{book}{pid}-B1", pid, book, f"{sym}USDT", "Buy", "Market", 1, 1.0,
+                     usd1, usd1, "filled", created, created))
+        for n, (p, q) in enumerate(limits, start=2):
+            con.execute("INSERT INTO dry_orders(link_id, position_id, book, pair, side, kind, "
+                        "step, price, qty, usd, status, created_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (f"dry-{book}{pid}-B{n}", pid, book, f"{sym}USDT", "Buy", "Limit", n, p,
+                         q, p * q, "new", created))
+        con.commit()
+        con.close()
+        return pid
+
+    def q(c: Config, sql: str, args=()) -> list[dict]:
+        con = sqlite3.connect(c["output"]["db_path"])
+        con.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in con.execute(sql, args).fetchall()]
+        finally:
+            con.close()
+
+    def x(c: Config, sql: str, args=()) -> None:
+        con = sqlite3.connect(c["output"]["db_path"])
+        con.execute(sql, args)
+        con.commit()
+        con.close()
+
+    def run(c: Config, fx: _FakeDemo, now: float, **kw):
+        return dm.run_demo(c, fx, now=now, sleep=lambda s: None, **kw)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        c = make_cfg(tmp)
+        fx = _FakeDemo({"AAAUSDT": 1.0, "OLDUSDT": 1.0, "SHDUSDT": 1.0, "GONUSDT": 1.0},
+                       {"AAA": 100.0, "BTC": 1.0})
+        r_id = dry_pos(c, "R", "AAA", now0 - 60)
+        h_id = dry_pos(c, "H", "AAA", now0 - 60)
+        dry_pos(c, "R", "OLD", d0 - 3 * D)               # до since — не трогаем вовсе
+        dry_pos(c, "R", "SHD", now0 - 60, shadow=1)      # тень — на демо не идёт
+        gone_id = dry_pos(c, "H", "GON", now0 - 60)      # закрылась до первого запуска демо
+        x(c, "UPDATE dry_positions SET status='closed', reason='стоп' WHERE id=?", (gone_id,))
+        code0, lines0 = run(c, fx, now0)
+        ords0 = q(c, "SELECT * FROM demo_orders ORDER BY link_id")
+        pos0 = {p["dry_id"]: p for p in q(c, "SELECT * FROM demo_positions")}
+        n_create0 = len(fx.creates)
+
+        # (а) вход: те же ступени, рынок в USDT, лимитки по ценам пробного, orderLinkId
+        rb = [o for o in ords0 if o["dry_id"] == r_id and o["side"] == "Buy"]
+        _check("вход: R и H — по 5 ступеней, B1 рынком на $10.00 в USDT, B2–B5 лимитками "
+               "по ценам и количествам пробного",
+               code0 == 0 and len(rb) == 5
+               and len([o for o in ords0 if o["dry_id"] == h_id and o["side"] == "Buy"]) == 5
+               and any(cr["link"] == f"dmo-R{r_id}-B1" and cr["type"] == "Market"
+                       and cr["qty"] == "10.00" and cr["unit"] == "quoteCoin"
+                       for cr in fx.creates)
+               and [(o["price"], o["qty"]) for o in rb[1:]]
+               == [(0.93, 10.7), (0.87, 11.4), (0.81, 12.3), (0.74, 13.5)]
+               and any(cr["link"] == f"dmo-R{r_id}-B2" and cr["price"] == "0.93"
+                       and cr["qty"] == "10.7" for cr in fx.creates), failures)
+        _check("тень, позиции до since, закрытые до демо и чужие монеты счёта не трогаются",
+               set(pos0) == {r_id, h_id} and fx.bal["BTC"] == 1.0
+               and not any(cr["symbol"] in ("OLDUSDT", "SHDUSDT", "GONUSDT")
+                           for cr in fx.creates), failures)
+        rp = pos0[r_id]
+        _check("числа позиции — по исполнению биржи: куплено 10 × (1 − 0.1%) монет за $10",
+               abs(rp["bought_qty"] - 9.99) < 1e-9 and abs(rp["spent_usdt"] - 10.0) < 1e-9
+               and abs(rp["qty"] - 9.99) < 1e-9 and rp["status"] == "open", failures)
+        l0 = [o for o in ords0 if o["role"] == "L0"]
+        _check("тейк R: треть дешевле минимума биржи → лимитка на весь остаток 9.9 по 1.51 "
+               "(средняя 10/9.99 с комиссией в монете, +50% вверх к tick); у H тейков нет",
+               len(l0) == 1 and l0[0]["dry_id"] == r_id and l0[0]["price"] == 1.51
+               and abs(l0[0]["qty"] - 9.9) < 1e-9 and l0[0]["side"] == "Sell"
+               and not [o for o in ords0 if o["role"] == "L1"], failures)
+        _check("лог: ключ демо ok с пометкой про лишние права, «поставил на демо», сводка книг",
+               any(ln.startswith("ключ демо: торговля · вывода нет · IP привязан")
+                   and "демо: Bybit дал ещё" in ln for ln in lines0)
+               and any("поставил на демо 5 ступ." in ln for ln in lines0)
+               and any(ln.startswith("демо R «правила»: открыто 1") for ln in lines0), failures)
+
+        # (б) повтор прогона: ни одного нового ордера
+        code1, _ = run(c, fx, now0 + 60)
+        _check("повтор прогона: новых ордеров нет, числа те же",
+               code1 == 0 and len(fx.creates) == n_create0
+               and abs(q(c, "SELECT qty FROM demo_positions WHERE dry_id=?", (r_id,))[0]["qty"]
+                       - 9.99) < 1e-9, failures)
+
+        # (в) докупка: B2 исполнилась → тейк переставлен от новой средней, доли от купленного
+        fx.move("AAAUSDT", 0.92, 1.0, 0.95)
+        code2, lines2 = run(c, fx, now0 + D)
+        ords2 = q(c, "SELECT * FROM demo_orders WHERE dry_id=? ORDER BY role, ver", (r_id,))
+        l0s = [o for o in ords2 if o["role"] == "L0"]
+        bought = 9.99 + 10.7 * 0.999
+        avg = (10.0 + 10.7 * 0.93) / bought
+        _check("после докупки: L0 снят («переставляю тейк»), L0v2 по новой средней +50%, "
+               "L1 +150%, количества — треть купленного вниз к шагу",
+               code2 == 0 and len(l0s) == 2 and l0s[0]["status"] == "cancelled"
+               and l0s[0]["note"].startswith("снят: переставляю тейк")
+               and l0s[1]["link_id"] == f"dmo-R{r_id}-L0v2" and l0s[1]["status"] == "new"
+               and abs(l0s[1]["price"] - ex.round_step(avg * 1.5, 0.01, up=True)) < 1e-9
+               and abs(l0s[1]["qty"] - 6.8) < 1e-9
+               and any(o["role"] == "L1" and abs(o["price"]
+                                                 - ex.round_step(avg * 2.5, 0.01, up=True)) < 1e-9
+                       and abs(o["qty"] - 6.8) < 1e-9 for o in ords2), failures)
+
+        # (г) демо стёрло лимитку (7 дней) и биржа сняла другую сама → ставим заново
+        fx.purge(f"dmo-R{r_id}-B3")
+        fx.admin_cancel(f"dmo-H{h_id}-B4")
+        code3, lines3 = run(c, fx, now0 + 2 * D)
+        b3 = q(c, "SELECT * FROM demo_orders WHERE dry_id=? AND role='B3' ORDER BY ver", (r_id,))
+        b4h = q(c, "SELECT * FROM demo_orders WHERE dry_id=? AND role='B4' ORDER BY ver", (h_id,))
+        _check("пропавшая лимитка B3 → «gone» и B3v2 на тот же остаток; снятая биржей B4 у H → "
+               "B4v2",
+               code3 == 0 and [o["status"] for o in b3] == ["gone", "new"]
+               and b3[1]["link_id"] == f"dmo-R{r_id}-B3v2" and abs(b3[1]["qty"] - 11.4) < 1e-9
+               and [o["status"] for o in b4h] == ["cancelled", "new"]
+               and "снят биржей" in b4h[0]["note"], failures)
+
+        # (д) пробный снял лимитку B5 (срок) → демо снимает свою
+        x(c, "UPDATE dry_orders SET status='cancelled', note='срок 120 дн.' WHERE link_id=?",
+          (f"dry-H{h_id}-B5",))
+        run(c, fx, now0 + 2 * D + 60)
+        b5h = q(c, "SELECT * FROM demo_orders WHERE link_id=?", (f"dmo-H{h_id}-B5",))[0]
+        _check("пробный снял B5 → на демо снята (заметка «снят: пробный снял»)",
+               b5h["status"] == "cancelled" and b5h["note"].startswith("снят: пробный снял"),
+               failures)
+
+        # (е) тейк исполнился → лимитки покупки сняты, выручка — за вычетом комиссии в USDT
+        tp = q(c, "SELECT * FROM demo_orders WHERE dry_id=? AND role='L0' AND status='new'",
+               (r_id,))[0]
+        fx.move("AAAUSDT", 1.3, tp["price"] + 0.01, tp["price"])
+        code4, lines4 = run(c, fx, now0 + 3 * D)
+        live_b = q(c, "SELECT * FROM demo_orders WHERE dry_id=? AND side='Buy' AND status IN "
+                      "('new','sending','cancel_sent')", (r_id,))
+        rp4 = q(c, "SELECT * FROM demo_positions WHERE dry_id=?", (r_id,))[0]
+        _check("тейк +50% исполнен: лимитки покупки R сняты («начали продавать»), выручка "
+               "= qty × цена × (1 − 0.1%)",
+               code4 == 0 and not live_b
+               and abs(rp4["proceeds_usdt"] - 6.8 * tp["price"] * 0.999) < 1e-6
+               and any("начали продавать" in ln for ln in lines4), failures)
+
+        # (ж) пробный закрыл R по стопу → снять всё, продать остаток рынком, закрыть
+        bal_before = fx.bal["AAA"]
+        x(c, "UPDATE dry_positions SET status='closed', reason='стоп', closed_ts=? WHERE id=?",
+          (now0 + 4 * D, r_id))
+        fx.px["AAAUSDT"] = 0.70
+        code5, lines5 = run(c, fx, now0 + 4 * D)
+        rp5 = q(c, "SELECT * FROM demo_positions WHERE dry_id=?", (r_id,))[0]
+        xs = q(c, "SELECT * FROM demo_orders WHERE dry_id=? AND role='X'", (r_id,))
+        left = q(c, "SELECT * FROM demo_orders WHERE dry_id=? AND status IN "
+                    "('new','sending','cancel_sent')", (r_id,))
+        _check("стоп пробного: тейк L1 снят, остаток продан рынком (-X), позиция closed «стоп», "
+               "проданы только свои монеты",
+               code5 == 0 and rp5["status"] == "closed" and rp5["reason"] == "стоп"
+               and len(xs) == 1 and xs[0]["status"] == "filled" and not left
+               and abs(bal_before - fx.bal["AAA"] - xs[0]["cum_qty"]) < 1e-9
+               and fx.bal["AAA"] >= 100.0 - 1e-9 and rp5["qty"] < 0.1
+               and xs[0]["cum_qty"] <= rp5["bought_qty"] - 6.8 + 1e-9, failures)
+        n5 = len(fx.creates)
+        run(c, fx, now0 + 4 * D + 60)
+        _check("закрытая позиция: повтор прогона ничего не ставит", len(fx.creates) == n5,
+               failures)
+
+        # (з) H: продажа остатка отклонена → closing, в следующий прогон — X v2
+        x(c, "UPDATE dry_positions SET status='closed', reason='трейл', closed_ts=? WHERE id=?",
+          (now0 + 5 * D, h_id))
+        fx.fail_create = 170131
+        code6, lines6 = run(c, fx, now0 + 5 * D)
+        hp6 = q(c, "SELECT * FROM demo_positions WHERE dry_id=?", (h_id,))[0]
+        fx.fail_create = None
+        code7, lines7 = run(c, fx, now0 + 5 * D + 60)
+        hp7 = q(c, "SELECT * FROM demo_positions WHERE dry_id=?", (h_id,))[0]
+        hx = q(c, "SELECT * FROM demo_orders WHERE dry_id=? AND role='X' ORDER BY ver", (h_id,))
+        _check("H: продажа отклонена биржей → closing; следующий прогон — X v2, closed «трейл»",
+               hp6["status"] == "closing" and [o["status"] for o in hx] == ["rejected", "filled"]
+               and hx[1]["link_id"] == f"dmo-H{h_id}-Xv2" and hp7["status"] == "closed"
+               and hp7["reason"] == "трейл", failures)
+
+        # (и) сводка дня: блок демо
+        st = dm.brief_state(c, now=now0 + 5 * D + 120)
+        bl = tg.demo_brief_lines(st, c)
+        _check("сводка: «🧪 Демо-счёт Bybit», продажа «продал остаток», P&L рядом с пробным",
+               bool(bl) and bl[0].startswith("🧪 <b>Демо-счёт Bybit</b>")
+               and any("продал остаток" in ln for ln in bl)
+               and any("(пробный" in ln for ln in bl), failures)
+        _check("сводка: позиция без открытых и без новостей за сутки — блока нет",
+               tg.demo_brief_lines({**st, "books": {}, "placed": 0, "fills": 0, "sells": [],
+                                    "skipped": [], "rejected": 0}, c) == [], failures)
+
+    # (к) потолки и отказы
+    with tempfile.TemporaryDirectory() as tmp:
+        c = make_cfg(tmp, max_day_usdt=60, max_coins=1, since="2026-10-01")
+        fx = _FakeDemo({"AAAUSDT": 1.0, "BBBUSDT": 1.0, "CCCUSDT": 1.0, "DDDUSDT": 1.0,
+                        "EEEUSDT": 2.0})
+        a = dry_pos(c, "R", "AAA", now0 - 60)
+        b = dry_pos(c, "R", "BBB", now0 - 50)        # книга R уже занята (max_coins 1)
+        h = dry_pos(c, "H", "CCC", now0 - 40)        # день: 50 + 50 > 60
+        big = dry_pos(c, "H", "DDD", now0 - 30, usd1=20.0)
+        drift = dry_pos(c, "H", "EEE", now0 - 20)    # цена 2.0 против 1.0 у пробного
+        late = dry_pos(c, "H", "LATE", now0 - 3 * D + 3600)
+        run(c, fx, now0)
+        ps = {p["dry_id"]: p for p in q(c, "SELECT * FROM demo_positions")}
+        _check("потолки: монет в книге, $ за день, $ на ордер, цена ушла, опоздал — skipped "
+               "с причиной, ордеров нет",
+               ps[a]["status"] == "open" and ps[b]["status"] == "skipped"
+               and "монет" in ps[b]["reason"] and "потолок дня" in ps[h]["reason"]
+               and "на ордер" in ps[big]["reason"] and "цена ушла" in ps[drift]["reason"]
+               and "опоздал" in ps[late]["reason"]
+               and {cr["symbol"] for cr in fx.creates} == {"AAAUSDT"}, failures)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        c = make_cfg(tmp)
+        fx = _FakeDemo({"AAAUSDT": 1.0})
+        fx.bal["USDT"] = 30.0
+        dry_pos(c, "R", "AAA", now0 - 60)
+        run(c, fx, now0)
+        p = q(c, "SELECT * FROM demo_positions")[0]
+        _check("на демо-счёте USDT меньше лестницы → skipped «свободно … < лестницы»",
+               p["status"] == "skipped" and "свободно 30.00 USDT" in p["reason"]
+               and not fx.creates, failures)
+
+    # (л) ключ: вывод или без IP — ни одного ордера, код 1; стоп-кран — ничего
+    with tempfile.TemporaryDirectory() as tmp:
+        c = make_cfg(tmp)
+        dry_pos(c, "R", "AAA", now0 - 60)
+        fx = _FakeDemo({"AAAUSDT": 1.0})
+        fx.key["permissions"] = {**fx.key["permissions"], "Wallet": ["Withdraw"]}
+        cw, lw = run(c, fx, now0)
+        fx2 = _FakeDemo({"AAAUSDT": 1.0})
+        fx2.key["ips"] = ["*"]
+        cn, ln_ = run(c, fx2, now0)
+        halt_dir = _P(tmp) / "halt"
+        halt_dir.mkdir()
+        (halt_dir / "HALT").write_text(_json.dumps({"reason": "тест", "ts": now0, "by": "t"}),
+                                       encoding="utf-8")
+        fx3 = _FakeDemo({"AAAUSDT": 1.0})
+        ch, lh = run(c, fx3, now0, halt_base=halt_dir)
+        st = dm.brief_state(c, now=now0)
+        _check("ключ с правом вывода / без IP → код 1, «⛔ ключ демо», ни одного ордера",
+               cw == 1 and cn == 1 and not fx.creates and not fx2.creates
+               and any(x_.startswith("⛔ ключ демо") and "ВЫВОДА" in x_ for x_ in lw)
+               and any("IP" in x_ for x_ in ln_), failures)
+        _check("стоп-кран: демо ничего не делает", ch == 0 and not fx3.creates
+               and any("остановлен" in x_ for x_ in lh), failures)
+        bl = tg.demo_brief_lines(st, c)
+        _check("сводка: опасный ключ демо — жирной строкой",
+               any(x_.startswith("<b>⛔ ключ демо") for x_ in bl), failures)
+
+    # (м) повтор orderLinkId (ответ потерялся, ордер дошёл) → состояние с биржи, не задвоено
+    with tempfile.TemporaryDirectory() as tmp:
+        c = make_cfg(tmp)
+        fx = _FakeDemo({"AAAUSDT": 1.0})
+        pid = dry_pos(c, "R", "AAA", now0 - 60)
+        con = dm.connect(c["output"]["db_path"])
+        d = dm._insert(con, q(c, "SELECT * FROM dry_positions WHERE id=?", (pid,))[0], "open",
+                       "", now0)
+        fx.create_order("AAAUSDT", "Buy", "Limit", "10.7", f"dmo-R{pid}-B2", price="0.93")
+        o = dm.place(con, fx, d, role="B2", side="Buy", kind="Limit", price=0.93, qty=10.7,
+                     now=now0)
+        con.close()
+        _check("ответ 170141 «уже есть» → ордер считается стоящим (new), второй не создан",
+               o["status"] == "new" and len(fx.orders) == 1, failures)
+
+    # (н) торговый клиент: только демо-домен, только спот без займа, подпись POST
+    try:
+        bb.TradeClient("k", "s", bb.BASE_URL)
+        live_refused = False
+    except bb.BybitError as e:
+        live_refused = "только с демо" in str(e)
+    sent: list = []
+
+    def fake_post(url, headers, body, timeout):
+        sent.append((url, headers, body))
+        return 200, b'{"retCode":0,"retMsg":"OK","result":{"orderId":"1","orderLinkId":"x"}}'
+    tc = bb.TradeClient("key", "secret", post=fake_post, clock=lambda: 1700000000.0)
+    r = tc.create_order("AAAUSDT", "Buy", "Limit", "10.7", "dmo-R1-B2", price="0.93")
+    body = _json.loads(sent[0][2])
+    sign_ok = sent[0][1]["X-BAPI-SIGN"] == bb.sign("secret", "1700000000000", "key", "5000",
+                                                    sent[0][2].decode())
+    _check("TradeClient: основной домен — отказ; ордер — category spot, isLeverage 0, GTC, "
+           "api-demo, подпись по телу JSON",
+           live_refused and r["retCode"] == 0 and body["category"] == "spot"
+           and body["isLeverage"] == 0 and body["timeInForce"] == "GTC"
+           and sent[0][0] == "https://api-demo.bybit.com/v5/order/create" and sign_ok, failures)
+
+    def post_10003(url, headers, body, timeout):
+        return 200, b'{"retCode":10003,"retMsg":"API key is invalid.","result":{}}'
+    tc2 = bb.TradeClient("key", "secret", post=post_10003)
+    try:
+        tc2.cancel_order("AAAUSDT", "x")
+        key_raised = False
+    except bb.BybitError as e:
+        key_raised = e.code == 10003
+
+    def post_dup(url, headers, body, timeout):
+        return 200, b'{"retCode":170141,"retMsg":"Duplicate clientOrderId.","result":{}}'
+    rd = bb.TradeClient("key", "secret", post=post_dup).create_order(
+        "AAAUSDT", "Sell", "Market", "1", "x")
+    _check("TradeClient: 10003 (ключ) — исключение, 170141 (повтор) — ответ для разбора",
+           key_raised and rd["retCode"] == 170141, failures)
+    info = {"readOnly": 0, "ips": ["1.2.3.4"], "deadlineDay": -2,
+            "permissions": {"Spot": ["SpotTrade"], "ContractTrade": ["Order"]}}
+    _check("check_key demo: лишние права Bybit — ok с пометкой; без demo — danger",
+           bb.check_key(info, "trade", demo=True)["level"] == "ok"
+           and any("ContractTrade" in f for f in bb.check_key(info, "trade", demo=True)["facts"])
+           and bb.check_key(info, "trade")["level"] == "danger", failures)
+
+
 def main() -> int:
     cfg = load_config()
     failures: list[str] = []
@@ -5529,6 +5997,8 @@ def main() -> int:
     test_executor_filters(cfg, failures)
     print()
     test_executor_fixes(cfg, failures)
+    print()
+    test_demo(cfg, failures)
     print()
     test_github_levels(cfg, failures)
     print()

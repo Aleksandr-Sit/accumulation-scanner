@@ -16,6 +16,7 @@
   python run.py backup --accept-shrink      # база уменьшена намеренно: копия — новый эталон
   python run.py sync [--notify]             # реальные позиции из исполнений Bybit (Read-Only)
   python run.py execute --dry-run           # пробный исполнитель: «поставил бы», без ордеров
+  python run.py demo [--status]             # демо-счёт Bybit: те же ордера на учебные деньги
   python run.py halt [причина]              # стоп-кран исполнителя (снять — только resume)
   python run.py resume                      # снять стоп-кран (только на сервере, по SSH)
   python run.py control [--status]          # команды /stop /status из Telegram (таймер 5 мин)
@@ -526,6 +527,7 @@ def cmd_brief(args) -> int:
         state = deliver.brief_state(cfg, scan_exit=args.scan_exit, watch_exit=args.watch_exit,
                                     backup_exit=args.backup_exit, sync_exit=args.sync_exit,
                                     exec_exit=args.exec_exit, report_exit=args.report_exit,
+                                    demo_exit=getattr(args, "demo_exit", None),
                                     quality_exit=args.quality_exit)
         text = telegram.format_brief(state, cfg, test=args.test)
     except Exception as e:
@@ -951,6 +953,29 @@ def cmd_execute(args) -> int:
     return code
 
 
+def cmd_demo(args) -> int:
+    """Демо-счёт Bybit (scanner/demo.py, блок F): настоящие ордера на api-demo.bybit.com
+    зеркально пробному исполнителю — после execute. Нет ключа демо — пропуск, код 0;
+    --status — позиции и ордера из БД, без сети. Код 1 — ключ опасен или сбой биржи."""
+    cfg = load_config(args.config)
+    from scanner import bybit, demo
+    if args.status:
+        for line in demo.status_lines(cfg):
+            print(f"[demo] {line}")
+        return 0
+    if not (cfg.get("api_keys.bybit_demo_key") and cfg.get("api_keys.bybit_demo_secret")):
+        print("[demo] ключа демо-счёта нет (BYBIT_DEMO_API_KEY/BYBIT_DEMO_API_SECRET в .env) "
+              "— пропуск")
+        return 0
+    try:
+        code, lines = demo.run_demo(cfg, demo.client_from_cfg(cfg))
+    except (bybit.BybitError, OSError, sqlite3.Error) as e:
+        code, lines = 1, [f"FAIL: {type(e).__name__}: {e}"]
+    for line in lines:
+        print(f"[demo] {line}")
+    return code
+
+
 def _tell_owner(cfg, text: str) -> None:
     """Сообщение владельцу о стоп-кране (без исключений: стоп важнее доставки)."""
     try:
@@ -1099,6 +1124,8 @@ def main() -> int:
                          "прошла» в строке статуса")
     pb.add_argument("--exec-exit", type=int, default=None,
                     help="код выхода execute из daily_run: ≠ 0 — «⚠ пробный исполнитель упал»")
+    pb.add_argument("--demo-exit", type=int, default=None,
+                    help="код выхода demo из daily_run: ≠ 0 — «⚠ демо-счёт: сбой»")
     pb.add_argument("--report-exit", type=int, default=None,
                     help="код выхода report из daily_run: ≠ 0 — «⚠ недельная сводка не ушла»")
     pb.add_argument("--quality-exit", type=int, default=None,
@@ -1165,6 +1192,13 @@ def main() -> int:
                      help="обязателен: реального режима пока нет (шаги 3–4)")
     pex.add_argument("--config", default=None)
     pex.set_defaults(func=cmd_execute)
+
+    pdm = sub.add_parser("demo", help="демо-счёт Bybit: ордера пробного исполнителя на учебные "
+                                      "деньги (api-demo.bybit.com)")
+    pdm.add_argument("--status", action="store_true",
+                     help="позиции и ордера демо из БД, без сети и без ордеров")
+    pdm.add_argument("--config", default=None)
+    pdm.set_defaults(func=cmd_demo)
 
     ph = sub.add_parser("halt", help="стоп-кран: исполнитель не ставит лестниц и не "
                                      "исполняет ордеров (снять — run.py resume)")

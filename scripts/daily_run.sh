@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Ежедневный прогон сканера на VPS: quality (срез трека Q, если пора) -> scan -> sync (позиции
-# из Bybit) -> watch -> execute (пробный исполнитель) -> report (раз в неделю) -> backup -> brief, Telegram, лог в logs/.
+# из Bybit) -> watch -> execute (пробный исполнитель) -> demo (демо-счёт Bybit) -> report (раз в неделю) -> backup -> brief, Telegram, лог в logs/.
 # Linux-двойник daily_run.ps1. Запускается таймером systemd (scripts/systemd/accumulation-scanner.timer).
 # Ручной запуск: bash scripts/daily_run.sh [--no-notify]
 #
@@ -56,7 +56,7 @@ run_step() {  # имя, таймаут в секундах, аргументы r
 }
 
 # Таймауты — с запасом в 3–5 раз к обычной длительности (скан ~20 мин, остальное — секунды,
-# пересчёт трека Q ~6 мин, отправка копии базы — до пары минут). Сумма 3 ч 15 мин < 4 ч
+# пересчёт трека Q ~6 мин, отправка копии базы — до пары минут). Сумма 3 ч 30 мин < 4 ч
 # TimeoutStartSec юнита: при зависании убивает таймаут шага, а не systemd весь прогон.
 
 # Срез трека Q: старше refresh_after_days — пересчёт (~6 мин сети) в data/. Сбой не блокирует
@@ -72,6 +72,9 @@ run_step watch 900 watch "${notify[@]}"; watch_rc=$rc
 # Пробный исполнитель: лестницы по сегодняшним карточкам в книги R/H, без ордеров. Сбой не
 # блокирует остальные шаги — код уходит в сводку дня. Стоп-кран (data/HALT) — шаг ничего не делает.
 run_step execute 900 execute --dry-run; exec_rc=$rc
+# Демо-счёт Bybit (блок F): те же ордера на учебные деньги (api-demo.bybit.com) — после execute,
+# решения берёт у него. Нет ключа демо — пропуск, код 0. Стоп-кран — шаг ничего не делает.
+run_step demo 900 demo; demo_rc=$rc
 # Недельная сводка: report сам решает, пора ли (--if-due, первый прогон недели).
 run_step report 600 report --if-due "${notify[@]}"; report_rc=$rc
 # Бэкап базы — после всех записей дня; раз в неделю копия уходит в Telegram (без звука).
@@ -80,7 +83,8 @@ backup_dir=()
 run_step backup 1200 backup "${backup_dir[@]}" --send-weekly "${notify[@]}"; backup_rc=$rc
 # Сводка дня — тихо и последней; пришла сводка = прогон дошёл до конца.
 run_step brief 300 brief --scan-exit "$scan_rc" --watch-exit "$watch_rc" --backup-exit "$backup_rc" \
-    --sync-exit "$sync_rc" --exec-exit "$exec_rc" --report-exit "$report_rc" \
+    --sync-exit "$sync_rc" --exec-exit "$exec_rc" --demo-exit "$demo_rc" \
+    --report-exit "$report_rc" \
     --quality-exit "$quality_rc" "${notify[@]}"; brief_rc=$rc
 
 # Логи старше 30 дней не нужны.
@@ -88,5 +92,5 @@ find logs -name 'daily_*.log' -mtime +30 -delete
 
 printf 'end %s %s\n' "$(date +%s)" "$brief_rc" >> "$state"
 [ "$quality_rc" -eq 0 ] && [ "$scan_rc" -eq 0 ] && [ "$sync_rc" -eq 0 ] && [ "$watch_rc" -eq 0 ] \
-    && [ "$exec_rc" -eq 0 ] && [ "$report_rc" -eq 0 ] && [ "$backup_rc" -eq 0 ] \
+    && [ "$exec_rc" -eq 0 ] && [ "$demo_rc" -eq 0 ] && [ "$report_rc" -eq 0 ] && [ "$backup_rc" -eq 0 ] \
     && [ "$brief_rc" -eq 0 ]

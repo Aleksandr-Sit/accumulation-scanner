@@ -825,6 +825,8 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
         head.append("⚠ синхронизация с Bybit не прошла")
     if state.get("exec_fail"):
         head.append("⚠ пробный исполнитель упал")
+    if state.get("demo_fail"):
+        head.append("⚠ демо-счёт: сбой")
     g = state.get("guard") or {}
     if g.get("report_fail"):
         head.append("⚠ недельная сводка не ушла")
@@ -887,6 +889,9 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
     ex = executor_brief_lines(state.get("executor"), cfg)
     if ex:
         lines += ex + [""]
+    dm = demo_brief_lines(state.get("demo"), cfg)
+    if dm:
+        lines += dm + [""]
 
     foot = []
     if scan.get("elapsed_min") is not None:
@@ -975,6 +980,56 @@ def executor_brief_lines(ex: dict | None, cfg) -> list[str]:
     if active_sh:
         out.append("👥 тень: " + " · ".join(f"{b.get('emoji', '•')} {b['open']} поз., "
                                            f"{fmt_usd(b['pnl'])}" for b in shadow.values()))
+    return out
+
+
+_DEMO_ROLE = {"X": "продал остаток"}
+
+
+def demo_brief_lines(dm: dict | None, cfg) -> list[str]:
+    """Блок сводки дня «🧪 Демо-счёт Bybit» (scanner/demo.brief_state): ордера пробного на
+    бирже с учебными деньгами — что поставил, что не поставил и почему, исполнения и продажи за
+    сутки, P&L книг рядом с P&L пробного по тем же позициям, ключ. Нечего сказать — пусто."""
+    if not dm:
+        return []
+    books = dm.get("books") or {}
+    active = any(b.get("open") or b.get("closed") for b in books.values())
+    key_bad = dm.get("key_level") in ("warn", "danger", "error")
+    news = (dm.get("placed") or dm.get("skipped") or dm.get("fills") or dm.get("sells")
+            or dm.get("rejected"))
+    if not (active or news or key_bad or not dm.get("run_today")):
+        return []
+    out = ["🧪 <b>Демо-счёт Bybit</b> <i>(учебные деньги: ордера пробного на бирже)</i>"]
+    if not dm.get("run_today"):
+        out.append("⚠ сегодня демо не запускалось")
+    if key_bad:
+        txt = _esc(dm.get("key_line") or "ключ демо не проверен")
+        out.append(f"<b>{txt}</b>" if dm["key_level"] == "danger" else txt)
+    if dm.get("placed"):
+        out.append(f"поставил лестниц: {dm['placed']}")
+    for sym, why in dm.get("skipped") or []:
+        out.append(f"не поставил {_esc(sym)}: {_esc(why)}")
+    acts = []
+    if dm.get("fills"):
+        acts.append(f"исполнилось лимиток {dm['fills']}")
+    if dm.get("sells"):
+        lad = cfg["stage8_exit"]["ladder"]
+
+        def role(r: str) -> str:
+            if r.startswith("L") and r[1:].isdigit() and int(r[1:]) < len(lad):
+                return f"тейк +{lad[int(r[1:])][0] * 100:.0f}%"
+            return _DEMO_ROLE.get(r, r)
+        acts.append("продажи: " + ", ".join(f"{_esc(b)} {_esc(sym)} {role(r)}"
+                                            for b, sym, r in dm["sells"]))
+    if acts:
+        out.append("за сутки: " + "; ".join(acts))
+    if dm.get("rejected"):
+        out.append(f"⚠ биржа отклонила ордеров: {dm['rejected']} — подробности: "
+                   f"python3 run.py demo --status")
+    if active:
+        out.append(" · ".join(f"{b.get('emoji', '•')} {_esc(b.get('label', k))}: "
+                              f"{b['open']} поз., {fmt_usd(b['pnl'])} "
+                              f"(пробный {fmt_usd(b['dry_pnl'])})" for k, b in books.items()))
     return out
 
 

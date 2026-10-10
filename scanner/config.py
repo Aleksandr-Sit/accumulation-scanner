@@ -46,7 +46,8 @@ class Config:
 ENV_KEYS = {"coingecko_demo": "COINGECKO_DEMO_KEY", "goplus": "GOPLUS_KEY",
             "dune": "DUNE_API_KEY", "telegram_token": "TELEGRAM_BOT_TOKEN",
             "telegram_chat_id": "TELEGRAM_CHAT_ID", "telegram_owner_id": "TELEGRAM_OWNER_ID",
-            "bybit_key": "BYBIT_API_KEY", "bybit_secret": "BYBIT_API_SECRET"}
+            "bybit_key": "BYBIT_API_KEY", "bybit_secret": "BYBIT_API_SECRET",
+            "bybit_demo_key": "BYBIT_DEMO_API_KEY", "bybit_demo_secret": "BYBIT_DEMO_API_SECRET"}
 
 
 def load_config(path: str | os.PathLike[str] | None = None) -> Config:

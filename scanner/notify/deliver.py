@@ -199,7 +199,7 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
                 watch_exit: int | None = None, backup_exit: int | None = None,
                 sync_exit: int | None = None, exec_exit: int | None = None,
                 report_exit: int | None = None, quality_exit: int | None = None,
-                data_dir=None) -> dict:
+                demo_exit: int | None = None, data_dir=None) -> dict:
     """Всё для сводки дня — из scanner.db, watchlist.json, среза трека Q и data/ (стоп-кран,
     опрос команд, ключ Bybit, состояние прошлого прогона), без сети. data_dir — для тестов."""
     import shutil
@@ -315,7 +315,8 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
         s = fresh_slice(cfg, now)
         track_q = {"ok": s["ok"], "date": s["date"], "age_days": s["age_days"]}
     steps = (("quality", quality_exit), ("scan", scan_exit), ("sync", sync_exit),
-             ("watch", watch_exit), ("execute", exec_exit), ("report", report_exit),
+             ("watch", watch_exit), ("execute", exec_exit), ("demo", demo_exit),
+             ("report", report_exit),
              ("backup", backup_exit))
     try:
         disk_free = shutil.disk_usage(Path(db).resolve().parent).free
@@ -341,7 +342,18 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
             # пробный исполнитель: книги R/H и действия за сегодня (таблиц нет — None)
             "executor": _executor_state(cfg, now),
             # EXIT_NODATA — не падение: пары без данных Bybit в блоке исполнителя
-            "exec_fail": bool(exec_exit) and exec_exit != EXIT_NODATA}
+            "exec_fail": bool(exec_exit) and exec_exit != EXIT_NODATA,
+            # демо-счёт Bybit (блок F): книги, действия за сутки, ключ (таблиц нет — None)
+            "demo": _demo_state(cfg, now), "demo_fail": bool(demo_exit)}
+
+
+def _demo_state(cfg, now: float) -> dict | None:
+    try:
+        from .. import demo
+        return demo.brief_state(cfg, now)
+    except Exception as e:  # noqa: BLE001 — сбой блока не должен съесть сводку дня
+        print(f"[brief] блок демо-счёта пропущен: {type(e).__name__}: {e}")
+        return None
 
 
 def _executor_state(cfg, now: float) -> dict | None:
