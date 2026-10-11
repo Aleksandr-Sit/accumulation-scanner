@@ -7,7 +7,8 @@
 #   2. клонирует репозиторий в рабочий каталог и копирует туда базу (sqlite backup, источник
 #      открывается только на чтение) и кэши — боевая scanner.db и рабочая копия кода не
 #      меняются, исследования пишут *_results.json только в клон;
-#   3. по очереди: ladder_dca_study, junk_filter_study, portfolio_vs_market,
+#   3. по очереди: ladder_dca_study, junk_filter_study, portfolio_vs_market, top20_basket_study
+#      (снимки CMC — .cache/cmc_hist, новые месяцы докачает сам),
 #      market_regime_study, hold_stop_study, score_quintiles — лог каждого в logs/;
 #   4. сравнивает новые *_results.json с теми, что лежат в репозитории
 #      (backtest/compare_results.py) -> summary.txt.
@@ -100,7 +101,7 @@ log "--- 2. клон репозитория и копия базы"
 rm -rf "$work/repo"
 git -c core.longpaths=true clone -q "$src" "$work/repo" || { log "  ⚠ git clone не прошёл"; exit 1; }
 mkdir -p "$work/repo/.cache"
-for c in binance_1d_full binance_1d; do
+for c in binance_1d_full binance_1d cmc_hist; do
     [ -d "$src/.cache/$c" ] && cp -r "$src/.cache/$c" "$work/repo/.cache/"
 done
 "$py" - "$db" "$work/repo/scanner.db" <<'EOF' || { log "  ⚠ копия базы не снята"; exit 1; }
@@ -113,7 +114,7 @@ EOF
 log "  клон $(git -C "$work/repo" rev-parse --short HEAD), база скопирована ($(du -h "$work/repo/scanner.db" | cut -f1))"
 
 # ---- 3. исследования
-studies="${only:-ladder_dca_study junk_filter_study portfolio_vs_market market_regime_study hold_stop_study score_quintiles}"
+studies="${only:-ladder_dca_study junk_filter_study portfolio_vs_market top20_basket_study market_regime_study hold_stop_study score_quintiles}"
 fail=0
 log "--- 3. исследования: $studies"
 for s in $studies; do
