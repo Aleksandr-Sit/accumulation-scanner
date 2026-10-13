@@ -1,0 +1,3346 @@
+{
+ "meta": {
+  "first": "2018-01-07",
+  "last": "2026-09-06",
+  "archive_last_day": 1790553600,
+  "fee": 0.0015,
+  "seeds": 30,
+  "compositions": [
+   {
+    "date": "2018-01-07",
+    "coins": [
+     "BCH",
+     "LTC",
+     "NEO",
+     "BNB"
+    ]
+   },
+   {
+    "date": "2018-02-04",
+    "coins": [
+     "BCH",
+     "LTC",
+     "NEO",
+     "BNB"
+    ]
+   },
+   {
+    "date": "2018-03-04",
+    "coins": [
+     "BCH",
+     "LTC",
+     "NEO",
+     "BNB"
+    ]
+   },
+   {
+    "date": "2018-04-01",
+    "coins": [
+     "BCH",
+     "LTC",
+     "NEO",
+     "BNB",
+     "QTUM"
+    ]
+   },
+   {
+    "date": "2018-05-06",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "ADA",
+     "NEO",
+     "QTUM",
+     "BNB"
+    ]
+   },
+   {
+    "date": "2018-06-03",
+    "coins": [
+     "XRP",
+     "BCH",
+     "EOS",
+     "LTC",
+     "ADA",
+     "XLM",
+     "MIOTA",
+     "NEO",
+     "BNB",
+     "QTUM"
+    ]
+   },
+   {
+    "date": "2018-07-01",
+    "coins": [
+     "XRP",
+     "BCH",
+     "EOS",
+     "LTC",
+     "XLM",
+     "ADA",
+     "MIOTA",
+     "TRX",
+     "NEO",
+     "BNB",
+     "ETC",
+     "VEN",
+     "ONT",
+     "QTUM",
+     "ICX"
+    ]
+   },
+   {
+    "date": "2018-08-05",
+    "coins": [
+     "XRP",
+     "BCH",
+     "EOS",
+     "XLM",
+     "LTC",
+     "ADA",
+     "MIOTA",
+     "TRX",
+     "ETC",
+     "NEO",
+     "BNB",
+     "VET",
+     "QTUM",
+     "ICX",
+     "ONT"
+    ]
+   },
+   {
+    "date": "2018-09-02",
+    "coins": [
+     "XRP",
+     "BCH",
+     "EOS",
+     "XLM",
+     "LTC",
+     "ADA",
+     "MIOTA",
+     "TRX",
+     "NEO",
+     "ETC",
+     "BNB",
+     "VET",
+     "ONT",
+     "QTUM",
+     "ICX"
+    ]
+   },
+   {
+    "date": "2018-10-07",
+    "coins": [
+     "XRP",
+     "BCH",
+     "EOS",
+     "XLM",
+     "LTC",
+     "ADA",
+     "TRX",
+     "MIOTA",
+     "BNB",
+     "NEO",
+     "ETC",
+     "VET",
+     "ONT",
+     "QTUM",
+     "ICX"
+    ]
+   },
+   {
+    "date": "2018-11-04",
+    "coins": [
+     "XRP",
+     "BCH",
+     "EOS",
+     "XLM",
+     "LTC",
+     "ADA",
+     "TRX",
+     "MIOTA",
+     "BNB",
+     "NEO",
+     "ETC",
+     "VET",
+     "ONT",
+     "QTUM",
+     "ICX"
+    ]
+   },
+   {
+    "date": "2018-12-02",
+    "coins": [
+     "XRP",
+     "XLM",
+     "BCH",
+     "EOS",
+     "LTC",
+     "BSV",
+     "ADA",
+     "TRX",
+     "MIOTA",
+     "BNB",
+     "ETC",
+     "NEO",
+     "VET",
+     "ONT",
+     "QTUM",
+     "ICX"
+    ]
+   },
+   {
+    "date": "2019-01-06",
+    "coins": [
+     "XRP",
+     "BCH",
+     "EOS",
+     "LTC",
+     "XLM",
+     "BSV",
+     "TRX",
+     "ADA",
+     "MIOTA",
+     "BNB",
+     "ETC",
+     "NEO",
+     "VET",
+     "QTUM",
+     "ONT",
+     "ICX"
+    ]
+   },
+   {
+    "date": "2019-02-03",
+    "coins": [
+     "XRP",
+     "EOS",
+     "BCH",
+     "LTC",
+     "TRX",
+     "XLM",
+     "BSV",
+     "ADA",
+     "BNB",
+     "MIOTA",
+     "NEO",
+     "ETC",
+     "WAVES",
+     "VET",
+     "ONT",
+     "QTUM",
+     "LINK",
+     "ICX"
+    ]
+   },
+   {
+    "date": "2019-03-03",
+    "coins": [
+     "XRP",
+     "EOS",
+     "LTC",
+     "BCH",
+     "XLM",
+     "BNB",
+     "TRX",
+     "BSV",
+     "ADA",
+     "MIOTA",
+     "NEO",
+     "ETC",
+     "ONT",
+     "WAVES",
+     "VET",
+     "QTUM",
+     "LINK",
+     "HOT",
+     "ZRX",
+     "ZIL"
+    ]
+   },
+   {
+    "date": "2019-04-07",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "EOS",
+     "BNB",
+     "XLM",
+     "ADA",
+     "TRX",
+     "BSV",
+     "DASH",
+     "XMR",
+     "MIOTA",
+     "ETC",
+     "NEO",
+     "ONT",
+     "ZEC",
+     "VET",
+     "BAT",
+     "OMG",
+     "QTUM"
+    ]
+   },
+   {
+    "date": "2019-05-05",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "EOS",
+     "BNB",
+     "XLM",
+     "ADA",
+     "TRX",
+     "XMR",
+     "DASH",
+     "ATOM",
+     "MIOTA",
+     "ETC",
+     "NEO",
+     "ONT",
+     "BAT",
+     "ZEC",
+     "VET",
+     "OMG",
+     "QTUM"
+    ]
+   },
+   {
+    "date": "2019-06-02",
+    "coins": [
+     "XRP",
+     "BCH",
+     "EOS",
+     "LTC",
+     "BNB",
+     "XLM",
+     "TRX",
+     "ADA",
+     "XMR",
+     "DASH",
+     "MIOTA",
+     "ATOM",
+     "ETC",
+     "NEO",
+     "ONT",
+     "ZEC",
+     "BAT",
+     "VET",
+     "LINK",
+     "BTT"
+    ]
+   },
+   {
+    "date": "2019-07-07",
+    "coins": [
+     "XRP",
+     "LTC",
+     "BCH",
+     "EOS",
+     "BNB",
+     "TRX",
+     "ADA",
+     "XLM",
+     "XMR",
+     "DASH",
+     "NEO",
+     "LINK",
+     "MIOTA",
+     "ATOM",
+     "ETC",
+     "ZEC",
+     "ONT",
+     "QTUM",
+     "DOGE",
+     "VET"
+    ]
+   },
+   {
+    "date": "2019-08-04",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "BNB",
+     "EOS",
+     "XLM",
+     "XMR",
+     "TRX",
+     "ADA",
+     "DASH",
+     "LINK",
+     "NEO",
+     "MIOTA",
+     "ETC",
+     "ATOM",
+     "ONT",
+     "ZEC",
+     "DOGE",
+     "BAT",
+     "VET"
+    ]
+   },
+   {
+    "date": "2019-09-01",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "BNB",
+     "EOS",
+     "XMR",
+     "XLM",
+     "ADA",
+     "TRX",
+     "DASH",
+     "ETC",
+     "MIOTA",
+     "LINK",
+     "NEO",
+     "ATOM",
+     "ONT",
+     "ZEC",
+     "DOGE",
+     "BAT",
+     "VET"
+    ]
+   },
+   {
+    "date": "2019-10-06",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "EOS",
+     "BNB",
+     "XLM",
+     "ADA",
+     "TRX",
+     "XMR",
+     "LINK",
+     "MIOTA",
+     "DASH",
+     "XTZ",
+     "ETC",
+     "NEO",
+     "ATOM",
+     "ONT",
+     "DOGE",
+     "ZEC",
+     "BAT"
+    ]
+   },
+   {
+    "date": "2019-11-03",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "BNB",
+     "EOS",
+     "XLM",
+     "TRX",
+     "XMR",
+     "ADA",
+     "LINK",
+     "NEO",
+     "MIOTA",
+     "DASH",
+     "ATOM",
+     "XTZ",
+     "ETC",
+     "ONT",
+     "DOGE",
+     "BAT",
+     "ZEC"
+    ]
+   },
+   {
+    "date": "2019-12-01",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "EOS",
+     "BNB",
+     "XLM",
+     "TRX",
+     "ADA",
+     "XMR",
+     "XTZ",
+     "LINK",
+     "ATOM",
+     "NEO",
+     "MIOTA",
+     "DASH",
+     "ETC",
+     "ONT",
+     "VET",
+     "DOGE",
+     "BAT"
+    ]
+   },
+   {
+    "date": "2020-01-05",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "EOS",
+     "BNB",
+     "XMR",
+     "XLM",
+     "TRX",
+     "ADA",
+     "XTZ",
+     "ATOM",
+     "NEO",
+     "LINK",
+     "ETC",
+     "MIOTA",
+     "DASH",
+     "ONT",
+     "VET",
+     "DOGE",
+     "BAT"
+    ]
+   },
+   {
+    "date": "2020-02-02",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "EOS",
+     "BNB",
+     "ADA",
+     "XTZ",
+     "ETC",
+     "XMR",
+     "TRX",
+     "XLM",
+     "DASH",
+     "LINK",
+     "MIOTA",
+     "NEO",
+     "ATOM",
+     "ZEC",
+     "ONT",
+     "VET",
+     "BAT"
+    ]
+   },
+   {
+    "date": "2020-03-01",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "EOS",
+     "BNB",
+     "XTZ",
+     "LINK",
+     "ADA",
+     "XLM",
+     "XMR",
+     "TRX",
+     "ETC",
+     "NEO",
+     "DASH",
+     "ATOM",
+     "MIOTA",
+     "ZEC",
+     "ONT",
+     "BAT",
+     "VET"
+    ]
+   },
+   {
+    "date": "2020-04-05",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "EOS",
+     "BNB",
+     "XTZ",
+     "XMR",
+     "XLM",
+     "TRX",
+     "ADA",
+     "LINK",
+     "DASH",
+     "ETC",
+     "NEO",
+     "MIOTA",
+     "ATOM",
+     "ZEC",
+     "ONT",
+     "FTT",
+     "DOGE"
+    ]
+   },
+   {
+    "date": "2020-05-03",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "BNB",
+     "EOS",
+     "XTZ",
+     "XLM",
+     "LINK",
+     "ADA",
+     "XMR",
+     "TRX",
+     "ETC",
+     "DASH",
+     "NEO",
+     "ATOM",
+     "MIOTA",
+     "ZEC",
+     "ONT",
+     "DOGE",
+     "FTT"
+    ]
+   },
+   {
+    "date": "2020-06-07",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "BNB",
+     "EOS",
+     "ADA",
+     "XTZ",
+     "XLM",
+     "LINK",
+     "TRX",
+     "XMR",
+     "NEO",
+     "ETC",
+     "DASH",
+     "MIOTA",
+     "ATOM",
+     "ZEC",
+     "VET",
+     "ONT",
+     "BAT"
+    ]
+   },
+   {
+    "date": "2020-07-05",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "ADA",
+     "BNB",
+     "EOS",
+     "XTZ",
+     "LINK",
+     "XLM",
+     "TRX",
+     "XMR",
+     "VET",
+     "NEO",
+     "ETC",
+     "MIOTA",
+     "DASH",
+     "ATOM",
+     "COMP",
+     "ZEC",
+     "ONT"
+    ]
+   },
+   {
+    "date": "2020-08-02",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LTC",
+     "ADA",
+     "BNB",
+     "LINK",
+     "EOS",
+     "XTZ",
+     "XLM",
+     "XMR",
+     "TRX",
+     "VET",
+     "NEO",
+     "ETC",
+     "DASH",
+     "ZEC",
+     "MIOTA",
+     "ATOM",
+     "MKR",
+     "ONT"
+    ]
+   },
+   {
+    "date": "2020-09-06",
+    "coins": [
+     "XRP",
+     "LINK",
+     "BCH",
+     "DOT",
+     "BNB",
+     "LTC",
+     "EOS",
+     "ADA",
+     "TRX",
+     "XTZ",
+     "XLM",
+     "XMR",
+     "NEO",
+     "ATOM",
+     "MIOTA",
+     "LEND",
+     "YFI",
+     "VET",
+     "DASH",
+     "ETC"
+    ]
+   },
+   {
+    "date": "2020-10-04",
+    "coins": [
+     "XRP",
+     "BNB",
+     "BCH",
+     "LINK",
+     "DOT",
+     "LTC",
+     "ADA",
+     "EOS",
+     "TRX",
+     "XMR",
+     "XTZ",
+     "XLM",
+     "NEO",
+     "ATOM",
+     "UNI",
+     "THETA",
+     "MIOTA",
+     "VET",
+     "ZEC",
+     "DASH"
+    ]
+   },
+   {
+    "date": "2020-11-01",
+    "coins": [
+     "XRP",
+     "BCH",
+     "LINK",
+     "BNB",
+     "LTC",
+     "DOT",
+     "ADA",
+     "EOS",
+     "XMR",
+     "TRX",
+     "XLM",
+     "XTZ",
+     "NEO",
+     "ATOM",
+     "FIL",
+     "MIOTA",
+     "VET",
+     "DASH",
+     "THETA",
+     "ETC"
+    ]
+   },
+   {
+    "date": "2020-12-06",
+    "coins": [
+     "XRP",
+     "LTC",
+     "LINK",
+     "BCH",
+     "ADA",
+     "DOT",
+     "BNB",
+     "XLM",
+     "EOS",
+     "XMR",
+     "XEM",
+     "TRX",
+     "XTZ",
+     "FIL",
+     "NEO",
+     "VET",
+     "ATOM",
+     "AAVE",
+     "DASH",
+     "MIOTA"
+    ]
+   },
+   {
+    "date": "2021-01-03",
+    "coins": [
+     "LTC",
+     "XRP",
+     "DOT",
+     "BCH",
+     "ADA",
+     "BNB",
+     "LINK",
+     "XLM",
+     "EOS",
+     "XMR",
+     "THETA",
+     "TRX",
+     "XEM",
+     "VET",
+     "XTZ",
+     "UNI",
+     "DOGE",
+     "ATOM",
+     "NEO",
+     "AAVE"
+    ]
+   },
+   {
+    "date": "2021-02-07",
+    "coins": [
+     "ADA",
+     "XRP",
+     "DOT",
+     "BNB",
+     "LINK",
+     "LTC",
+     "DOGE",
+     "XLM",
+     "BCH",
+     "AAVE",
+     "UNI",
+     "EOS",
+     "ATOM",
+     "XEM",
+     "XMR",
+     "TRX",
+     "XTZ",
+     "MKR",
+     "EGLD",
+     "SNX"
+    ]
+   },
+   {
+    "date": "2021-03-07",
+    "coins": [
+     "BNB",
+     "ADA",
+     "DOT",
+     "XRP",
+     "UNI",
+     "LTC",
+     "LINK",
+     "BCH",
+     "XLM",
+     "DOGE",
+     "XEM",
+     "AAVE",
+     "THETA",
+     "ATOM",
+     "XMR",
+     "TRX",
+     "EOS",
+     "MIOTA",
+     "VET",
+     "SOL"
+    ]
+   },
+   {
+    "date": "2021-04-04",
+    "coins": [
+     "BNB",
+     "DOT",
+     "ADA",
+     "XRP",
+     "UNI",
+     "LTC",
+     "LINK",
+     "THETA",
+     "FIL",
+     "BTT",
+     "BCH",
+     "XLM",
+     "TRX",
+     "DOGE",
+     "LUNA",
+     "SOL",
+     "VET",
+     "EOS",
+     "AAVE",
+     "XMR"
+    ]
+   },
+   {
+    "date": "2021-05-02",
+    "coins": [
+     "BNB",
+     "XRP",
+     "DOGE",
+     "ADA",
+     "DOT",
+     "UNI",
+     "BCH",
+     "LTC",
+     "LINK",
+     "VET",
+     "XLM",
+     "SOL",
+     "FIL",
+     "THETA",
+     "TRX",
+     "NEO",
+     "XMR",
+     "LUNA",
+     "CAKE",
+     "EOS"
+    ]
+   },
+   {
+    "date": "2021-06-06",
+    "coins": [
+     "BNB",
+     "ADA",
+     "DOGE",
+     "XRP",
+     "DOT",
+     "UNI",
+     "ICP",
+     "BCH",
+     "LINK",
+     "LTC",
+     "SOL",
+     "MATIC",
+     "XLM",
+     "THETA",
+     "VET",
+     "ETC",
+     "FIL",
+     "EOS",
+     "TRX",
+     "XMR"
+    ]
+   },
+   {
+    "date": "2021-07-04",
+    "coins": [
+     "BNB",
+     "ADA",
+     "DOGE",
+     "XRP",
+     "DOT",
+     "UNI",
+     "BCH",
+     "LTC",
+     "SOL",
+     "LINK",
+     "MATIC",
+     "ETC",
+     "THETA",
+     "ICP",
+     "XLM",
+     "VET",
+     "FIL",
+     "TRX",
+     "XMR",
+     "EOS"
+    ]
+   },
+   {
+    "date": "2021-08-01",
+    "coins": [
+     "BNB",
+     "ADA",
+     "XRP",
+     "DOGE",
+     "DOT",
+     "UNI",
+     "BCH",
+     "LINK",
+     "LTC",
+     "SOL",
+     "MATIC",
+     "ETC",
+     "XLM",
+     "THETA",
+     "ICP",
+     "VET",
+     "FIL",
+     "LUNA",
+     "TRX",
+     "XMR"
+    ]
+   },
+   {
+    "date": "2021-09-05",
+    "coins": [
+     "ADA",
+     "BNB",
+     "XRP",
+     "SOL",
+     "DOGE",
+     "DOT",
+     "UNI",
+     "LTC",
+     "LINK",
+     "BCH",
+     "LUNA",
+     "ICP",
+     "FIL",
+     "MATIC",
+     "AVAX",
+     "VET",
+     "ETC",
+     "XLM",
+     "THETA",
+     "TRX"
+    ]
+   },
+   {
+    "date": "2021-10-03",
+    "coins": [
+     "BNB",
+     "ADA",
+     "SOL",
+     "XRP",
+     "DOT",
+     "DOGE",
+     "LUNA",
+     "UNI",
+     "AVAX",
+     "LINK",
+     "ALGO",
+     "LTC",
+     "BCH",
+     "MATIC",
+     "ATOM",
+     "ICP",
+     "AXS",
+     "XTZ",
+     "FIL",
+     "XLM"
+    ]
+   },
+   {
+    "date": "2021-11-07",
+    "coins": [
+     "BNB",
+     "SOL",
+     "ADA",
+     "XRP",
+     "DOT",
+     "DOGE",
+     "SHIB",
+     "LUNA",
+     "AVAX",
+     "UNI",
+     "LINK",
+     "LTC",
+     "MATIC",
+     "ALGO",
+     "BCH",
+     "VET",
+     "AXS",
+     "ICP",
+     "XLM",
+     "ATOM"
+    ]
+   },
+   {
+    "date": "2021-12-05",
+    "coins": [
+     "BNB",
+     "SOL",
+     "ADA",
+     "XRP",
+     "DOT",
+     "LUNA",
+     "DOGE",
+     "AVAX",
+     "SHIB",
+     "MATIC",
+     "ALGO",
+     "LTC",
+     "UNI",
+     "LINK",
+     "BCH",
+     "TRX",
+     "XLM",
+     "MANA",
+     "AXS",
+     "FTT"
+    ]
+   },
+   {
+    "date": "2022-01-02",
+    "coins": [
+     "BNB",
+     "SOL",
+     "ADA",
+     "XRP",
+     "LUNA",
+     "DOT",
+     "AVAX",
+     "DOGE",
+     "SHIB",
+     "MATIC",
+     "UNI",
+     "ALGO",
+     "LTC",
+     "LINK",
+     "NEAR",
+     "BCH",
+     "ATOM",
+     "TRX",
+     "XLM",
+     "FTM"
+    ]
+   },
+   {
+    "date": "2022-02-06",
+    "coins": [
+     "BNB",
+     "ADA",
+     "SOL",
+     "XRP",
+     "LUNA",
+     "DOT",
+     "DOGE",
+     "AVAX",
+     "SHIB",
+     "MATIC",
+     "ATOM",
+     "LTC",
+     "NEAR",
+     "LINK",
+     "UNI",
+     "TRX",
+     "ALGO",
+     "FTT",
+     "BCH",
+     "MANA"
+    ]
+   },
+   {
+    "date": "2022-03-06",
+    "coins": [
+     "BNB",
+     "XRP",
+     "LUNA",
+     "ADA",
+     "SOL",
+     "AVAX",
+     "DOT",
+     "DOGE",
+     "SHIB",
+     "MATIC",
+     "ATOM",
+     "LTC",
+     "NEAR",
+     "LINK",
+     "TRX",
+     "UNI",
+     "FTT",
+     "BCH",
+     "ALGO",
+     "MANA"
+    ]
+   },
+   {
+    "date": "2022-04-03",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "ADA",
+     "LUNA",
+     "AVAX",
+     "DOT",
+     "DOGE",
+     "SHIB",
+     "MATIC",
+     "NEAR",
+     "ATOM",
+     "LTC",
+     "LINK",
+     "UNI",
+     "TRX",
+     "BCH",
+     "FTT",
+     "ETC",
+     "ALGO"
+    ]
+   },
+   {
+    "date": "2022-05-01",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "LUNA",
+     "ADA",
+     "DOGE",
+     "AVAX",
+     "DOT",
+     "SHIB",
+     "MATIC",
+     "NEAR",
+     "TRX",
+     "LTC",
+     "BCH",
+     "FTT",
+     "LINK",
+     "ATOM",
+     "UNI",
+     "APE",
+     "XLM"
+    ]
+   },
+   {
+    "date": "2022-06-05",
+    "coins": [
+     "BNB",
+     "ADA",
+     "XRP",
+     "SOL",
+     "DOGE",
+     "DOT",
+     "TRX",
+     "AVAX",
+     "SHIB",
+     "MATIC",
+     "LTC",
+     "NEAR",
+     "UNI",
+     "XLM",
+     "LINK",
+     "FTT",
+     "BCH",
+     "XMR",
+     "ETC",
+     "ALGO"
+    ]
+   },
+   {
+    "date": "2022-07-03",
+    "coins": [
+     "BNB",
+     "XRP",
+     "ADA",
+     "SOL",
+     "DOGE",
+     "DOT",
+     "TRX",
+     "SHIB",
+     "AVAX",
+     "MATIC",
+     "UNI",
+     "LTC",
+     "FTT",
+     "LINK",
+     "XLM",
+     "NEAR",
+     "ATOM",
+     "ALGO",
+     "XMR",
+     "BCH"
+    ]
+   },
+   {
+    "date": "2022-08-07",
+    "coins": [
+     "BNB",
+     "XRP",
+     "ADA",
+     "SOL",
+     "DOT",
+     "DOGE",
+     "AVAX",
+     "MATIC",
+     "SHIB",
+     "UNI",
+     "TRX",
+     "ETC",
+     "LTC",
+     "FTT",
+     "LINK",
+     "NEAR",
+     "ATOM",
+     "XLM",
+     "XMR",
+     "FLOW"
+    ]
+   },
+   {
+    "date": "2022-09-04",
+    "coins": [
+     "BNB",
+     "ADA",
+     "XRP",
+     "SOL",
+     "DOGE",
+     "DOT",
+     "MATIC",
+     "SHIB",
+     "TRX",
+     "AVAX",
+     "UNI",
+     "ETC",
+     "LTC",
+     "ATOM",
+     "FTT",
+     "LINK",
+     "NEAR",
+     "XMR",
+     "XLM",
+     "BCH"
+    ]
+   },
+   {
+    "date": "2022-10-02",
+    "coins": [
+     "BNB",
+     "XRP",
+     "ADA",
+     "SOL",
+     "DOGE",
+     "DOT",
+     "MATIC",
+     "SHIB",
+     "TRX",
+     "AVAX",
+     "UNI",
+     "LTC",
+     "ETC",
+     "LINK",
+     "ATOM",
+     "FTT",
+     "XLM",
+     "NEAR",
+     "XMR",
+     "ALGO"
+    ]
+   },
+   {
+    "date": "2022-11-06",
+    "coins": [
+     "BNB",
+     "XRP",
+     "DOGE",
+     "ADA",
+     "SOL",
+     "MATIC",
+     "DOT",
+     "SHIB",
+     "TRX",
+     "AVAX",
+     "UNI",
+     "LTC",
+     "ATOM",
+     "LINK",
+     "ETC",
+     "FTT",
+     "ALGO",
+     "XMR",
+     "XLM",
+     "NEAR"
+    ]
+   },
+   {
+    "date": "2022-12-04",
+    "coins": [
+     "BNB",
+     "XRP",
+     "DOGE",
+     "ADA",
+     "MATIC",
+     "DOT",
+     "LTC",
+     "SHIB",
+     "SOL",
+     "TRX",
+     "UNI",
+     "AVAX",
+     "LINK",
+     "ATOM",
+     "ETC",
+     "XMR",
+     "XLM",
+     "BCH",
+     "ALGO",
+     "QNT"
+    ]
+   },
+   {
+    "date": "2023-01-01",
+    "coins": [
+     "BNB",
+     "XRP",
+     "DOGE",
+     "ADA",
+     "MATIC",
+     "LTC",
+     "TRX",
+     "DOT",
+     "SHIB",
+     "UNI",
+     "SOL",
+     "AVAX",
+     "LINK",
+     "XMR",
+     "ATOM",
+     "ETC",
+     "XLM",
+     "BCH",
+     "APE",
+     "QNT"
+    ]
+   },
+   {
+    "date": "2023-02-05",
+    "coins": [
+     "BNB",
+     "XRP",
+     "ADA",
+     "DOGE",
+     "MATIC",
+     "SOL",
+     "SHIB",
+     "DOT",
+     "LTC",
+     "AVAX",
+     "TRX",
+     "UNI",
+     "ATOM",
+     "LINK",
+     "ETC",
+     "XMR",
+     "BCH",
+     "APT",
+     "XLM",
+     "APE"
+    ]
+   },
+   {
+    "date": "2023-03-05",
+    "coins": [
+     "BNB",
+     "XRP",
+     "ADA",
+     "DOGE",
+     "MATIC",
+     "SOL",
+     "DOT",
+     "LTC",
+     "TRX",
+     "SHIB",
+     "AVAX",
+     "UNI",
+     "LINK",
+     "ATOM",
+     "ETC",
+     "XMR",
+     "FIL",
+     "BCH",
+     "LDO",
+     "XLM"
+    ]
+   },
+   {
+    "date": "2023-04-02",
+    "coins": [
+     "BNB",
+     "XRP",
+     "ADA",
+     "DOGE",
+     "MATIC",
+     "SOL",
+     "DOT",
+     "LTC",
+     "SHIB",
+     "TRX",
+     "AVAX",
+     "LINK",
+     "UNI",
+     "ATOM",
+     "XMR",
+     "ETC",
+     "XLM",
+     "BCH",
+     "FIL",
+     "HBAR"
+    ]
+   },
+   {
+    "date": "2023-05-07",
+    "coins": [
+     "BNB",
+     "XRP",
+     "ADA",
+     "DOGE",
+     "MATIC",
+     "SOL",
+     "DOT",
+     "TRX",
+     "LTC",
+     "SHIB",
+     "AVAX",
+     "LINK",
+     "ATOM",
+     "UNI",
+     "XMR",
+     "ETC",
+     "XLM",
+     "ICP",
+     "BCH",
+     "FIL"
+    ]
+   },
+   {
+    "date": "2023-06-04",
+    "coins": [
+     "BNB",
+     "XRP",
+     "ADA",
+     "DOGE",
+     "SOL",
+     "MATIC",
+     "TRX",
+     "LTC",
+     "DOT",
+     "AVAX",
+     "SHIB",
+     "ATOM",
+     "LINK",
+     "UNI",
+     "XMR",
+     "ETC",
+     "XLM",
+     "BCH",
+     "ICP",
+     "LDO"
+    ]
+   },
+   {
+    "date": "2023-07-02",
+    "coins": [
+     "BNB",
+     "XRP",
+     "ADA",
+     "DOGE",
+     "LTC",
+     "SOL",
+     "TRX",
+     "DOT",
+     "MATIC",
+     "BCH",
+     "AVAX",
+     "SHIB",
+     "LINK",
+     "ATOM",
+     "UNI",
+     "XMR",
+     "XLM",
+     "ETC",
+     "LDO",
+     "ICP"
+    ]
+   },
+   {
+    "date": "2023-08-06",
+    "coins": [
+     "BNB",
+     "XRP",
+     "DOGE",
+     "ADA",
+     "SOL",
+     "TRX",
+     "MATIC",
+     "DOT",
+     "LTC",
+     "SHIB",
+     "AVAX",
+     "BCH",
+     "LINK",
+     "XLM",
+     "UNI",
+     "ATOM",
+     "XMR",
+     "ETC",
+     "HBAR",
+     "FIL"
+    ]
+   },
+   {
+    "date": "2023-09-03",
+    "coins": [
+     "BNB",
+     "XRP",
+     "ADA",
+     "DOGE",
+     "SOL",
+     "TRX",
+     "DOT",
+     "MATIC",
+     "LTC",
+     "SHIB",
+     "BCH",
+     "AVAX",
+     "XLM",
+     "LINK",
+     "XMR",
+     "UNI",
+     "ATOM",
+     "ETC",
+     "HBAR",
+     "ICP"
+    ]
+   },
+   {
+    "date": "2023-10-01",
+    "coins": [
+     "BNB",
+     "XRP",
+     "SOL",
+     "ADA",
+     "DOGE",
+     "TRX",
+     "MATIC",
+     "DOT",
+     "LTC",
+     "BCH",
+     "LINK",
+     "SHIB",
+     "AVAX",
+     "XLM",
+     "ATOM",
+     "XMR",
+     "UNI",
+     "ETC",
+     "HBAR",
+     "FIL"
+    ]
+   },
+   {
+    "date": "2023-11-05",
+    "coins": [
+     "BNB",
+     "XRP",
+     "SOL",
+     "ADA",
+     "DOGE",
+     "TRX",
+     "LINK",
+     "MATIC",
+     "DOT",
+     "LTC",
+     "SHIB",
+     "BCH",
+     "AVAX",
+     "XLM",
+     "ATOM",
+     "XMR",
+     "UNI",
+     "ETC",
+     "FIL",
+     "HBAR"
+    ]
+   },
+   {
+    "date": "2023-12-03",
+    "coins": [
+     "BNB",
+     "XRP",
+     "SOL",
+     "ADA",
+     "DOGE",
+     "TRX",
+     "LINK",
+     "AVAX",
+     "MATIC",
+     "DOT",
+     "LTC",
+     "SHIB",
+     "BCH",
+     "ATOM",
+     "UNI",
+     "XLM",
+     "XMR",
+     "ETC",
+     "RUNE",
+     "FIL"
+    ]
+   },
+   {
+    "date": "2024-01-07",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "ADA",
+     "AVAX",
+     "DOGE",
+     "TRX",
+     "DOT",
+     "MATIC",
+     "LINK",
+     "SHIB",
+     "ICP",
+     "LTC",
+     "BCH",
+     "ATOM",
+     "UNI",
+     "XLM",
+     "NEAR",
+     "INJ",
+     "OP"
+    ]
+   },
+   {
+    "date": "2024-02-04",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "ADA",
+     "AVAX",
+     "DOGE",
+     "LINK",
+     "TRX",
+     "DOT",
+     "MATIC",
+     "ICP",
+     "SHIB",
+     "LTC",
+     "BCH",
+     "ETC",
+     "UNI",
+     "ATOM",
+     "XLM",
+     "XMR",
+     "APT"
+    ]
+   },
+   {
+    "date": "2024-03-03",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "ADA",
+     "DOGE",
+     "AVAX",
+     "SHIB",
+     "DOT",
+     "TRX",
+     "LINK",
+     "MATIC",
+     "BCH",
+     "UNI",
+     "LTC",
+     "ICP",
+     "FIL",
+     "ETC",
+     "ATOM",
+     "NEAR",
+     "IMX"
+    ]
+   },
+   {
+    "date": "2024-04-07",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "DOGE",
+     "ADA",
+     "AVAX",
+     "SHIB",
+     "BCH",
+     "DOT",
+     "TRX",
+     "LINK",
+     "MATIC",
+     "ICP",
+     "LTC",
+     "NEAR",
+     "UNI",
+     "APT",
+     "ETC",
+     "STX",
+     "FIL"
+    ]
+   },
+   {
+    "date": "2024-05-05",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "DOGE",
+     "ADA",
+     "SHIB",
+     "AVAX",
+     "TRX",
+     "DOT",
+     "BCH",
+     "LINK",
+     "NEAR",
+     "MATIC",
+     "LTC",
+     "ICP",
+     "UNI",
+     "ETC",
+     "HBAR",
+     "APT",
+     "RNDR"
+    ]
+   },
+   {
+    "date": "2024-06-02",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "DOGE",
+     "ADA",
+     "SHIB",
+     "AVAX",
+     "LINK",
+     "DOT",
+     "TRX",
+     "BCH",
+     "NEAR",
+     "MATIC",
+     "LTC",
+     "PEPE",
+     "UNI",
+     "ICP",
+     "ETC",
+     "APT",
+     "RNDR"
+    ]
+   },
+   {
+    "date": "2024-07-07",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "DOGE",
+     "ADA",
+     "TRX",
+     "AVAX",
+     "SHIB",
+     "DOT",
+     "LINK",
+     "BCH",
+     "NEAR",
+     "MATIC",
+     "LTC",
+     "UNI",
+     "PEPE",
+     "ICP",
+     "ETC",
+     "FET",
+     "APT"
+    ]
+   },
+   {
+    "date": "2024-08-04",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "DOGE",
+     "ADA",
+     "TRX",
+     "AVAX",
+     "SHIB",
+     "DOT",
+     "LINK",
+     "BCH",
+     "LTC",
+     "NEAR",
+     "MATIC",
+     "UNI",
+     "ICP",
+     "PEPE",
+     "ETC",
+     "XLM",
+     "APT"
+    ]
+   },
+   {
+    "date": "2024-09-01",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "DOGE",
+     "TRX",
+     "TON",
+     "ADA",
+     "AVAX",
+     "SHIB",
+     "LINK",
+     "BCH",
+     "DOT",
+     "LTC",
+     "NEAR",
+     "MATIC",
+     "UNI",
+     "ICP",
+     "PEPE",
+     "APT",
+     "FET"
+    ]
+   },
+   {
+    "date": "2024-10-06",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "DOGE",
+     "TON",
+     "TRX",
+     "ADA",
+     "AVAX",
+     "SHIB",
+     "LINK",
+     "BCH",
+     "DOT",
+     "NEAR",
+     "SUI",
+     "LTC",
+     "TAO",
+     "APT",
+     "PEPE",
+     "UNI",
+     "ICP"
+    ]
+   },
+   {
+    "date": "2024-11-03",
+    "coins": [
+     "BNB",
+     "SOL",
+     "XRP",
+     "DOGE",
+     "TRX",
+     "TON",
+     "ADA",
+     "SHIB",
+     "AVAX",
+     "LINK",
+     "BCH",
+     "DOT",
+     "SUI",
+     "LTC",
+     "NEAR",
+     "APT",
+     "UNI",
+     "PEPE",
+     "ICP",
+     "TAO"
+    ]
+   },
+   {
+    "date": "2024-12-01",
+    "coins": [
+     "XRP",
+     "SOL",
+     "BNB",
+     "DOGE",
+     "ADA",
+     "AVAX",
+     "SHIB",
+     "TRX",
+     "TON",
+     "XLM",
+     "DOT",
+     "LINK",
+     "BCH",
+     "SUI",
+     "PEPE",
+     "LTC",
+     "NEAR",
+     "HBAR",
+     "UNI",
+     "APT"
+    ]
+   },
+   {
+    "date": "2025-01-05",
+    "coins": [
+     "XRP",
+     "SOL",
+     "BNB",
+     "DOGE",
+     "ADA",
+     "TRX",
+     "AVAX",
+     "SUI",
+     "LINK",
+     "TON",
+     "SHIB",
+     "XLM",
+     "DOT",
+     "HBAR",
+     "BCH",
+     "UNI",
+     "LTC",
+     "PEPE",
+     "NEAR",
+     "ICP"
+    ]
+   },
+   {
+    "date": "2025-02-02",
+    "coins": [
+     "XRP",
+     "SOL",
+     "BNB",
+     "DOGE",
+     "ADA",
+     "TRX",
+     "LINK",
+     "AVAX",
+     "XLM",
+     "SUI",
+     "TON",
+     "HBAR",
+     "SHIB",
+     "LTC",
+     "DOT",
+     "BCH",
+     "UNI",
+     "OM",
+     "PEPE",
+     "NEAR"
+    ]
+   },
+   {
+    "date": "2025-03-02",
+    "coins": [
+     "XRP",
+     "SOL",
+     "BNB",
+     "ADA",
+     "DOGE",
+     "TRX",
+     "LINK",
+     "HBAR",
+     "XLM",
+     "AVAX",
+     "SUI",
+     "LTC",
+     "SHIB",
+     "TON",
+     "DOT",
+     "OM",
+     "BCH",
+     "UNI",
+     "NEAR",
+     "APT"
+    ]
+   },
+   {
+    "date": "2025-04-06",
+    "coins": [
+     "XRP",
+     "BNB",
+     "SOL",
+     "DOGE",
+     "TRX",
+     "ADA",
+     "LINK",
+     "TON",
+     "XLM",
+     "SHIB",
+     "AVAX",
+     "SUI",
+     "HBAR",
+     "DOT",
+     "OM",
+     "BCH",
+     "LTC",
+     "UNI",
+     "PEPE",
+     "APT"
+    ]
+   },
+   {
+    "date": "2025-05-04",
+    "coins": [
+     "XRP",
+     "BNB",
+     "SOL",
+     "DOGE",
+     "ADA",
+     "TRX",
+     "SUI",
+     "LINK",
+     "AVAX",
+     "XLM",
+     "TON",
+     "SHIB",
+     "HBAR",
+     "BCH",
+     "LTC",
+     "DOT",
+     "PEPE",
+     "APT",
+     "UNI",
+     "TAO"
+    ]
+   },
+   {
+    "date": "2025-06-01",
+    "coins": [
+     "XRP",
+     "BNB",
+     "SOL",
+     "DOGE",
+     "TRX",
+     "ADA",
+     "SUI",
+     "LINK",
+     "AVAX",
+     "XLM",
+     "BCH",
+     "TON",
+     "SHIB",
+     "HBAR",
+     "LTC",
+     "DOT",
+     "PEPE",
+     "UNI",
+     "AAVE",
+     "TAO"
+    ]
+   },
+   {
+    "date": "2025-07-06",
+    "coins": [
+     "XRP",
+     "BNB",
+     "SOL",
+     "TRX",
+     "DOGE",
+     "ADA",
+     "SUI",
+     "BCH",
+     "LINK",
+     "XLM",
+     "AVAX",
+     "TON",
+     "SHIB",
+     "HBAR",
+     "LTC",
+     "DOT",
+     "UNI",
+     "AAVE",
+     "PEPE",
+     "TAO"
+    ]
+   },
+   {
+    "date": "2025-08-03",
+    "coins": [
+     "XRP",
+     "BNB",
+     "SOL",
+     "TRX",
+     "DOGE",
+     "ADA",
+     "XLM",
+     "SUI",
+     "LINK",
+     "BCH",
+     "HBAR",
+     "AVAX",
+     "TON",
+     "LTC",
+     "SHIB",
+     "DOT",
+     "UNI",
+     "PEPE",
+     "AAVE",
+     "ENA"
+    ]
+   },
+   {
+    "date": "2025-09-07",
+    "coins": [
+     "XRP",
+     "BNB",
+     "SOL",
+     "DOGE",
+     "TRX",
+     "ADA",
+     "LINK",
+     "SUI",
+     "BCH",
+     "XLM",
+     "AVAX",
+     "HBAR",
+     "LTC",
+     "TON",
+     "SHIB",
+     "DOT",
+     "UNI",
+     "WLFI",
+     "ENA",
+     "AAVE"
+    ]
+   },
+   {
+    "date": "2025-10-05",
+    "coins": [
+     "XRP",
+     "BNB",
+     "SOL",
+     "DOGE",
+     "TRX",
+     "ADA",
+     "LINK",
+     "SUI",
+     "AVAX",
+     "XLM",
+     "BCH",
+     "HBAR",
+     "LTC",
+     "SHIB",
+     "TON",
+     "DOT",
+     "UNI",
+     "WLFI",
+     "AAVE",
+     "ENA"
+    ]
+   },
+   {
+    "date": "2025-11-02",
+    "coins": [
+     "XRP",
+     "BNB",
+     "SOL",
+     "DOGE",
+     "TRX",
+     "ADA",
+     "LINK",
+     "BCH",
+     "XLM",
+     "SUI",
+     "HBAR",
+     "AVAX",
+     "LTC",
+     "ZEC",
+     "SHIB",
+     "TON",
+     "TAO",
+     "DOT",
+     "UNI",
+     "AAVE"
+    ]
+   },
+   {
+    "date": "2025-12-07",
+    "coins": [
+     "XRP",
+     "BNB",
+     "SOL",
+     "TRX",
+     "DOGE",
+     "ADA",
+     "BCH",
+     "LINK",
+     "XLM",
+     "LTC",
+     "SUI",
+     "AVAX",
+     "ZEC",
+     "HBAR",
+     "SHIB",
+     "WLFI",
+     "TON",
+     "DOT",
+     "UNI",
+     "TAO"
+    ]
+   },
+   {
+    "date": "2026-01-04",
+    "coins": [
+     "XRP",
+     "BNB",
+     "SOL",
+     "TRX",
+     "DOGE",
+     "ADA",
+     "BCH",
+     "LINK",
+     "ZEC",
+     "XLM",
+     "SUI",
+     "LTC",
+     "AVAX",
+     "HBAR",
+     "SHIB",
+     "WLFI",
+     "TON",
+     "UNI",
+     "DOT",
+     "PEPE"
+    ]
+   },
+   {
+    "date": "2026-02-01",
+    "coins": [
+     "BNB",
+     "XRP",
+     "SOL",
+     "TRX",
+     "DOGE",
+     "BCH",
+     "ADA",
+     "LINK",
+     "XLM",
+     "ZEC",
+     "LTC",
+     "AVAX",
+     "SUI",
+     "SHIB",
+     "HBAR",
+     "WLFI",
+     "TON",
+     "DOT",
+     "UNI",
+     "TAO"
+    ]
+   },
+   {
+    "date": "2026-03-01",
+    "coins": [
+     "BNB",
+     "XRP",
+     "SOL",
+     "TRX",
+     "DOGE",
+     "ADA",
+     "BCH",
+     "LINK",
+     "XLM",
+     "HBAR",
+     "LTC",
+     "AVAX",
+     "ZEC",
+     "SUI",
+     "SHIB",
+     "WLFI",
+     "TON",
+     "DOT",
+     "UNI",
+     "TAO"
+    ]
+   },
+   {
+    "date": "2026-04-05",
+    "coins": [
+     "BNB",
+     "XRP",
+     "SOL",
+     "TRX",
+     "DOGE",
+     "ADA",
+     "BCH",
+     "LINK",
+     "XLM",
+     "LTC",
+     "ZEC",
+     "AVAX",
+     "HBAR",
+     "SHIB",
+     "SUI",
+     "TAO",
+     "TON",
+     "WLFI",
+     "DOT",
+     "UNI"
+    ]
+   },
+   {
+    "date": "2026-05-03",
+    "coins": [
+     "XRP",
+     "BNB",
+     "SOL",
+     "TRX",
+     "DOGE",
+     "ADA",
+     "BCH",
+     "ZEC",
+     "LINK",
+     "XLM",
+     "LTC",
+     "AVAX",
+     "HBAR",
+     "SUI",
+     "SHIB",
+     "TON",
+     "TAO",
+     "UNI",
+     "DOT",
+     "WLFI"
+    ]
+   },
+   {
+    "date": "2026-06-07",
+    "coins": [
+     "BNB",
+     "XRP",
+     "SOL",
+     "TRX",
+     "DOGE",
+     "ZEC",
+     "XLM",
+     "ADA",
+     "LINK",
+     "BCH",
+     "TON",
+     "HBAR",
+     "LTC",
+     "SUI",
+     "AVAX",
+     "SHIB",
+     "NEAR",
+     "TAO",
+     "WLFI",
+     "ONDO"
+    ]
+   },
+   {
+    "date": "2026-07-05",
+    "coins": [
+     "BNB",
+     "XRP",
+     "SOL",
+     "TRX",
+     "DOGE",
+     "ZEC",
+     "ADA",
+     "XLM",
+     "LINK",
+     "BCH",
+     "GRAM",
+     "LTC",
+     "HBAR",
+     "SUI",
+     "AVAX",
+     "NEAR",
+     "SHIB",
+     "TAO",
+     "DEXE",
+     "UNI"
+    ]
+   },
+   {
+    "date": "2026-08-02",
+    "coins": [
+     "BNB",
+     "XRP",
+     "SOL",
+     "TRX",
+     "DOGE",
+     "ZEC",
+     "ADA",
+     "LINK",
+     "XLM",
+     "BCH",
+     "GRAM",
+     "LTC",
+     "HBAR",
+     "SHIB",
+     "AVAX",
+     "SUI",
+     "UNI",
+     "NEAR",
+     "TAO",
+     "ONDO"
+    ]
+   },
+   {
+    "date": "2026-09-06",
+    "coins": [
+     "BNB",
+     "XRP",
+     "SOL",
+     "TRX",
+     "ZEC",
+     "DOGE",
+     "LINK",
+     "ADA",
+     "XLM",
+     "BCH",
+     "UNI",
+     "LTC",
+     "GRAM",
+     "HBAR",
+     "AVAX",
+     "SUI",
+     "SHIB",
+     "NEAR",
+     "TAO",
+     "ASTER"
+    ]
+   }
+  ]
+ },
+ "growth": {
+  "равн/мес": {
+   "marks": {
+    "всё время": -0.4197119742353068,
+    "2018-20": -0.8661107509081056,
+    "2020-22": 1.923011801010023,
+    "2023-26": 0.48274795732655207
+   },
+   "max_dd": -0.9130503925462328
+  },
+  "равн/кв": {
+   "marks": {
+    "всё время": -0.365691728252161,
+    "2018-20": -0.8764201809335285,
+    "2020-22": 2.1951383907068722,
+    "2023-26": 0.6064349582012794
+   },
+   "max_dd": -0.9192292775696888
+  },
+  "равн/год": {
+   "marks": {
+    "всё время": -0.18942301382041982,
+    "2018-20": -0.8522653724289472,
+    "2020-22": 1.8786239733853272,
+    "2023-26": 0.9060181397787384
+   },
+   "max_dd": -0.9034418994377347
+  },
+  "равн/ни разу": {
+   "marks": {
+    "всё время": 9.386465082321974,
+    "2018-20": -0.7315913664136411,
+    "2020-22": 11.71134289473378,
+    "2023-26": 2.0442467430133116
+   },
+   "max_dd": -0.8795863337303433
+  },
+  "кап/мес": {
+   "marks": {
+    "всё время": -0.3809258959297558,
+    "2018-20": -0.8830201118654228,
+    "2020-22": 1.2946766656442614,
+    "2023-26": 1.306268868898302
+   },
+   "max_dd": -0.9198048265530625
+  },
+  "кап/кв": {
+   "marks": {
+    "всё время": -0.34027181839754683,
+    "2018-20": -0.8869399077327063,
+    "2020-22": 1.4798347462746273,
+    "2023-26": 1.3530597755670883
+   },
+   "max_dd": -0.9224484286779403
+  },
+  "кап/год": {
+   "marks": {
+    "всё время": -0.39627462202046115,
+    "2018-20": -0.8868046988605734,
+    "2020-22": 1.1774599127994003,
+    "2023-26": 1.4494064917473173
+   },
+   "max_dd": -0.922355684542673
+  },
+  "кап/ни разу": {
+   "marks": {
+    "всё время": 0.23984330462035253,
+    "2018-20": -0.8266878158662712,
+    "2020-22": 2.0088327397095247,
+    "2023-26": 1.3776047493760095
+   },
+   "max_dd": -0.8646321429891248
+  },
+  "с ETH равн/мес": {
+   "marks": {
+    "всё время": -0.3090316494582225,
+    "2018-20": -0.8618944495337708,
+    "2020-22": 2.063523380505963,
+    "2023-26": 0.6331490506536035
+   },
+   "max_dd": -0.9122680316799622
+  },
+  "с ETH кап/мес": {
+   "marks": {
+    "всё время": 0.19035779441003298,
+    "2018-20": -0.8789718015265445,
+    "2020-22": 3.273921366548394,
+    "2023-26": 1.3012532967849522
+   },
+   "max_dd": -0.9207686105624371
+  },
+  "BTC": {
+   "marks": {
+    "всё время": 4.17026965274987,
+    "2018-20": -0.5886744482827586,
+    "2020-22": 1.5014225671843104,
+    "2023-26": 4.025050626626747
+   },
+   "max_dd": -0.801132257958654
+  },
+  "ETH": {
+   "marks": {
+    "всё время": 1.3940289736352387,
+    "2018-20": -0.8791815437765451,
+    "2020-22": 7.8461935293684135,
+    "2023-26": 1.2399570121798824
+   },
+   "max_dd": -0.9396550481981527
+  },
+  "альты": {
+   "marks": {
+    "всё время": 0.7134060994195739,
+    "2018-20": -0.8925248631028717,
+    "2020-22": 5.084147131242153,
+    "2023-26": 1.6203095137276482
+   },
+   "max_dd": -0.9220324251745662
+  }
+ },
+ "low_to_peak": {
+  "цикл 2018–22": {
+   "равн/мес": {
+    "mult": 28.045065353572696,
+    "low": "2020-03",
+    "peak": "2021-05"
+   },
+   "кап/мес": {
+    "mult": 18.806387128337068,
+    "low": "2020-03",
+    "peak": "2021-05"
+   },
+   "равн/год": {
+    "mult": 33.79664281764905,
+    "low": "2020-03",
+    "peak": "2021-05"
+   },
+   "кап/год": {
+    "mult": 20.504878809821665,
+    "low": "2020-03",
+    "peak": "2021-05"
+   },
+   "BTC": {
+    "mult": 21.024818477326793,
+    "low": "2018-12",
+    "peak": "2021-11"
+   },
+   "ETH": {
+    "mult": 57.401862464183374,
+    "low": "2018-12",
+    "peak": "2021-11"
+   },
+   "альты": {
+    "mult": 35.1998135105242,
+    "low": "2018-12",
+    "peak": "2021-11"
+   }
+  },
+  "цикл 2022–26": {
+   "равн/мес": {
+    "mult": 3.838727345064913,
+    "low": "2023-06",
+    "peak": "2024-12"
+   },
+   "кап/мес": {
+    "mult": 4.399932900524685,
+    "low": "2023-09",
+    "peak": "2024-12"
+   },
+   "равн/год": {
+    "mult": 4.547290875854708,
+    "low": "2022-12",
+    "peak": "2024-12"
+   },
+   "кап/год": {
+    "mult": 4.563945979992244,
+    "low": "2023-09",
+    "peak": "2024-12"
+   },
+   "BTC": {
+    "mult": 7.8991349883311175,
+    "low": "2022-11",
+    "peak": "2025-10"
+   },
+   "ETH": {
+    "mult": 4.855717343462663,
+    "low": "2022-06",
+    "peak": "2025-08"
+   },
+   "альты": {
+    "mult": 4.678512627141273,
+    "low": "2022-06",
+    "peak": "2024-12"
+   }
+  }
+ },
+ "rolling": {
+  "12": {
+   "равн/мес": {
+    "all": {
+     "n": 93,
+     "median": -0.020082794810182936,
+     "beat_BTC": 0.17204301075268819,
+     "beat_ETH": 0.23655913978494625,
+     "beat_альты": 0.10752688172043011,
+     "median_BTC": 0.4689019142773183,
+     "median_ETH": 0.2840407770640072,
+     "median_альты": -0.0017706052916200976
+    },
+    "since_2022_06": {
+     "n": 40,
+     "median": 0.08799945300940537,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.3,
+     "beat_альты": 0.125,
+     "median_BTC": 0.6410096333413522,
+     "median_ETH": 0.29981810830046096,
+     "median_альты": 0.2290533491270993
+    }
+   },
+   "равн/кв": {
+    "all": {
+     "n": 93,
+     "median": -0.04543035241254245,
+     "beat_BTC": 0.17204301075268819,
+     "beat_ETH": 0.26881720430107525,
+     "beat_альты": 0.12903225806451613,
+     "median_BTC": 0.4689019142773183,
+     "median_ETH": 0.2840407770640072,
+     "median_альты": -0.0017706052916200976
+    },
+    "since_2022_06": {
+     "n": 40,
+     "median": 0.13119811454836128,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.35,
+     "beat_альты": 0.175,
+     "median_BTC": 0.6410096333413522,
+     "median_ETH": 0.29981810830046096,
+     "median_альты": 0.2290533491270993
+    }
+   },
+   "равн/год": {
+    "all": {
+     "n": 93,
+     "median": -0.055837572162687366,
+     "beat_BTC": 0.1935483870967742,
+     "beat_ETH": 0.27956989247311825,
+     "beat_альты": 0.21505376344086022,
+     "median_BTC": 0.4689019142773183,
+     "median_ETH": 0.2840407770640072,
+     "median_альты": -0.0017706052916200976
+    },
+    "since_2022_06": {
+     "n": 40,
+     "median": 0.20310798903511085,
+     "beat_BTC": 0.025,
+     "beat_ETH": 0.35,
+     "beat_альты": 0.225,
+     "median_BTC": 0.6410096333413522,
+     "median_ETH": 0.29981810830046096,
+     "median_альты": 0.2290533491270993
+    }
+   },
+   "кап/мес": {
+    "all": {
+     "n": 93,
+     "median": -0.03838397853031261,
+     "beat_BTC": 0.20430107526881722,
+     "beat_ETH": 0.3118279569892473,
+     "beat_альты": 0.22580645161290322,
+     "median_BTC": 0.4689019142773183,
+     "median_ETH": 0.2840407770640072,
+     "median_альты": -0.0017706052916200976
+    },
+    "since_2022_06": {
+     "n": 40,
+     "median": 0.2065115171600077,
+     "beat_BTC": 0.15,
+     "beat_ETH": 0.475,
+     "beat_альты": 0.325,
+     "median_BTC": 0.6410096333413522,
+     "median_ETH": 0.29981810830046096,
+     "median_альты": 0.2290533491270993
+    }
+   },
+   "кап/кв": {
+    "all": {
+     "n": 93,
+     "median": -0.04848127651133771,
+     "beat_BTC": 0.20430107526881722,
+     "beat_ETH": 0.3225806451612903,
+     "beat_альты": 0.26881720430107525,
+     "median_BTC": 0.4689019142773183,
+     "median_ETH": 0.2840407770640072,
+     "median_альты": -0.0017706052916200976
+    },
+    "since_2022_06": {
+     "n": 40,
+     "median": 0.21091629190292582,
+     "beat_BTC": 0.15,
+     "beat_ETH": 0.475,
+     "beat_альты": 0.375,
+     "median_BTC": 0.6410096333413522,
+     "median_ETH": 0.29981810830046096,
+     "median_альты": 0.2290533491270993
+    }
+   },
+   "кап/год": {
+    "all": {
+     "n": 93,
+     "median": -0.10280750029820629,
+     "beat_BTC": 0.21505376344086022,
+     "beat_ETH": 0.3225806451612903,
+     "beat_альты": 0.26881720430107525,
+     "median_BTC": 0.4689019142773183,
+     "median_ETH": 0.2840407770640072,
+     "median_альты": -0.0017706052916200976
+    },
+    "since_2022_06": {
+     "n": 40,
+     "median": 0.223739023696083,
+     "beat_BTC": 0.175,
+     "beat_ETH": 0.5,
+     "beat_альты": 0.4,
+     "median_BTC": 0.6410096333413522,
+     "median_ETH": 0.29981810830046096,
+     "median_альты": 0.2290533491270993
+    }
+   },
+   "с ETH равн/мес": {
+    "all": {
+     "n": 93,
+     "median": -0.0028678595963459452,
+     "beat_BTC": 0.17204301075268819,
+     "beat_ETH": 0.25806451612903225,
+     "beat_альты": 0.12903225806451613,
+     "median_BTC": 0.4689019142773183,
+     "median_ETH": 0.2840407770640072,
+     "median_альты": -0.0017706052916200976
+    },
+    "since_2022_06": {
+     "n": 40,
+     "median": 0.1300214944912852,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.325,
+     "beat_альты": 0.175,
+     "median_BTC": 0.6410096333413522,
+     "median_ETH": 0.29981810830046096,
+     "median_альты": 0.2290533491270993
+    }
+   },
+   "с ETH кап/мес": {
+    "all": {
+     "n": 93,
+     "median": 0.0454767532272764,
+     "beat_BTC": 0.27956989247311825,
+     "beat_ETH": 0.3010752688172043,
+     "beat_альты": 0.21505376344086022,
+     "median_BTC": 0.4689019142773183,
+     "median_ETH": 0.2840407770640072,
+     "median_альты": -0.0017706052916200976
+    },
+    "since_2022_06": {
+     "n": 40,
+     "median": 0.23919697780992433,
+     "beat_BTC": 0.15,
+     "beat_ETH": 0.475,
+     "beat_альты": 0.375,
+     "median_BTC": 0.6410096333413522,
+     "median_ETH": 0.29981810830046096,
+     "median_альты": 0.2290533491270993
+    }
+   },
+   "держать равн": {
+    "all": {
+     "n": 93,
+     "median": 0.014136876372891294,
+     "beat_BTC": 0.1827956989247312,
+     "beat_ETH": 0.26881720430107525,
+     "beat_альты": 0.20430107526881722,
+     "median_BTC": 0.4689019142773183,
+     "median_ETH": 0.2840407770640072,
+     "median_альты": -0.0017706052916200976
+    },
+    "since_2022_06": {
+     "n": 40,
+     "median": 0.15763151123149344,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.35,
+     "beat_альты": 0.225,
+     "median_BTC": 0.6410096333413522,
+     "median_ETH": 0.29981810830046096,
+     "median_альты": 0.2290533491270993
+    }
+   },
+   "держать кап": {
+    "all": {
+     "n": 93,
+     "median": -0.06717603052858778,
+     "beat_BTC": 0.21505376344086022,
+     "beat_ETH": 0.3118279569892473,
+     "beat_альты": 0.23655913978494625,
+     "median_BTC": 0.4689019142773183,
+     "median_ETH": 0.2840407770640072,
+     "median_альты": -0.0017706052916200976
+    },
+    "since_2022_06": {
+     "n": 40,
+     "median": 0.22598238900223833,
+     "beat_BTC": 0.175,
+     "beat_ETH": 0.475,
+     "beat_альты": 0.375,
+     "median_BTC": 0.6410096333413522,
+     "median_ETH": 0.29981810830046096,
+     "median_альты": 0.2290533491270993
+    }
+   }
+  },
+  "24": {
+   "равн/мес": {
+    "all": {
+     "n": 81,
+     "median": 0.06974108780099164,
+     "beat_BTC": 0.2716049382716049,
+     "beat_ETH": 0.13580246913580246,
+     "beat_альты": 0.024691358024691357,
+     "median_BTC": 1.0931855645427162,
+     "median_ETH": 0.5359657565472873,
+     "median_альты": 0.6558950667763217
+    },
+    "since_2022_06": {
+     "n": 28,
+     "median": 0.2132493240651624,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.2857142857142857,
+     "beat_альты": 0.0,
+     "median_BTC": 1.878432591555782,
+     "median_ETH": 0.47579589877404427,
+     "median_альты": 0.6684305398418143
+    }
+   },
+   "равн/кв": {
+    "all": {
+     "n": 81,
+     "median": 0.17915352684090702,
+     "beat_BTC": 0.2839506172839506,
+     "beat_ETH": 0.14814814814814814,
+     "beat_альты": 0.037037037037037035,
+     "median_BTC": 1.0931855645427162,
+     "median_ETH": 0.5359657565472873,
+     "median_альты": 0.6558950667763217
+    },
+    "since_2022_06": {
+     "n": 28,
+     "median": 0.38613172958723485,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.35714285714285715,
+     "beat_альты": 0.03571428571428571,
+     "median_BTC": 1.878432591555782,
+     "median_ETH": 0.47579589877404427,
+     "median_альты": 0.6684305398418143
+    }
+   },
+   "равн/год": {
+    "all": {
+     "n": 81,
+     "median": 0.3247045719981605,
+     "beat_BTC": 0.2222222222222222,
+     "beat_ETH": 0.2345679012345679,
+     "beat_альты": 0.07407407407407407,
+     "median_BTC": 1.0931855645427162,
+     "median_ETH": 0.5359657565472873,
+     "median_альты": 0.6558950667763217
+    },
+    "since_2022_06": {
+     "n": 28,
+     "median": 0.4930130153226453,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.4642857142857143,
+     "beat_альты": 0.07142857142857142,
+     "median_BTC": 1.878432591555782,
+     "median_ETH": 0.47579589877404427,
+     "median_альты": 0.6684305398418143
+    }
+   },
+   "кап/мес": {
+    "all": {
+     "n": 81,
+     "median": 0.5393805936948746,
+     "beat_BTC": 0.16049382716049382,
+     "beat_ETH": 0.32098765432098764,
+     "beat_альты": 0.25925925925925924,
+     "median_BTC": 1.0931855645427162,
+     "median_ETH": 0.5359657565472873,
+     "median_альты": 0.6558950667763217
+    },
+    "since_2022_06": {
+     "n": 28,
+     "median": 0.6221882799753773,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.7857142857142857,
+     "beat_альты": 0.6785714285714286,
+     "median_BTC": 1.878432591555782,
+     "median_ETH": 0.47579589877404427,
+     "median_альты": 0.6684305398418143
+    }
+   },
+   "кап/кв": {
+    "all": {
+     "n": 81,
+     "median": 0.5876456946743611,
+     "beat_BTC": 0.2345679012345679,
+     "beat_ETH": 0.30864197530864196,
+     "beat_альты": 0.2716049382716049,
+     "median_BTC": 1.0931855645427162,
+     "median_ETH": 0.5359657565472873,
+     "median_альты": 0.6558950667763217
+    },
+    "since_2022_06": {
+     "n": 28,
+     "median": 0.6620754214413529,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.7857142857142857,
+     "beat_альты": 0.7142857142857143,
+     "median_BTC": 1.878432591555782,
+     "median_ETH": 0.47579589877404427,
+     "median_альты": 0.6684305398418143
+    }
+   },
+   "кап/год": {
+    "all": {
+     "n": 81,
+     "median": 0.6229885006296791,
+     "beat_BTC": 0.14814814814814814,
+     "beat_ETH": 0.30864197530864196,
+     "beat_альты": 0.2839506172839506,
+     "median_BTC": 1.0931855645427162,
+     "median_ETH": 0.5359657565472873,
+     "median_альты": 0.6558950667763217
+    },
+    "since_2022_06": {
+     "n": 28,
+     "median": 0.7238605295338648,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.7857142857142857,
+     "beat_альты": 0.75,
+     "median_BTC": 1.878432591555782,
+     "median_ETH": 0.47579589877404427,
+     "median_альты": 0.6684305398418143
+    }
+   },
+   "с ETH равн/мес": {
+    "all": {
+     "n": 81,
+     "median": 0.1314058274742529,
+     "beat_BTC": 0.2839506172839506,
+     "beat_ETH": 0.1728395061728395,
+     "beat_альты": 0.037037037037037035,
+     "median_BTC": 1.0931855645427162,
+     "median_ETH": 0.5359657565472873,
+     "median_альты": 0.6558950667763217
+    },
+    "since_2022_06": {
+     "n": 28,
+     "median": 0.3204861140959103,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.35714285714285715,
+     "beat_альты": 0.03571428571428571,
+     "median_BTC": 1.878432591555782,
+     "median_ETH": 0.47579589877404427,
+     "median_альты": 0.6684305398418143
+    }
+   },
+   "с ETH кап/мес": {
+    "all": {
+     "n": 81,
+     "median": 0.507092495443368,
+     "beat_BTC": 0.2962962962962963,
+     "beat_ETH": 0.32098765432098764,
+     "beat_альты": 0.12345679012345678,
+     "median_BTC": 1.0931855645427162,
+     "median_ETH": 0.5359657565472873,
+     "median_альты": 0.6558950667763217
+    },
+    "since_2022_06": {
+     "n": 28,
+     "median": 0.5698452000814423,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.7857142857142857,
+     "beat_альты": 0.2857142857142857,
+     "median_BTC": 1.878432591555782,
+     "median_ETH": 0.47579589877404427,
+     "median_альты": 0.6684305398418143
+    }
+   },
+   "держать равн": {
+    "all": {
+     "n": 81,
+     "median": 0.2981372300035916,
+     "beat_BTC": 0.25925925925925924,
+     "beat_ETH": 0.2716049382716049,
+     "beat_альты": 0.19753086419753085,
+     "median_BTC": 1.0931855645427162,
+     "median_ETH": 0.5359657565472873,
+     "median_альты": 0.6558950667763217
+    },
+    "since_2022_06": {
+     "n": 28,
+     "median": 0.37733733076031317,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.5714285714285714,
+     "beat_альты": 0.2857142857142857,
+     "median_BTC": 1.878432591555782,
+     "median_ETH": 0.47579589877404427,
+     "median_альты": 0.6684305398418143
+    }
+   },
+   "держать кап": {
+    "all": {
+     "n": 81,
+     "median": 0.45526360255654796,
+     "beat_BTC": 0.2222222222222222,
+     "beat_ETH": 0.32098765432098764,
+     "beat_альты": 0.32098765432098764,
+     "median_BTC": 1.0931855645427162,
+     "median_ETH": 0.5359657565472873,
+     "median_альты": 0.6558950667763217
+    },
+    "since_2022_06": {
+     "n": 28,
+     "median": 0.7825286932627004,
+     "beat_BTC": 0.0,
+     "beat_ETH": 0.7857142857142857,
+     "beat_альты": 0.7857142857142857,
+     "median_BTC": 1.878432591555782,
+     "median_ETH": 0.47579589877404427,
+     "median_альты": 0.6684305398418143
+    }
+   }
+  }
+ },
+ "R": {
+  "равн/мес": {
+   "n": 299,
+   "spent": 9958.865495,
+   "pnl": 1503.1656730019617,
+   "bench": 1533.4737622388873,
+   "beat_share": 0.45484949832775917
+  },
+  "кап/мес": {
+   "n": 299,
+   "spent": 9958.865495,
+   "pnl": 1503.1656730019617,
+   "bench": 1477.3009236240084,
+   "beat_share": 0.46488294314381273
+  },
+  "равн/год": {
+   "n": 299,
+   "spent": 9958.865495,
+   "pnl": 1503.1656730019617,
+   "bench": 1725.431289510519,
+   "beat_share": 0.4414715719063545
+  },
+  "кап/год": {
+   "n": 299,
+   "spent": 9958.865495,
+   "pnl": 1503.1656730019617,
+   "bench": 1525.2656849525533,
+   "beat_share": 0.46153846153846156
+  },
+  "с ETH кап/мес": {
+   "n": 299,
+   "spent": 9958.865495,
+   "pnl": 1503.1656730019617,
+   "bench": 1739.2709166753773,
+   "beat_share": 0.4882943143812709
+  },
+  "BTC": {
+   "n": 299,
+   "spent": 9958.865495,
+   "pnl": 1503.1656730019617,
+   "bench": 1862.3458289038429,
+   "beat_share": 0.47491638795986624
+  },
+  "ETH": {
+   "n": 299,
+   "spent": 9958.865495,
+   "pnl": 1503.1656730019617,
+   "bench": 2178.942260433103,
+   "beat_share": 0.46488294314381273
+  },
+  "альты": {
+   "n": 299,
+   "spent": 9958.865495,
+   "pnl": 1503.1656730019617,
+   "bench": 1688.764383646503,
+   "beat_share": 0.46153846153846156
+  },
+  "n_all": 299,
+  "spent_all": 9958.865495,
+  "pnl_all": 1503.1656730019617,
+  "random": {
+   "равн/мес": {
+    "vs_per_usd_mean": -0.013968418032012542,
+    "beat_runs": 6
+   },
+   "кап/мес": {
+    "vs_per_usd_mean": -0.005452116697600509,
+    "beat_runs": 11
+   },
+   "равн/год": {
+    "vs_per_usd_mean": -0.03239199614136879,
+    "beat_runs": 0
+   },
+   "кап/год": {
+    "vs_per_usd_mean": -0.010706997073265492,
+    "beat_runs": 8
+   },
+   "с ETH кап/мес": {
+    "vs_per_usd_mean": -0.02739323552198692,
+    "beat_runs": 0
+   },
+   "BTC": {
+    "vs_per_usd_mean": -0.032187103375212224,
+    "beat_runs": 0
+   },
+   "ETH": {
+    "vs_per_usd_mean": -0.06862012046607902,
+    "beat_runs": 0
+   },
+   "альты": {
+    "vs_per_usd_mean": -0.027590540879826642,
+    "beat_runs": 0
+   }
+  }
+ },
+ "H": {
+  "равн/мес": {
+   "n": 75,
+   "spent": 2769.648884,
+   "pnl": 1903.1755893529767,
+   "bench": 785.2052037150879,
+   "beat_share": 0.18666666666666668
+  },
+  "кап/мес": {
+   "n": 75,
+   "spent": 2769.648884,
+   "pnl": 1903.1755893529767,
+   "bench": 917.7466746675403,
+   "beat_share": 0.2
+  },
+  "равн/год": {
+   "n": 75,
+   "spent": 2769.648884,
+   "pnl": 1903.1755893529767,
+   "bench": 1001.8801618756883,
+   "beat_share": 0.18666666666666668
+  },
+  "кап/год": {
+   "n": 75,
+   "spent": 2769.648884,
+   "pnl": 1903.1755893529767,
+   "bench": 925.1234146607572,
+   "beat_share": 0.18666666666666668
+  },
+  "с ETH кап/мес": {
+   "n": 75,
+   "spent": 2769.648884,
+   "pnl": 1903.1755893529767,
+   "bench": 2029.3196669237125,
+   "beat_share": 0.22666666666666666
+  },
+  "BTC": {
+   "n": 75,
+   "spent": 2769.648884,
+   "pnl": 1903.1755893529767,
+   "bench": 3185.174245567431,
+   "beat_share": 0.13333333333333333
+  },
+  "ETH": {
+   "n": 75,
+   "spent": 2769.648884,
+   "pnl": 1903.1755893529767,
+   "bench": 4600.970243915955,
+   "beat_share": 0.25333333333333335
+  },
+  "альты": {
+   "n": 75,
+   "spent": 2769.648884,
+   "pnl": 1903.1755893529767,
+   "bench": 2985.822171942422,
+   "beat_share": 0.32
+  },
+  "n_all": 75,
+  "spent_all": 2769.648884,
+  "pnl_all": 1903.1755893529767,
+  "random": {
+   "равн/мес": {
+    "vs_per_usd_mean": 0.3938804670011589,
+    "beat_runs": 30
+   },
+   "кап/мес": {
+    "vs_per_usd_mean": 0.33492002574753194,
+    "beat_runs": 30
+   },
+   "равн/год": {
+    "vs_per_usd_mean": 0.30847172141233703,
+    "beat_runs": 30
+   },
+   "кап/год": {
+    "vs_per_usd_mean": 0.3310351385970041,
+    "beat_runs": 30
+   },
+   "с ETH кап/мес": {
+    "vs_per_usd_mean": -0.0743526334299092,
+    "beat_runs": 1
+   },
+   "BTC": {
+    "vs_per_usd_mean": -0.5025418539409325,
+    "beat_runs": 0
+   },
+   "ETH": {
+    "vs_per_usd_mean": -1.0290853977108925,
+    "beat_runs": 0
+   },
+   "альты": {
+    "vs_per_usd_mean": -0.43572183709230533,
+    "beat_runs": 0
+   }
+  }
+ }
+}
