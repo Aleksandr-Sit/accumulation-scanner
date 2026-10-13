@@ -196,19 +196,22 @@ STEPS = [
 
 
 def exec_book(cands: list[dict], sim, take, quota, *, cooldown: bool, cash: bool,
-              order: str = "rank", seed: int = 0) -> list[tuple[dict, dict]]:
+              order: str = "rank", seed: int = 0,
+              quota2: tuple | None = None) -> list[tuple[dict, dict]]:
     """Книга исполнителя по дням сигналов: слот занят до выхода (одна позиция на монету,
     не больше J.SLOTS, квота неликвида), кулдаун — COOLDOWN_DAYS от прошлого ВЗЯТОГО входа
     по монете (cooldown=False — его заменяет шаг эпизодов 90 дн. от сигнала, как раньше),
     cash — свободный USDT книги (CAPITAL + выручка − траты − резерв лимиток) не меньше
     стоимости лестницы. risk_check исполнителя (экспозиция по вложенному ≤ 30% / 60% × $1500
     = $750) при 15 × $50 не строже лимита монет — отдельно не считается.
+    quota2 — вторая квота (признак, мест), например «вне топ-200 CMC не больше N мест»
+    (cmc_rank_gate_study); None — как раньше.
     sim(ep) -> строка simulate_exec | None (отказ плана). -> [(эпизод, строка)]."""
     rnd = random.Random(seed)
     by_day: dict[int, list[dict]] = {}
     for ep in cands:
         by_day.setdefault(ep["day"], []).append(ep)
-    held: list[tuple[int, bool, str]] = []
+    held: list[tuple[int, bool, str, bool]] = []
     last: dict[str, int] = {}
     events: list[tuple[int, float]] = []
     free = CAPITAL
@@ -231,6 +234,9 @@ def exec_book(cands: list[dict], sim, take, quota, *, cooldown: bool, cash: bool
             in_q = quota is not None and quota(ep)
             if len(held) >= J.SLOTS or (in_q and sum(1 for x in held if x[1]) >= ILLIQUID_SLOTS):
                 continue
+            in_q2 = quota2 is not None and quota2[0](ep)
+            if in_q2 and sum(1 for x in held if x[3]) >= quota2[1]:
+                continue
             r = sim(ep)
             if r is None:
                 continue
@@ -242,7 +248,7 @@ def exec_book(cands: list[dict], sim, take, quota, *, cooldown: bool, cash: bool
                 free -= need
                 for d, v in r["cash"][1:]:
                     heapq.heappush(events, (ts[d], v))
-            held.append((day + max(r["span"], 1) * DAY, in_q, coin))
+            held.append((day + max(r["span"], 1) * DAY, in_q, coin, in_q2))
             last[coin] = day
             taken.append((ep, r))
     return taken

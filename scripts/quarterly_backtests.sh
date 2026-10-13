@@ -9,7 +9,8 @@
 #      меняются, исследования пишут *_results.json только в клон;
 #   3. по очереди: ladder_dca_study, junk_filter_study, portfolio_vs_market, top20_basket_study
 #      (снимки CMC — .cache/cmc_hist, новые месяцы докачает сам), size_band_study (снимки
-#      CMC на 3000 мест — .cache/cmc_hist_deep, первый раз ~5 мин), top20_ex_eth_study, rotation_study
+#      CMC на 3000 мест — .cache/cmc_hist_deep, первый раз ~5 мин), cmc_rank_gate_study (те же
+#      снимки, ~6 мин), top20_ex_eth_study, rotation_study
 #      (снимки CMC с 2015 — тот же кэш), regime_exit_study,
 #      market_regime_study, hold_stop_study, score_quintiles — лог каждого в logs/;
 #   4. сравнивает новые *_results.json с теми, что лежат в репозитории
@@ -20,7 +21,7 @@
 # Где запускать: ноутбук (Git Bash) или VPS — нужны python3 и сеть до data.binance.vision и
 # api.binance.com (с VPS проверено 09.10.2026). Архива на VPS изначально нет: первый прогон
 # скачает его целиком (~40 МБ, сотни тысяч мелких запросов — долго); быстрее один раз
-# скопировать .cache/binance_1d_full с ноутбука. Счёт ~30–45 мин CPU, один процесс.
+# скопировать .cache/binance_1d_full с ноутбука. Счёт ~35–50 мин CPU, один процесс.
 # На VPS — вне окна таймера сканера (06:00 UTC), не трогает его замок и базу.
 #
 # Запуск из корня репозитория:
@@ -116,7 +117,7 @@ EOF
 log "  клон $(git -C "$work/repo" rev-parse --short HEAD), база скопирована ($(du -h "$work/repo/scanner.db" | cut -f1))"
 
 # ---- 3. исследования
-studies="${only:-ladder_dca_study junk_filter_study portfolio_vs_market top20_basket_study size_band_study top20_ex_eth_study rotation_study regime_exit_study market_regime_study hold_stop_study score_quintiles}"
+studies="${only:-ladder_dca_study junk_filter_study portfolio_vs_market top20_basket_study size_band_study cmc_rank_gate_study top20_ex_eth_study rotation_study regime_exit_study market_regime_study hold_stop_study score_quintiles}"
 fail=0
 log "--- 3. исследования: $studies"
 for s in $studies; do
