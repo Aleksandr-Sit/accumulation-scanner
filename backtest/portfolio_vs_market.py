@@ -196,7 +196,7 @@ STEPS = [
 
 
 def exec_book(cands: list[dict], sim, take, quota, *, cooldown: bool, cash: bool,
-              order: str = "rank", seed: int = 0,
+              order="rank", seed: int = 0,
               quota2: tuple | None = None) -> list[tuple[dict, dict]]:
     """Книга исполнителя по дням сигналов: слот занят до выхода (одна позиция на монету,
     не больше J.SLOTS, квота неликвида), кулдаун — COOLDOWN_DAYS от прошлого ВЗЯТОГО входа
@@ -206,6 +206,10 @@ def exec_book(cands: list[dict], sim, take, quota, *, cooldown: bool, cash: bool
     = $750) при 15 × $50 не строже лимита монет — отдельно не считается.
     quota2 — вторая квота (признак, мест), например «вне топ-200 CMC не больше N мест»
     (cmc_rank_gate_study); None — как раньше.
+    order — порядок сигналов внутри дня: "rank" — по месту оборота (прод), любая другая
+    строка — случайный (random.Random(seed)); функция-ключ ep -> число (или кортеж) —
+    сначала случайное перемешивание тем же seed, затем устойчивая сортировка по ключу по
+    возрастанию: равные ключи идут в случайном порядке (momentum_order_study, Q13).
     sim(ep) -> строка simulate_exec | None (отказ плана). -> [(эпизод, строка)]."""
     rnd = random.Random(seed)
     by_day: dict[int, list[dict]] = {}
@@ -221,7 +225,10 @@ def exec_book(cands: list[dict], sim, take, quota, *, cooldown: bool, cash: bool
         while events and events[0][0] <= day:
             free += heapq.heappop(events)[1]
         cc = [ep for ep in by_day[day] if take(ep)]
-        if order == "rank":
+        if callable(order):
+            rnd.shuffle(cc)
+            cc.sort(key=order)
+        elif order == "rank":
             cc.sort(key=lambda ep: ep["rank"])
         else:
             rnd.shuffle(cc)
