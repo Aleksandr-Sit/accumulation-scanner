@@ -1281,12 +1281,18 @@ def test_entry_quality(cfg, failures: list[str]) -> None:
     mn, _ = spring_quality(neutral, cfg)
     _check("нет данных -> множитель 1.0 (нейтрально)", mn == 1.0, failures)
 
-    # Фандинг: капитуляция шортов (отрицательный) = бонус.
+    # Фандинг: капитуляция шортов (отрицательный) — с P12 (16.10.2026) надбавки нет, только пометка.
     fc = Candidate(source="t", track="A", symbol="F", zone="ПРУЖИНА/ДНО",
                    funding_rate=-0.001)
     mf, nf = spring_quality(fc, cfg)
-    _check("отрицательный фандинг -> бонус (>1)", mf > 1.0, failures)
-    _check("фандинг: заметка про капитуляцию", any("капитуляц" in n for n in nf), failures)
+    _check("отрицательный фандинг -> множитель 1.0 (P12: funding_bonus 1.0)", mf == 1.0, failures)
+    _check("фандинг: справочная пометка без «топлива отскока»",
+           any("справочно" in n for n in nf) and not any("топливо" in n for n in nf), failures)
+    from scanner.config import Config as _C
+    old_b = _C({**cfg._d, "stage4b_quality": {**cfg._d["stage4b_quality"], "funding_bonus": 1.08}})
+    mo, no = spring_quality(fc, old_b)
+    _check("фандинг: funding_bonus 1.08 в конфиге — надбавка и прежняя заметка",
+           mo > 1.0 and any("капитуляц" in n for n in no), failures)
     # эйфория лонгов на пружине = штраф
     fe = Candidate(source="t", track="A", symbol="FE", zone="ПРУЖИНА/ДНО",
                    funding_rate=0.001)

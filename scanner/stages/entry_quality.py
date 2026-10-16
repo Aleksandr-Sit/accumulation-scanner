@@ -121,8 +121,13 @@ def spring_quality(candidate, cfg: Config) -> tuple[float, list[str]]:
     fr = getattr(candidate, "funding_rate", None)
     if isinstance(fr, (int, float)):
         if fr <= q.get("funding_capitulation", -0.0003):
-            mult *= q.get("funding_bonus", 1.08)
-            notes.append(f"фандинг {fr*100:.3f}%/8h — шорты в толпе (капитуляция, топливо отскока)")
+            bonus = q.get("funding_bonus", 1.08)
+            mult *= bonus
+            if bonus != 1.0:
+                notes.append(f"фандинг {fr*100:.3f}%/8h — шорты в толпе (капитуляция, топливо отскока)")
+            else:   # P12 (16.10.2026): надбавка не подтвердилась — только пометка
+                notes.append(f"фандинг {fr*100:.3f}%/8h — шорты в толпе (справочно: на истории "
+                             f"исход не лучше)")
         elif fr >= q.get("funding_euphoria", 0.0005):
             mult *= q.get("funding_penalty", 0.92)
             notes.append(f"⚠ фандинг +{fr*100:.3f}%/8h — эйфория лонгов на пружине (подозрительно)")
