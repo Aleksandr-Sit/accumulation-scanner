@@ -197,7 +197,8 @@ STEPS = [
 
 def exec_book(cands: list[dict], sim, take, quota, *, cooldown: bool, cash: bool,
               order="rank", seed: int = 0,
-              quota2: tuple | None = None) -> list[tuple[dict, dict]]:
+              quota2: tuple | None = None,
+              group_cap: tuple | None = None) -> list[tuple[dict, dict]]:
     """Книга исполнителя по дням сигналов: слот занят до выхода (одна позиция на монету,
     не больше J.SLOTS, квота неликвида), кулдаун — COOLDOWN_DAYS от прошлого ВЗЯТОГО входа
     по монете (cooldown=False — его заменяет шаг эпизодов 90 дн. от сигнала, как раньше),
@@ -206,6 +207,10 @@ def exec_book(cands: list[dict], sim, take, quota, *, cooldown: bool, cash: bool
     = $750) при 15 × $50 не строже лимита монет — отдельно не считается.
     quota2 — вторая квота (признак, мест), например «вне топ-200 CMC не больше N мест»
     (cmc_rank_gate_study); None — как раньше.
+    group_cap — лимит группы (key_fn, K): не больше K открытых мест с одинаковым key_fn(ep),
+    например «не больше K монет одного сектора» (sector_cap_study, Q14); key_fn(ep) None —
+    группа без лимита; сигнал сверх лимита пропускается, место и деньги — следующим сигналам
+    дня (как квота). None — как раньше.
     order — порядок сигналов внутри дня: "rank" — по месту оборота (прод), любая другая
     строка — случайный (random.Random(seed)); функция-ключ ep -> число (или кортеж) —
     сначала случайное перемешивание тем же seed, затем устойчивая сортировка по ключу по
@@ -215,7 +220,7 @@ def exec_book(cands: list[dict], sim, take, quota, *, cooldown: bool, cash: bool
     by_day: dict[int, list[dict]] = {}
     for ep in cands:
         by_day.setdefault(ep["day"], []).append(ep)
-    held: list[tuple[int, bool, str, bool]] = []
+    held: list[tuple[int, bool, str, bool, object]] = []
     last: dict[str, int] = {}
     events: list[tuple[int, float]] = []
     free = CAPITAL
@@ -244,6 +249,9 @@ def exec_book(cands: list[dict], sim, take, quota, *, cooldown: bool, cash: bool
             in_q2 = quota2 is not None and quota2[0](ep)
             if in_q2 and sum(1 for x in held if x[3]) >= quota2[1]:
                 continue
+            grp = group_cap[0](ep) if group_cap is not None else None
+            if grp is not None and sum(1 for x in held if x[4] == grp) >= group_cap[1]:
+                continue
             r = sim(ep)
             if r is None:
                 continue
@@ -255,7 +263,7 @@ def exec_book(cands: list[dict], sim, take, quota, *, cooldown: bool, cash: bool
                 free -= need
                 for d, v in r["cash"][1:]:
                     heapq.heappush(events, (ts[d], v))
-            held.append((day + max(r["span"], 1) * DAY, in_q, coin, in_q2))
+            held.append((day + max(r["span"], 1) * DAY, in_q, coin, in_q2, grp))
             last[coin] = day
             taken.append((ep, r))
     return taken
