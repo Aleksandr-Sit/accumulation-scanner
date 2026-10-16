@@ -615,7 +615,7 @@ def _write_watchlist(cfg: Config, watchlist: list[Candidate]) -> None:
             "liveness_score": c.liveness_score, "liveness_notes": c.liveness_notes,
             "dev_commits_4w": c.dev_commits_4w, "dev_contributors": c.dev_contributors,
             "dev_last_commit_days": c.dev_last_commit_days, "n_exchanges": c.n_exchanges,
-            "on_cex": c.on_cex, "holder_count": c.holder_count,
+            "on_cex": c.on_cex, "cex_names": c.cex_names, "holder_count": c.holder_count,
             "lp_locked_pct": c.lp_locked_pct, "wash_ratio": c.wash_ratio,
             "drawdown_from_ath_pct": c.drawdown_from_ath_pct,
             "spring": c.spring_prefilter,

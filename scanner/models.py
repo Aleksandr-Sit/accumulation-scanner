@@ -40,6 +40,7 @@ class Candidate:
     dev_last_commit_days: int | None = None  # GitHub: дней с последнего коммита/push
     n_exchanges: int | None = None         # число рынков (CoinGecko tickers)
     on_cex: bool = False                   # есть ли CEX-листинг (не только DEX)
+    cex_names: list = field(default_factory=list)  # CEX из списка liveness._CEX (ключи)
     holder_count: int | None = None        # число холдеров (GoPlus)
     lp_locked_pct: float | None = None     # % LP заблокирован/сожжён (None = нет данных)
     wash_ratio: float | None = None        # volume_24h / liquidity (аномально высокое = накрутка)

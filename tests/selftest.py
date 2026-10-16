@@ -1459,6 +1459,23 @@ def test_telegram_format(cfg, failures: list[str]) -> None:
                      rf_venue="Bybit spot", score=80.0, confidence=0.9)]
     _check("select_picks: «DEX only» карточкой не идёт (only_venues)",
            [c.symbol for c in tg.select_picks(dex, cfg)] == ["BYB"], failures)
+    oc = [Candidate(source="t", track="A", symbol="BNC", zone="ПРУЖИНА/ДНО", rf_venue="DEX only",
+                    score=85.0, confidence=0.9, cex_names=["binance", "mexc"]),
+          Candidate(source="t", track="A", symbol="MXO", zone="ПРУЖИНА/ДНО", rf_venue="DEX only",
+                    score=84.0, confidence=0.9, cex_names=["mexc", "htx"])]
+    _check("select_picks: нет на Bybit, но есть на крупной CEX — идёт; только MEXC/HTX — нет",
+           [c.symbol for c in tg.select_picks(dex + oc, cfg)] == ["BYB", "BNC"], failures)
+    _check("other_cex: только крупные из other_cex_major, монета Bybit — пусто",
+           tg.other_cex(oc[0], cfg) == ["Binance"] and tg.other_cex(dex[1], cfg) == [], failures)
+    card_oc = tg.format_coin_card(oc[0], None, cfg)
+    _check("карточка: «нет на Bybit» в заголовке и строка «исполнитель не купит; торгуется: Binance»",
+           "· нет на Bybit" in card_oc.splitlines()[0]
+           and "исполнитель не купит; торгуется: Binance" in card_oc, failures)
+    from scanner.stages.liveness import extract_dev_listings
+    dl = extract_dev_listings({"tickers": [{"market": {"name": n}} for n in
+                                           ("Coinbase Exchange", "Binance US", "Uniswap V3 (Ethereum)", "Gate")]})
+    _check("liveness: cex_names — «Coinbase Exchange» = coinbase, «Binance US» — не binance",
+           dl["cex_names"] == ["coinbase", "gate"] and dl["on_cex"] is True, failures)
     from scanner.config import Config
     allv = Config({**cfg._d, "stage6_telegram": {**cfg._d["stage6_telegram"], "only_venues": []}})
     _check("select_picks: пустой only_venues — все площадки",

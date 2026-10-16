@@ -446,18 +446,38 @@ def market_block(ctx: dict, cfg, now: float | None = None) -> list[str]:
 
 # ---------------------------------------------------------------- отбор под алерт
 
+_CEX_TITLE = {"binance": "Binance", "okx": "OKX", "coinbase": "Coinbase", "kraken": "Kraken",
+              "upbit": "Upbit", "bitget": "Bitget", "kucoin": "KuCoin", "gate": "Gate",
+              "bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "bitfinex": "Bitfinex",
+              "crypto.com exchange": "Crypto.com", "gemini": "Gemini"}
+
+
+def other_cex(c, cfg) -> list[str]:
+    """Крупные CEX монеты (stage6_telegram.other_cex_major), если её нет на Bybit spot:
+    такая монета приходит карточкой с пометкой «нет на Bybit». Монета Bybit — пусто."""
+    if getattr(c, "rf_venue", "") == "Bybit spot":
+        return []
+    major = [x.lower() for x in (cfg["stage6_telegram"].get("other_cex_major") or [])]
+    have = {x.lower() for x in (getattr(c, "cex_names", None) or [])}
+    return [_CEX_TITLE.get(x, x) for x in major if x in have and x != "bybit"]
+
+
+def venue_ok(c, cfg) -> bool:
+    """Площадка проходит в карточки: only_venues (Bybit spot) или крупная CEX вне Bybit."""
+    venues = set(cfg["stage6_telegram"].get("only_venues") or [])
+    return not venues or c.rf_venue in venues or bool(other_cex(c, cfg))
+
+
 def select_picks(watchlist: list, cfg) -> list:
     """Кандидаты, которые реально попадут в карточки (фильтры stage6_telegram + лимит).
     Им же пишется mute: монета, которой не было в сообщении, не должна глушиться."""
     t = cfg["stage6_telegram"]
     zones = set(t.get("only_zones") or [])
-    venues = set(t.get("only_venues") or [])
     min_score = t.get("min_score", 0)
     min_conf = t.get("min_confidence", 0.0)
     picks = [c for c in watchlist
              if c.score >= min_score and c.confidence >= min_conf
-             and (not zones or c.zone in zones)
-             and (not venues or c.rf_venue in venues)]
+             and (not zones or c.zone in zones) and venue_ok(c, cfg)]
     return picks[:t.get("max_alerts", 10)]
 
 
@@ -619,8 +639,15 @@ def format_coin_card(c, plan: dict | None, cfg, *, price: float | None = None,
                 f"<b>{sym} {_ZONE_WORD.get(c.zone, c.zone)} — {fmt_score(c.score)}/100</b>")
     else:                       # run.py card по монете вне watchlist: зоны и балла нет
         head = f"{'🧪 ТЕСТ · ' if test else ''}📐 <b>{sym} — план лестницы</b>"
+    oc = other_cex(c, cfg) if c.zone else []
+    if oc:
+        venue = "нет на Bybit"
     head += f" · {venue}" if venue else ""
     lines = [head]
+    if oc:
+        why = ("на Bybit под этим тикером другая монета"
+               if "bybit_ticker_mismatch" in (getattr(c, "flags", None) or []) else "нет на Bybit spot")
+        lines.append(f"ℹ {why} — исполнитель не купит; торгуется: {_esc(', '.join(oc))}")
     sub = []
     if c.name and c.name.upper() != (c.symbol or "").upper():
         sub.append(_esc(c.name))

@@ -247,10 +247,9 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
     new = [c for c in picks if c.symbol in sent]
     muted = [c for c in picks if c.symbol not in sent and c.symbol in recent]
     zones = set(t.get("only_zones") or [])
-    venues = set(t.get("only_venues") or [])
     shown = {c.symbol for c in new + muted}
     near = [c for c in wl if (not zones or c.zone in zones) and c.symbol not in shown
-            and (not venues or c.rf_venue in venues)
+            and telegram.venue_ok(c, cfg)
             and c.score < t.get("min_score", 0)][:t.get("near_threshold_n", 3)]
 
     ps = PositionStore(db)

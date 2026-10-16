@@ -20,6 +20,17 @@ from ..config import Config
 _CEX = {"binance", "bybit", "okx", "coinbase", "kraken", "kucoin", "gate",
         "gate.io", "bitget", "mexc", "htx", "huobi", "upbit", "bitfinex",
         "crypto.com exchange", "gemini"}
+# Имена рынков CoinGecko с хвостом («Coinbase Exchange», «Gate.io») -> ключ _CEX.
+_CEX_ALIAS = {"coinbase exchange": "coinbase", "gate.io": "gate", "huobi": "htx",
+              "huobi global": "htx", "kraken pro": "kraken"}
+
+
+def cex_key(name: str) -> str | None:
+    """Имя рынка CoinGecko -> ключ из _CEX (None — не CEX из списка). «Binance US»,
+    «Binance TR» и прочие региональные — не Binance."""
+    n = (name or "").strip().lower()
+    n = _CEX_ALIAS.get(n, n)
+    return n if n in _CEX else None
 
 
 def extract_dev_listings(detail: dict) -> dict:
@@ -31,13 +42,14 @@ def extract_dev_listings(detail: dict) -> dict:
         mkt = ((t.get("market") or {}).get("name") or "").strip().lower()
         if mkt:
             ex_names.add(mkt)
-    on_cex = any(x in _CEX for x in ex_names)
+    cex = sorted({k for k in (cex_key(x) for x in ex_names) if k})
     return {
         "dev_commits_4w": dev.get("commit_count_4_weeks"),
         "dev_contributors": dev.get("pull_request_contributors"),
         "dev_stars": dev.get("stars"),
         "n_exchanges": len(ex_names) if tickers else None,
-        "on_cex": on_cex,
+        "on_cex": bool(cex),
+        "cex_names": cex,
     }
 
 
@@ -64,6 +76,7 @@ def assess_liveness(c, detail: dict, cfg: Config, dev: dict | None = None) -> No
     c.dev_stars = dl.get("dev_stars")
     c.n_exchanges = dl.get("n_exchanges")
     c.on_cex = bool(dl.get("on_cex"))
+    c.cex_names = list(dl.get("cex_names") or [])
     c.wash_ratio = wash_ratio(c.volume_24h, c.liquidity_usd)
     if c.dev_commits_4w is None and dev:
         c.dev_commits_4w = dev.get("commits_4w")
