@@ -165,6 +165,8 @@
     "min_score": 70,
     "min_confidence": 0.6,
     "only_zones": ["ПРУЖИНА/ДНО"],
+    "_venues_note": "only_venues — карточки только для монет этих площадок (rf_venue). 16.10.2026 владелец: карточки «DEX only» (нет на Bybit spot) не присылать — исполнитель их всё равно не покупает. Пустой список — все площадки.",
+    "only_venues": ["Bybit spot"],
     "max_alerts": 10,
     "alert_mute_days": 3,
     "charts": true,

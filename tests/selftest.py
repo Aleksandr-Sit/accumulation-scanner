@@ -1453,12 +1453,22 @@ def test_telegram_format(cfg, failures: list[str]) -> None:
     # select_picks = ровно те, кто придёт карточкой (по ним пишется mute)
     _check("select_picks: только ICP (нож и СЕРЕДИНА не идут)",
            [c.symbol for c in tg.select_picks(cands, cfg)] == ["ICP"], failures)
+    dex = [Candidate(source="t", track="A", symbol="DEXC", zone="ПРУЖИНА/ДНО",
+                     rf_venue="DEX only", score=90.0, confidence=0.9),
+           Candidate(source="t", track="A", symbol="BYB", zone="ПРУЖИНА/ДНО",
+                     rf_venue="Bybit spot", score=80.0, confidence=0.9)]
+    _check("select_picks: «DEX only» карточкой не идёт (only_venues)",
+           [c.symbol for c in tg.select_picks(dex, cfg)] == ["BYB"], failures)
+    from scanner.config import Config
+    allv = Config({**cfg._d, "stage6_telegram": {**cfg._d["stage6_telegram"], "only_venues": []}})
+    _check("select_picks: пустой only_venues — все площадки",
+           [c.symbol for c in tg.select_picks(dex, allv)] == ["DEXC", "BYB"], failures)
     low = [Candidate(source="t", track="A", symbol="X", zone="ПРУЖИНА/ДНО", score=10.0)]
     _check("ниже порога -> карточек нет", tg.select_picks(low, cfg) == [], failures)
     thin = [Candidate(source="t", track="B", symbol="THIN", zone="ПРУЖИНА/ДНО",
                       score=90.0, confidence=0.3)]
     _check("низкий confidence отсечён гейтом", tg.select_picks(thin, cfg) == [], failures)
-    many = [Candidate(source="t", track="A", symbol=f"S{i}", zone="ПРУЖИНА/ДНО",
+    many = [Candidate(source="t", track="A", symbol=f"S{i}", zone="ПРУЖИНА/ДНО", rf_venue="Bybit spot",
                       score=90.0 - i, confidence=0.9) for i in range(15)]
     _check("select_picks: не больше max_alerts",
            len(tg.select_picks(many, cfg)) == cfg["stage6_telegram"]["max_alerts"], failures)
@@ -1847,7 +1857,8 @@ def test_exit_alert_format(cfg, failures: list[str]) -> None:
     _check("спарклайн: 1 точка не падает", bool(tg.sparkline([5.0])), failures)
 
     # Сводка дня: суть в первой строке, рынок, монеты, позиции с ценами стопа и цели.
-    gram = Candidate(source="t", track="A", symbol="GRAM", zone="ПРУЖИНА/ДНО", score=70.0)
+    gram = Candidate(source="t", track="A", symbol="GRAM", zone="ПРУЖИНА/ДНО", score=70.0,
+                 rf_venue="Bybit spot")
     lunc = Candidate(source="t", track="A", symbol="LUNC", zone="ПРУЖИНА/ДНО", score=67.1)
     arb_row = {"position": pos, "last_price": 0.36, "last_ts": day, "hwm": 0.40,
                "pnl": {"pnl_pct": 19.6, "pnl_usdt": 58.7}, "held_days": 30,
@@ -1912,9 +1923,13 @@ def test_exit_alert_format(cfg, failures: list[str]) -> None:
         st.record_alert("GRAM", 70.0)
         st.close()
         _P(d["output"]["watchlist_json"]).write_text(_json.dumps([
-            {"symbol": "GRAM", "zone": "ПРУЖИНА/ДНО", "score": 70.0, "confidence": 0.9, "track": "A"},
-            {"symbol": "LUNC", "zone": "ПРУЖИНА/ДНО", "score": 67.1, "confidence": 0.9, "track": "Q"},
+            {"symbol": "GRAM", "zone": "ПРУЖИНА/ДНО", "score": 70.0, "confidence": 0.9, "track": "A",
+             "rf_venue": "Bybit spot"},
+            {"symbol": "LUNC", "zone": "ПРУЖИНА/ДНО", "score": 67.1, "confidence": 0.9, "track": "Q",
+             "rf_venue": "Bybit spot"},
             {"symbol": "MID", "zone": "СЕРЕДИНА", "score": 69.0, "confidence": 0.9, "track": "A"},
+            {"symbol": "DEXL", "zone": "ПРУЖИНА/ДНО", "score": 66.0, "confidence": 0.9, "track": "A",
+             "rf_venue": "DEX only"},
         ]), encoding="utf-8")
         ps = PositionStore(d["output"]["db_path"])
         pid = ps.add("GRAM", 1.5, 66.7, coin_id="the-open-network", base_low=1.3, paper=True)

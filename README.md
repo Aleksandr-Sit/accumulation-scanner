@@ -85,7 +85,8 @@
   py -3 run.py card GRAM --notify --test   # прислать карточку с пометкой «🧪 ТЕСТ»
   py -3 run.py brief                   # сводка дня (без сети); --notify — отправить без звука
   ```
-  Фильтр карточек — `stage6_telegram` в config.json (`min_score`, `only_zones`, `max_alerts`),
+  Фильтр карточек — `stage6_telegram` в config.json (`min_score`, `only_zones`, `only_venues` —
+  с 16.10.2026 только «Bybit spot», карточки «DEX only» не приходят, `max_alerts`),
   лестница в карточке — `card_budget_usdt` / `card_steps` (5 × $10, как у пробного исполнителя:
   цены совпадают с его журналом), картинка — `charts`.
 

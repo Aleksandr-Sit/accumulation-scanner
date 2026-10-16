@@ -451,11 +451,13 @@ def select_picks(watchlist: list, cfg) -> list:
     Им же пишется mute: монета, которой не было в сообщении, не должна глушиться."""
     t = cfg["stage6_telegram"]
     zones = set(t.get("only_zones") or [])
+    venues = set(t.get("only_venues") or [])
     min_score = t.get("min_score", 0)
     min_conf = t.get("min_confidence", 0.0)
     picks = [c for c in watchlist
              if c.score >= min_score and c.confidence >= min_conf
-             and (not zones or c.zone in zones)]
+             and (not zones or c.zone in zones)
+             and (not venues or c.rf_venue in venues)]
     return picks[:t.get("max_alerts", 10)]
 
 
