@@ -12,7 +12,7 @@ from ..ladder import fmt_step, plan_ladder
 from ..sources import bybit, coingecko
 
 _SIGNAL_LABEL = {"invalidation": "стоп", "trailing": "трейл", "peak_zone": "зона распределения",
-                 "market_hot": "перегрев рынка"}
+                 "market_hot": "перегрев рынка", "bn_monitor": "метка Binance"}
 
 
 def _creds(cfg) -> tuple[str, str]:
@@ -345,7 +345,24 @@ def brief_state(cfg, *, now: float | None = None, scan_exit: int | None = None,
             # EXIT_NODATA — не падение: пары без данных Bybit в блоке исполнителя
             "exec_fail": bool(exec_exit) and exec_exit != EXIT_NODATA,
             # демо-счёт Bybit (блок F): книги, действия за сутки, ключ (таблиц нет — None)
-            "demo": _demo_state(cfg, now), "demo_fail": bool(demo_exit)}
+            "demo": _demo_state(cfg, now), "demo_fail": bool(demo_exit),
+            # метки Monitoring Binance (sources/binance_tags.py): число и дата / «⚠ не загружены»
+            "bn_tags": bn_tags_state(cfg, now)}
+
+
+def bn_tags_state(cfg, now: float) -> dict | None:
+    """Состояние меток Binance для сводок, только чтение; правило выключено целиком — None."""
+    try:
+        from .. import executor
+        from ..sources import binance_tags
+        bm = executor.settings(cfg)["binance_monitor"]
+        if not any(bm.get(k, True) for k in ("block_entry", "exit", "watch_alert")):
+            return None
+        v = binance_tags.view(cfg["output"]["db_path"], now, bm.get("max_age_days", 3), ro=True)
+        return {k: v[k] for k in ("status", "count", "updated_ts", "err", "note")}
+    except Exception as e:  # noqa: BLE001 — сбой строки не должен съесть сводку
+        print(f"[brief] строка меток Binance пропущена: {type(e).__name__}: {e}")
+        return None
 
 
 def _demo_state(cfg, now: float) -> dict | None:

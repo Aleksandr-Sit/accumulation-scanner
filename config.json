@@ -244,6 +244,14 @@
     "market_max_age_days": 3,
     "shadow": true,
     "shadow_max_coins": 30,
+    "binance_monitor": {
+      "_note": "Метка Binance «Monitoring Tag» (кандидаты на делистинг) — замер Q12 16.10.2026 (backtest/monitoring_tag_study.py, итоги — backtest/monitoring_tag_results.json): с 07.2023 метку получили 166 монет, 76% потом делистнуты (71% — в течение года), цена через год −57% (к альтам −76%); повод — BICO: метка 09.10.2026, пробный и демо купили её 10.10. Решение владельца 16.10.2026: block_entry — монета под меткой не покупается ни в R, ни в H (уходит в тень bn_monitor; тень bn_monitor метку на выходе не применяет — книга «правила нет»); exit — открытая позиция R/H и тени продаётся целиком по первому дневному закрытию Bybit после дня метки (день метки + 1, как в замере), лимитки снимаются, демо-счёт зеркалит; watch_alert — реальной позиции громкая карточка «⚠ метка Monitoring Binance» один раз. Источник — scanner/sources/binance_tags.py: публичный CMS Binance (каталоги 49 и 161), раз в UTC-день, таблицы exchange_tags / exchange_tag_articles / exchange_tag_sync. Меток в базе нет вовсе — не блокирует (fail-open, «⚠ метки Binance не загружены» в сводке); последнее успешное обновление старше max_age_days — блок по последнему известному и «⚠ метки Binance от DD.MM». Тёзки: метка по тикеру Binance; цена Binance (api/v3/ticker/price) против нашей дальше price_tol (доля) — другая монета, метку не применяем; цены нет или пары на Binance нет — та же монета (тикер совпал, монета пришла карточкой/позицией под ним).",
+      "block_entry": true,
+      "exit": true,
+      "watch_alert": true,
+      "max_age_days": 3,
+      "price_tol": 0.2
+    },
     "_books_note": "R — stage8_exit целиком; H — без частичных продаж и трейла, только аварийный стоп. stop_pct — буфер под лоу базы. H −25% выбран по backtest/hold_stop_study.py 06.10.2026: шире стоп — медиана не лучше, хвост тяжелее (портфель 10 монет p10 −26% при −25 против −47% при −50).",
     "books": {
       "R": {"label": "правила", "emoji": "📏", "exits": "rules", "stop_pct": 25},
@@ -298,7 +306,8 @@
       "api.gopluslabs.io": 50,
       "api.honeypot.is": 50,
       "github.com": 30,
-      "api.github.com": 30
+      "api.github.com": 30,
+      "www.binance.com": 30
     }
   },
 

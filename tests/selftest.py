@@ -5955,6 +5955,514 @@ def test_demo(cfg, failures: list[str]) -> None:
            and bb.check_key(info, "trade")["level"] == "danger", failures)
 
 
+class _FakeBinanceHttp:
+    """CMS Binance и цены Binance для sources/binance_tags.py: страницы каталогов — списками
+    статей (новые первыми), сбой страницы — fail {(каталог, страница)} (ответа нет, как у
+    HttpClient после повторов), detail — тело вводной статьи, prices — ответ ticker/price."""
+
+    def __init__(self, pages: dict, detail: dict | None = None, prices: list | None = None):
+        self.pages = pages
+        self.detail = detail or {}
+        self.prices = prices or []
+        self.fail: set = set()
+        self.calls: list = []
+
+    def get_json(self, url, params=None, headers=None, use_cache=True, retries=5):
+        from scanner.sources import binance_tags as bt
+        params = dict(params or {})
+        self.calls.append((url, params))
+        if url == bt.CMS:
+            key = (params["catalogId"], params["pageNo"])
+            if key in self.fail:
+                return None
+            pg = self.pages.get(key[0], [])
+            arts = pg[key[1] - 1] if key[1] <= len(pg) else []
+            return {"code": "000000", "data": {"catalogs": [{"articles": arts}]}}
+        if url == bt.DETAIL:
+            return {"code": "000000", "data": {"body": self.detail.get(params["articleCode"], "")}}
+        if url == bt.PRICES:
+            return self.prices
+        return None
+
+    def cms_pages(self) -> list:
+        from scanner.sources import binance_tags as bt
+        return [(p["catalogId"], p["pageNo"]) for u, p in self.calls if u == bt.CMS]
+
+
+def test_binance_monitor(cfg, failures: list[str]) -> None:
+    print("Метка Monitoring Binance (Q12): источник, вход → тень, выход день+1, демо, watch:")
+    import calendar
+    import copy
+    import json as _json
+    import os
+    import sqlite3
+    import tempfile
+    from pathlib import Path as _P
+    from scanner import demo as dm
+    from scanner import executor as ex
+    from scanner import pipeline
+    from scanner.config import Config
+    from scanner.db import Store
+    from scanner.ladder import MARKET_FEE
+    from scanner.models import Candidate
+    from scanner.notify import deliver, telegram as tg
+    from scanner.positions import PositionStore
+    from scanner.sources import binance_tags as bt
+    from scanner.sources import coingecko as cg
+    D, H = ex.DAY, ex.HOUR
+    d0 = 1790812800                        # 2026-10-01 00:00 UTC
+    now0 = d0 + 6 * H + 1800
+
+    def day(s: str) -> int:
+        y, mo, dd = (int(x) for x in s.split("-"))
+        return calendar.timegm((y, mo, dd, 0, 0, 0))
+
+    # --- (1) разбор заголовков (чистые функции)
+    pt = bt.parse_title
+    _check("заголовок: «Include BICO & CVC on 2026-10-09» -> BICO, CVC; день 09.10 00:00 UTC",
+           pt("Binance Will Extend the Monitoring Tag to Include BICO & CVC on 2026-10-09")
+           == (["BICO", "CVC"], [], day("2026-10-09")), failures)
+    _check("заголовок: «X, Y & Z» и тикер из одного символа — ACA, D, DATA, FLOW",
+           pt("Binance Will Extend the Monitoring Tag to Include ACA, D, DATA & FLOW on "
+              "2026-01-02")[0] == ["ACA", "D", "DATA", "FLOW"], failures)
+    _check("заголовок: «A, B and C» и «to GPS» без Include",
+           pt("Binance Will Extend the Monitoring Tag to Include BETA, BOND, WTC and XEM on "
+              "2023-10-04")[0] == ["BETA", "BOND", "WTC", "XEM"]
+           and pt("Binance Will Extend the Monitoring Tag to GPS on 2025-03-07")[0] == ["GPS"],
+           failures)
+    a, r, _d = pt("Binance Will Extend the Monitoring Tag to Include STMX & TROY, Remove the "
+                  "Monitoring Tag for CVX & SUN, and Remove the Seed Tag for ARKM, BLUR, JTO & "
+                  "TIA on 2025-01-02")
+    _check("заголовок: метка + снятие + Seed Tag — Seed Tag не путается с Monitoring",
+           a == ["STMX", "TROY"] and r == ["CVX", "SUN"], failures)
+    a, r, _d = pt("Binance Will Remove the Monitoring Tag for ZEC and the Seed Tag for ENA, "
+                  "PYTH, TAO & W on 2025-07-09")
+    _check("заголовок: только снятие «for ZEC and the Seed Tag …» -> снят ZEC",
+           a == [] and r == ["ZEC"], failures)
+    a, _r, _d = pt("Binance Will Change the Monitoring Tag Inclusion Frequency to Monthly and "
+                   "Extend the Monitoring Tag to Include AERGO, ALPACA & AST on 2025-03-04")
+    _check("заголовок: «Change … Frequency … and Extend …» -> AERGO, ALPACA, AST",
+           a == ["AERGO", "ALPACA", "AST"], failures)
+    intro_body = _json.dumps({"node": "root", "child": [
+        {"node": "text", "text": "will be applied to the following tokens that exhibit risks: "
+                                 "Enzyme (MLN) Akropolis (AKRO) "},
+        {"node": "text", "text": "Binance will conduct periodic reviews (SEED)"}]})
+    _check("вводная статья: тикеры из текста между «following tokens» и «Binance will conduct»",
+           bt.intro_tickers(intro_body) == ["MLN", "AKRO"], failures)
+    iv = bt.intervals([
+        {"day": day("2023-07-26"), "added": "MLN", "removed": "", "title": "intro"},
+        {"day": day("2024-07-01"), "added": "", "removed": "MLN", "title": "rm"},
+        {"day": day("2026-04-14"), "added": "MLN", "removed": "", "title": "again"},
+        {"day": day("2025-01-01"), "added": "ZEN", "removed": "", "title": "z"},
+        {"day": day("2025-01-01"), "added": "", "removed": "ZEN", "title": "z-rm"}])
+    _check("интервалы: снята и помечена снова — снова под меткой с 14.04; снятие в день метки "
+           "идёт раньше неё",
+           [x["since"] for x in iv["MLN"]] == [day("2023-07-26"), day("2026-04-14")]
+           and iv["MLN"][-1]["removed"] is None and iv["MLN"][0]["removed"] == day("2024-07-01")
+           and iv["ZEN"][-1]["removed"] is None, failures)
+
+    # --- (2) обход CMS: полный, дообход, сбой, бюджет, устаревание, fail-open
+    def art(code: str, title: str, ts: float) -> dict:
+        return {"code": code, "title": title, "releaseDate": int(ts * 1000)}
+    T = "Binance Will Extend the Monitoring Tag to Include "
+
+    def cms() -> dict:
+        return {49: [
+            [art("f1", "Binance Launches Something", day("2026-10-15")),
+             art("bico", T + "BICO & CVC on 2026-10-09", day("2026-10-09") + 7 * H)],
+            [art("mln2", T + "FARM, MLN & VELODROME, Remove the Seed Tag for XAUT on 2026-04-14",
+                 day("2026-04-13")),
+             art("flow", T + "COS & WIF, Remove the Monitoring Tag for FLOW, and Remove the Seed "
+                 "Tag for ONDO on 2026-03-06", day("2026-03-05")),
+             art("d", T + "ACA, D, DATA & FLOW on 2026-01-02", day("2026-01-01"))],
+            [art("zen", "Binance Will Extend the Monitoring Tag to Include BAL & SUN and Remove "
+                 "the Monitoring Tag for MLN & ZEN on 2024-07-01", day("2024-06-28")),
+             art("zec", T + "ZEC & ZEN, and Remove the Seed Tag for GMX & SUSHI on 2024-01-04",
+                 day("2024-01-03")),
+             art("intro", "Introducing Seed Tags & Monitoring Tags for Tokens with High "
+                 "Volatility and Risks", day("2023-07-26") + 3 * H),
+             art("old", "Binance Lists Something", day("2023-06-20"))]],
+            161: [[art("act", T + "ACT, BLUR, PIVX & QKC on 2026-06-18", day("2026-06-17")),
+                   art("old161", "Binance Will Delist X on 2023-06-10", day("2023-06-01"))]]}
+    t1 = day("2026-10-16") + 5 * H
+    want = {"BICO", "CVC", "FARM", "MLN", "VELODROME", "COS", "WIF", "ACA", "D", "DATA", "BAL",
+            "SUN", "ZEC", "AKRO", "ACT", "BLUR", "PIVX", "QKC"}
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "t.db")
+        v0 = bt.view(db, t1)
+        _check("меток в базе нет -> status none, «⚠ метки Binance не загружены», ничего не "
+               "блокируется (fail-open)",
+               v0["status"] == "none" and v0["tagged"] == {}
+               and bt.line(v0) == "⚠ метки Binance не загружены"
+               and bt.check(v0, "BICO", 1.0) is None, failures)
+        fh = _FakeBinanceHttp(cms(), {"intro": intro_body},
+                              [{"symbol": "BICOUSDT", "price": "0.0173"},
+                               {"symbol": "BICOBTC", "price": "1e-7"}])
+        r1 = bt.refresh(db, fh, t1)
+        v1 = bt.view(db, t1)
+        _check("полный обход: каталоги 49 (3 стр. до 07.2023) и 161, вводная статья — из detail",
+               r1["ok"] and fh.cms_pages() == [(49, 1), (49, 2), (49, 3), (161, 1)]
+               and v1["status"] == "ok" and set(v1["tagged"]) == want, failures)
+        _check("под меткой: MLN — с повторной метки 14.04 (снята 01.07.2024); FLOW и ZEN сняты; "
+               "D — однобуквенный",
+               v1["tagged"]["MLN"]["since"] == day("2026-04-14") and "FLOW" not in v1["tagged"]
+               and "ZEN" not in v1["tagged"] and v1["tagged"]["D"]["since"] == day("2026-01-02")
+               and v1["tagged"]["BICO"]["since"] == day("2026-10-09"), failures)
+        _check("раз в UTC-день: сразу после обновления — не пора; на следующий день — пора",
+               not bt.due(db, t1 + H) and bt.due(db, t1 + D), failures)
+        fh.calls.clear()
+        fh.pages[49][0].insert(0, art("new", T + "NEWC on 2026-10-17", day("2026-10-17") + H))
+        r2 = bt.refresh(db, fh, t1 + D)
+        v2 = bt.view(db, t1 + D)
+        _check("дообход: по первой странице каталога до уже просмотренных статей (2 запроса), "
+               "новая метка NEWC добавлена",
+               r2["ok"] and r2["new"] == 1 and fh.cms_pages() == [(49, 1), (161, 1)]
+               and "NEWC" in v2["tagged"], failures)
+        fh.calls.clear()
+        fh.fail = {(49, 1)}
+        r3 = bt.refresh(db, fh, t1 + 2 * D)
+        v3 = bt.view(db, t1 + 2 * D)
+        _check("сбой сети: err, последнее известное состояние на месте, повтор не раньше 30 мин",
+               not r3["ok"] and "каталог 49" in r3["err"] and v3["err"] == r3["err"]
+               and set(v3["tagged"]) == want | {"NEWC"} and v3["status"] == "ok"
+               and not bt.due(db, t1 + 2 * D + 600) and bt.due(db, t1 + 2 * D + 1900), failures)
+        v4 = bt.view(db, t1 + 5 * D, max_age_days=3)
+        _check("устарело (обновлено 4 дня назад при пороге 3) -> stale «⚠ метки Binance от "
+               "17.10», блок по последнему известному",
+               v4["status"] == "stale" and v4["note"] == "⚠ метки Binance от 17.10"
+               and "BICO" in v4["tagged"], failures)
+        vp = bt.with_prices(bt.view(db, t1 + D), fh)
+        c_ok, c_far = bt.check(vp, "BICO", 0.0170, 0.2), bt.check(vp, "BICO", 0.05, 0.2)
+        c_none = bt.check(vp, "CVC", 0.1, 0.2)
+        _check("тёзка: цена Binance (одним запросом, пары XXXUSDT) в ±20% — та же; 0.05 против "
+               "0.0173 — другая; пары нет — та же (по тикеру)",
+               c_ok["same"] and c_ok["verdict"] is True and c_far["same"] is False
+               and "другая монета" in c_far["note"] and c_none["same"]
+               and c_none["verdict"] is None
+               and sum(1 for u, _p in fh.calls if u == bt.PRICES) == 1, failures)
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "t.db")
+        fh = _FakeBinanceHttp(cms(), {})            # detail не ответил — список из Q12
+        clock = iter(range(0, 10000, 100))
+        r5 = bt.refresh(db, fh, t1, budget_s=150, clock=lambda: next(clock))
+        v5 = bt.view(db, t1)
+        fh.calls.clear()
+        r6 = bt.refresh(db, fh, t1 + H)
+        v6 = bt.view(db, t1 + H)
+        _check("бюджет обхода: недообход — partial, блок по известному (BICO), продолжение со "
+               "стр. 3; detail не ответил — 26 монет вводной из Q12",
+               not r5["ok"] and v5["status"] == "partial" and "BICO" in v5["tagged"]
+               and "AKRO" not in v5["tagged"] and r6["ok"]
+               and fh.cms_pages()[0] == (49, 3) and v6["status"] == "ok"
+               and {"AKRO", "YFII", "WRX"} <= set(v6["tagged"])
+               and "MLN" in v6["tagged"], failures)
+
+    # --- (3) исполнитель: вход
+    inst = {"symbol": "", "status": "Trading", "st": False, "tick": 0.01, "qty_step": 0.1,
+            "min_qty": 0.1, "min_amt": 5.0}
+    hist = [(d0 - k * D, 0.95 if k == 10 else 1.0) for k in range(40, 0, -1)]
+    cold = {"day": d0 + 4 * D, "hot": {"lit": [], "near": [], "avail": 8, "n_lit": 0}}
+    after = [(d0, 1.0), (d0 + D, 1.02), (d0 + 2 * D, 1.04), (d0 + 3 * D, 1.06)]
+
+    def mk(tmp: str, bm: dict | None = None, **exe) -> Config:
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {**d.get("output", {}), "db_path": str(_P(tmp) / "t.db"),
+                       "watchlist_json": str(_P(tmp) / "wl.json")}
+        d["executor"] = {**d.get("executor", {}), **exe}
+        if bm is not None:
+            d["executor"]["binance_monitor"] = {**d["executor"].get("binance_monitor", {}), **bm}
+        d["demo"] = {**d.get("demo", {}), "since": "2026-10-01", "settle_s": 0}
+        (_P(tmp) / "wl.json").write_text("[]", encoding="utf-8")
+        Store(d["output"]["db_path"]).close()
+        return Config(d)
+
+    def pair(m, sym: str) -> None:
+        p = f"{sym}USDT"
+        m.inst[p] = {**inst, "symbol": p}
+        m.price[p] = 1.0
+        m.days[p] = hist + after
+
+    def card(c: Config, sym: str, ts: float = now0) -> None:
+        _wl_add(c, sym)
+        con = sqlite3.connect(c["output"]["db_path"])
+        con.execute("INSERT INTO alert_log(symbol, ts, score) VALUES (?,?,72)", (sym, ts))
+        con.commit()
+        con.close()
+
+    def q(c: Config, sql: str, args=()) -> list[dict]:
+        con = sqlite3.connect(c["output"]["db_path"])
+        con.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in con.execute(sql, args).fetchall()]
+        finally:
+            con.close()
+
+    def tv(tagged: dict, prices: dict | None = None, status: str = "ok") -> dict:
+        return {"status": status, "count": len(tagged), "updated_ts": now0, "err": "", "note": "",
+                "tagged": {k: {"since": v, "title": f"… {k} …"} for k, v in tagged.items()},
+                "price": lambda s: (prices or {}).get(s)}
+
+    def entry(bm: dict | None = None, tags=None, syms=("TAGC", "NAMS", "NOPX", "FREE")):
+        with tempfile.TemporaryDirectory() as tmp:
+            c = mk(tmp, bm)
+            m = _FakeMarket(now0)
+            for sym in syms:
+                pair(m, sym)
+                card(c, sym)
+            code, lines = ex.run_dry(c, m, now=now0, mctx=cold, tags=tags)
+            ps = q(c, "SELECT * FROM dry_positions ORDER BY id")
+            bs = deliver.brief_state(c, now=now0, exec_exit=0)
+            m.now = d0 + 4 * D + 6 * H
+            code2, lines2 = ex.run_dry(c, m, now=m.now, mctx=cold, tags=tags)
+            ps2 = q(c, "SELECT * FROM dry_positions ORDER BY id")
+        return {"code": code, "lines": lines, "ps": ps, "bs": bs, "lines2": lines2, "ps2": ps2}
+
+    def rows(res: dict, sym: str, key: str = "ps") -> list[dict]:
+        return [p for p in res[key] if p["symbol"] == sym]
+    since = d0 - 8 * D                                         # метка 23.09
+    tags = tv({"TAGC": since, "NAMS": since, "NOPX": since}, {"TAGC": 1.05, "NAMS": 3.0})
+    e1 = entry(tags=tags)
+    tg1 = rows(e1, "TAGC")
+    _check("вход: под меткой — ни R, ни H, обе книги в тень с shadow_why bn_monitor, лестница стоит",
+           e1["code"] == 0 and sorted(p["book"] for p in tg1) == ["H", "R"]
+           and all(p["shadow"] == 1 and p["status"] == "open" and p["shadow_why"] == "bn_monitor"
+                   and p["spent_usdt"] > 0 for p in tg1), failures)
+    _check("лог: «НЕ покупаю — метка Monitoring Binance с 23.09 → в тень R/H»",
+           any("TAGC: НЕ покупаю — метка Monitoring Binance с 23.09 → в тень R/H" in x
+               for x in e1["lines"]), failures)
+    _check("вход: цены Binance нет — блок по тикеру (fail-closed): NOPX в тени",
+           all(p["shadow"] == 1 and p["shadow_why"] == "bn_monitor" for p in rows(e1, "NOPX"))
+           and len(rows(e1, "NOPX")) == 2, failures)
+    _check("вход: тёзка (Binance 3.0 против Bybit 1.0) — не блокирует, основные книги, пометка в "
+           "логе; без метки — как обычно",
+           all(p["shadow"] == 0 and p["status"] == "open" for p in rows(e1, "NAMS"))
+           and any("NAMS: ⚠ тикер NAMS под меткой Monitoring Binance с 23.09, но цена Binance 3 "
+                   "против 1" in x for x in e1["lines"])
+           and all(p["shadow"] == 0 for p in rows(e1, "FREE")) and len(rows(e1, "FREE")) == 2,
+           failures)
+    _check("сводка дня: «в тени — метка Monitoring Binance»; строка состояния меток в логе",
+           ("TAGC", "метка Monitoring Binance") in e1["bs"]["executor"]["shadowed"]
+           and any(x.startswith("метки Monitoring Binance: под меткой 3, обновлено") for x in e1["lines"]),
+           failures)
+    _check("тень bn_monitor метку на выходе не применяет (книга «правила нет»); тёзка на выходе "
+           "не продаётся — строка в логе",
+           all(p["status"] == "open" for p in rows(e1, "TAGC", "ps2"))
+           and all(p["status"] == "open" for p in rows(e1, "NAMS", "ps2"))
+           and any("NAMS: тикер NAMS под меткой" in x for x in e1["lines2"]), failures)
+    e2 = entry(bm={"block_entry": False}, tags=tags, syms=("TAGC",))
+    _check("выключатель block_entry false — монета под меткой покупается в R/H",
+           all(p["shadow"] == 0 for p in rows(e2, "TAGC")) and len(rows(e2, "TAGC")) == 2,
+           failures)
+    e3 = entry(tags=None, syms=("TAGC",))
+    _check("fail-open: меток в базе нет (tags None -> база пуста) — покупает, в логе «⚠ метки "
+           "Binance не загружены»",
+           all(p["shadow"] == 0 for p in rows(e3, "TAGC")) and len(rows(e3, "TAGC")) == 2
+           and "⚠ метки Binance не загружены" in e3["lines"], failures)
+    _check("fail-open: status none в tags — тоже не блокирует",
+           all(p["shadow"] == 0 for p in rows(entry(tags=tv({}, status="none"),
+                                                    syms=("TAGC",)), "TAGC")), failures)
+    # устаревшие метки в базе — блок по последнему известному, «⚠ метки Binance от 21.09»
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        fh = _FakeBinanceHttp({49: [[art("stal", T + "STAL on 2026-09-01", day("2026-09-01")),
+                                     art("o", "x", day("2023-06-01"))]]})
+        bt.refresh(c["output"]["db_path"], fh, d0 - 10 * D)
+        m = _FakeMarket(now0)
+        pair(m, "STAL")
+        card(c, "STAL")
+        _c, lines_s = ex.run_dry(c, m, now=now0, mctx=cold)
+        ps_s = q(c, "SELECT * FROM dry_positions")
+        st_s = deliver.brief_state(c, now=now0, exec_exit=0)
+        txt_s = tg.strip_html(tg.format_brief(st_s, c, now=now0))
+    _check("устаревшие метки (21.09 при пороге 3 дн.) — блок по последнему известному, лог и "
+           "сводка «⚠ метки Binance от 21.09»",
+           len(ps_s) == 2 and all(p["shadow"] == 1 and p["shadow_why"] == "bn_monitor" for p in ps_s)
+           and any(x.startswith("⚠ метки Binance от 21.09") for x in lines_s)
+           and "⚠ метки Binance от 21.09" in txt_s, failures)
+
+    # --- (4) выход: открытая позиция R/H и тень (bottom) — по закрытию дня метки + 1
+    def exit_run(bm: dict | None = None, prices: dict | None = None, demo_fx=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            c = mk(tmp, bm)
+            m = _FakeMarket(now0)
+            for sym in ("AAA", "BOT"):
+                pair(m, sym)
+                card(c, sym)
+            m.ranks = {"ok": True, "day": ex.utc_day(now0), "n": 8, "note": "",
+                       "by_sym": {"AAA": {"rank": 1, "n": 8, "share": 1 / 8, "usd": 1e7},
+                                  "BOT": {"rank": 8, "n": 8, "share": 1.0, "usd": 1e3}}}
+            ex.run_dry(c, m, now=now0, mctx=cold, tags=tv({}))
+            if demo_fx is not None:
+                dm.run_demo(c, demo_fx, now=now0 + 60, sleep=lambda s: None)
+            m.now = d0 + 4 * D + 6 * H
+            tg2 = tv({"AAA": d0 + D, "BOT": d0 + D}, prices if prices is not None else
+                     {"AAA": 1.05})                          # метка 02.10 — продажа по 03.10
+            code, lines = ex.run_dry(c, m, now=m.now, mctx=cold, tags=tg2)
+            out = {"code": code, "lines": lines,
+                   "ps": q(c, "SELECT * FROM dry_positions ORDER BY id"),
+                   "os": q(c, "SELECT * FROM dry_orders ORDER BY link_id"),
+                   "bs": deliver.brief_state(c, now=m.now, exec_exit=0)}
+            out["txt"] = tg.strip_html(tg.format_brief(out["bs"], c, now=m.now))
+            if demo_fx is not None:
+                dm.run_demo(c, demo_fx, now=m.now, sleep=lambda s: None)
+                out["dp"] = q(c, "SELECT * FROM demo_positions ORDER BY dry_id")
+                out["do"] = q(c, "SELECT * FROM demo_orders ORDER BY link_id")
+        return out
+    fx = _FakeDemo({"AAAUSDT": 1.0}, {})
+    x1 = exit_run(demo_fx=fx)
+    aaa = [p for p in x1["ps"] if p["symbol"] == "AAA"]
+    bot = [p for p in x1["ps"] if p["symbol"] == "BOT"]
+    sells = {o["position_id"]: o for o in x1["os"] if o["side"] == "Sell"}
+    _check("выход R и H: позиция закрыта «метка Binance», продан весь остаток (хвост < шага 0.1)",
+           x1["code"] == 0 and len(aaa) == 2
+           and all(p["status"] == "closed" and p["reason"] == "метка Binance" and p["qty"] < 0.1
+                   for p in aaa), failures)
+    _check("выход: по закрытию дня ПОСЛЕ дня метки (метка 02.10 -> закрытие 03.10 = 1.04, "
+           "исполнено 04.10 00:00), рыночная комиссия, orderLinkId …-S-BNM",
+           all(sells[p["id"]]["signal"] == "bn_monitor" and abs(sells[p["id"]]["price"] - 1.04) < 1e-12
+               and sells[p["id"]]["filled_ts"] == d0 + 3 * D
+               and sells[p["id"]]["link_id"] == f"dry-{p['book']}{p['id']}-S-BNM"
+               and abs(p["proceeds_usdt"] - sells[p["id"]]["qty"] * 1.04 * (1 - MARKET_FEE)) < 1e-9
+               for p in aaa), failures)
+    _check("выход: неисполненные лимитки покупки сняты (по 4 на книгу), новых нет",
+           all(sum(1 for o in x1["os"] if o["position_id"] == p["id"] and o["side"] == "Buy"
+                   and o["status"] == "cancelled") == 4
+               and not any(o["position_id"] == p["id"] and o["status"] == "new" for o in x1["os"])
+               for p in aaa + bot), failures)
+    _check("тень (нижняя четверть) продаётся по метке так же — для честного сравнения (shd-…-S-BNM)",
+           len(bot) == 2 and all(p["shadow"] == 1 and p["status"] == "closed"
+                                 and p["reason"] == "метка Binance"
+                                 and sells[p["id"]]["link_id"].startswith("shd-") for p in bot),
+           failures)
+    _check("сводка дня: «продажи: R AAA метка Binance, H AAA метка Binance»",
+           ("R", "AAA", "bn_monitor") in x1["bs"]["executor"]["sells"]
+           and "R AAA метка Binance" in x1["txt"] and "H AAA метка Binance" in x1["txt"], failures)
+    dpa = [d for d in x1.get("dp", []) if d["symbol"] == "AAA"]
+    _check("демо-счёт зеркалит: обе позиции закрыты «метка Binance», остаток продан рынком (-X), "
+           "лимитки и тейк сняты",
+           len(dpa) == 2 and all(d["status"] == "closed" and d["reason"] == "метка Binance"
+                                 for d in dpa)
+           and all(any(o["dry_id"] == d["dry_id"] and o["role"] == "X" and o["status"] == "filled"
+                       for o in x1["do"]) for d in dpa)
+           and not any(o["status"] in dm.LIVE for o in x1["do"])
+           and any(lk.endswith("-B2") for lk in fx.cancels) and any("-L0" in lk for lk in fx.cancels),
+           failures)
+    x2 = exit_run(bm={"exit": False})
+    _check("выключатель exit false — позиции по метке не продаются",
+           all(p["status"] == "open" for p in x2["ps"])
+           and not any(o["signal"] == "bn_monitor" for o in x2["os"]), failures)
+    x3 = exit_run(prices={"AAA": 5.0})
+    _check("выход: тёзка (Binance 5.0 против закрытия Bybit 1.06) — AAA не продаётся, строка в "
+           "логе; BOT без цены Binance — продаётся по тикеру",
+           all(p["status"] == "open" for p in x3["ps"] if p["symbol"] == "AAA")
+           and all(p["status"] == "closed" for p in x3["ps"] if p["symbol"] == "BOT")
+           and any("AAA: тикер AAA под меткой Monitoring Binance" in x for x in x3["lines"]),
+           failures)
+    x4 = exit_run(bm={"block_entry": False, "exit": False})
+    _check("оба выключателя — правило молчит: «правило выключено» в логе, продаж нет",
+           any("правило выключено" in x for x in x4["lines"])
+           and all(p["status"] == "open" for p in x4["ps"]), failures)
+
+    # --- (5) карточка scan --notify
+    def cn(sym: str, tags_, c_=cfg, price=1.0) -> list[str]:
+        cand = Candidate(source="t", track="A", symbol=sym, zone="ПРУЖИНА/ДНО", score=72.0,
+                         confidence=0.9, rf_venue="Bybit spot", price_usd=price)
+        rk = {"ok": True, "n": 8, "by_sym": {sym: {"rank": 1, "n": 8, "share": 1 / 8, "usd": 1e7}}}
+        return ex.card_notes(c_, cand, rk, cold, now0, tags=tags_)
+    off = Config({**cfg._d, "executor": {**cfg._d["executor"], "binance_monitor": {
+        **cfg._d["executor"].get("binance_monitor", {}), "block_entry": False}}})
+    t_c = tv({"TAGC": since}, {"TAGC": 1.02})
+    _check("карточка: «⛔ метка Monitoring Binance с 23.09 — исполнитель не покупает»",
+           cn("TAGC", t_c) == ["⛔ метка Monitoring Binance с 23.09 — исполнитель не покупает"],
+           failures)
+    _check("карточка: тёзка по цене скана, без метки, block_entry false — строки нет",
+           cn("TAGC", t_c, price=5.0) == [] and cn("FREE", t_c) == []
+           and cn("TAGC", t_c, c_=off) == [], failures)
+
+    # --- (6) реальная позиция в watch: громкая карточка один раз
+    with tempfile.TemporaryDirectory() as tmp:
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {**d["output"], "db_path": os.path.join(tmp, "t.db"),
+                       "watchlist_json": os.path.join(tmp, "wl.json")}
+        d["market_regime"]["enabled"] = False
+        d["stage6_telegram"]["charts"] = False
+        d["api_keys"]["dune"] = ""
+        c = Config(d)
+        d_off = copy.deepcopy(d)
+        d_off["executor"]["binance_monitor"] = {**d["executor"].get("binance_monitor", {}),
+                                                "watch_alert": False}
+        c_off = Config(d_off)
+        db = d["output"]["db_path"]
+        live = {"t": 0}
+
+        def chart(http, coin_id, days, demo=""):
+            ts = [t for t in range(d0 - 40 * D, live["t"] - D + 1, D)]
+            return {"ts": ts + [live["t"]], "prices": [1.0] * (len(ts) + 1),
+                    "volumes": [1e6] * (len(ts) + 1), "mcaps": [None] * (len(ts) + 1)}
+        real_chart, real_fund = cg.fetch_market_chart, pipeline.fetch_funding_map
+        real_dune = pipeline.dune.fetch_onchain
+        try:
+            cg.fetch_market_chart = chart
+            pipeline.fetch_funding_map = lambda http: {}
+            pipeline.dune.fetch_onchain = lambda cfg_: {}
+            ps = PositionStore(db)
+            p_real = ps.add("RLT", 1.0, 100, coin_id="rlt", base_low=0.9, entry_ts=d0 - 20 * D)
+            p_pap = ps.add("PPR", 1.0, 100, coin_id="ppr", paper=True, base_low=0.9,
+                           entry_ts=d0 - 20 * D)
+            p_off = ps.add("OFFC", 1.0, 100, coin_id="offc", base_low=0.9, entry_ts=d0 - 20 * D)
+            ps.close_db()
+            wt = tv({"RLT": d0 - 3 * D, "PPR": d0 - 3 * D, "OFFC": d0 - 3 * D}, {"RLT": 1.01})
+            live["t"] = d0 + 6 * H
+            pipeline.run_watch(c_off, now=live["t"], http=object(), tags=wt)
+            ps = PositionStore(db)
+            off_events = "bn_monitor" in ps.event_types(p_off) or "bn_monitor" in ps.event_types(p_real)
+            ps.close_db()
+            out1 = pipeline.run_watch(c, now=live["t"], http=object(), tags=wt)
+            live["t"] = d0 + D + 6 * H
+            pipeline.run_watch(c, now=live["t"], http=object(), tags=wt)
+            ps = PositionStore(db)
+            box = [x for x in ps.outbox_pending("exit")]
+            ev_real = [e for e in ps.events(p_real) if e["type"] == "bn_monitor"]
+            pap_ev = "bn_monitor" in ps.event_types(p_pap)
+            ps.close_db()
+            st_w = deliver.brief_state(c, now=live["t"], watch_exit=0)
+        finally:
+            cg.fetch_market_chart, pipeline.fetch_funding_map = real_chart, real_fund
+            pipeline.dune.fetch_onchain = real_dune
+    row1 = next(r for r in out1["rows"] if r["position"]["id"] == p_real)
+    real_box = [x for x in box if x["position_id"] == p_real]
+    text_w, loud_w = tg.format_exit_card(real_box[0]["payload"], c) if real_box else ("", False)
+    _check("watch: реальная позиция под меткой — одна карточка за два прогона, событие bn_monitor "
+           "одно",
+           len(real_box) == 1 and len(ev_real) == 1
+           and any(s["type"] == "bn_monitor" for s in row1["signals"]), failures)
+    _check("watch: карточка громкая — «⛔ RLT — метка Monitoring Binance — риск делистинга», "
+           "«с 28.09 — риск делистинга (за год после метки делистнуты ~71%)», продать весь остаток",
+           loud_w and "⛔ <b>RLT — метка Monitoring Binance — риск делистинга</b>" in text_w
+           and "⚠ метка Monitoring Binance с 28.09 — риск делистинга (за год после метки "
+               "делистнуты ~71%)" in text_w and "Продать: весь остаток 100" in text_w, failures)
+    _check("watch: paper не получает карточки; watch_alert false — сигнала нет",
+           not pap_ev and not off_events
+           and not any(x["position_id"] == p_pap for x in box), failures)
+    _check("сводка дня: сигнал «💰RLT метка Binance» среди сигналов",
+           any(s["symbol"] == "RLT" and s["label"] == "метка Binance"
+               for s in st_w["signals_today"]), failures)
+
+    # --- (7) строки сводок
+    ok_line = tg.bn_tags_line({"status": "ok", "count": 159, "updated_ts": day("2026-10-16")})
+    _check("сводка: «под меткой Monitoring Binance 159 (обновлено 16.10)»; нет данных — «⚠ метки "
+           "Binance не загружены …»",
+           ok_line == "под меткой Monitoring Binance 159 (обновлено 16.10)"
+           and tg.bn_tags_line({"status": "none"}).startswith("⚠ метки Binance не загружены"),
+           failures)
+    wk = tg.format_weekly({"opened": 0, "open_now": 0, "invalidations": 0, "ladder_hits": 0,
+                           "trailings": 0, "paper_pnl_usdt": 0.0,
+                           "bn_tags": {"status": "ok", "count": 3, "updated_ts": day("2026-10-16")}},
+                          cfg)
+    _check("недельная: строка «🏷 под меткой Monitoring Binance 3 (обновлено 16.10)»",
+           "🏷 под меткой Monitoring Binance 3 (обновлено 16.10)" in wk, failures)
+
+
 def main() -> int:
     cfg = load_config()
     failures: list[str] = []
@@ -6031,6 +6539,8 @@ def main() -> int:
     test_executor_fixes(cfg, failures)
     print()
     test_demo(cfg, failures)
+    print()
+    test_binance_monitor(cfg, failures)
     print()
     test_github_levels(cfg, failures)
     print()

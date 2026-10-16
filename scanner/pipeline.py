@@ -434,7 +434,8 @@ def _open_paper_positions(cfg: Config, watchlist: list[Candidate],
     return opened
 
 
-def run_watch(cfg: Config, *, now: float | None = None, http: HttpClient | None = None) -> dict:
+def run_watch(cfg: Config, *, now: float | None = None, http: HttpClient | None = None,
+              tags: dict | None = None) -> dict:
     """Stage 7-8: обход открытых позиций -> exit-сигналы.
 
     Закрытия — scanner/closes: монеты с парой Bybit — закрытые свечи Bybit без кэша, иначе
@@ -445,6 +446,10 @@ def run_watch(cfg: Config, *, now: float | None = None, http: HttpClient | None 
     События, paper-исполнение, снапшот и карточка в очередь notify_outbox — одной транзакцией
     на закрытие; доставку делает run.py watch --notify (повторы, пока не дойдёт). Сбой одной
     позиции — строка с ошибкой, остальные считаются.
+    Метка Monitoring Binance (sources/binance_tags.py; tags — для тестов, None — обновление раз
+    в UTC-день, сбой — последнее известное): реальной позиции (не paper, вариант A) — сигнал
+    bn_monitor громкой карточкой через ту же очередь, один раз на позицию (журнал событий);
+    выключатель — executor.binance_monitor.watch_alert.
 
     Возвращает {"rows": [{position, pnl, held_days, signals, ...}], "summary": {...}}.
     """
@@ -466,13 +471,21 @@ def run_watch(cfg: Config, *, now: float | None = None, http: HttpClient | None 
             hot = mctx.get("hot") or {}
             market_in = {"hot_score": hot.get("score"), "lit": hot.get("lit") or []}
     onchain_map = dune.fetch_onchain(cfg) if open_pos else {}  # cached-результаты, дёшево
+    from .executor import settings as exec_settings
+    bm = exec_settings(cfg)["binance_monitor"]
+    real = [p for p in open_pos if not p.get("is_paper") and (p.get("variant") or "A") == "A"]
+    if not (bm.get("watch_alert", True) and real):
+        tags = None
+    elif tags is None:
+        tags = _bn_tags(cfg, http, now, bm)
 
     rows: list[dict] = []
     for pos in open_pos:
         try:
             rows.append(_watch_position(cfg, http, pstore, pos, now=now, demo=demo,
                                         funding=funding, market=market_in,
-                                        onchain_map=onchain_map))
+                                        onchain_map=onchain_map, tags=tags,
+                                        tag_tol=bm.get("price_tol", 0.2)))
         except Exception as e:  # noqa: BLE001 — одна позиция не должна ронять остальные
             import traceback
             traceback.print_exc()
@@ -488,9 +501,50 @@ def run_watch(cfg: Config, *, now: float | None = None, http: HttpClient | None 
     return {"rows": rows, "summary": summary}
 
 
+def _bn_tags(cfg: Config, http, now: float, bm: dict) -> dict | None:
+    """Метки Binance для watch: обновление раз в UTC-день; сбой — из базы; и он — None."""
+    from .sources import binance_tags
+    db = cfg["output"]["db_path"]
+    try:
+        return binance_tags.ensure(db, http, now, bm.get("max_age_days", 3))
+    except Exception as e:  # noqa: BLE001 — метки не должны ронять watch
+        print(f"[binance_tags] метки не обновлены: {type(e).__name__}: {e}")
+        try:
+            return binance_tags.view(db, now, bm.get("max_age_days", 3))
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def _bn_signal(pstore: PositionStore, pos: dict, state: dict, tags: dict | None, tol: float,
+               t: float, price: float, triggered: set, src: str, hwm: float,
+               armed: bool) -> dict | None:
+    """Сигнал «метка Monitoring Binance» реальной позиции: один раз на позицию (событие
+    bn_monitor в журнале), громкая карточка через notify_outbox. Тёзка по цене — молчим."""
+    if (not tags or pos.get("is_paper") or (pos.get("variant") or "A") != "A"
+            or "bn_monitor" in triggered or state.get("status") != "open"):
+        return None
+    from .sources import binance_tags
+    chk = binance_tags.check(tags, pos["symbol"], price, tol)
+    if not chk or not chk["same"]:
+        return None
+    note = (f"⚠ метка Monitoring Binance с {binance_tags.ddmm(chk['since'])} — риск делистинга "
+            f"(за год после метки делистнуты ~71%)")
+    sig = {"type": "bn_monitor", "urgency": "high", "action": "МЕТКА BINANCE — РИСК ДЕЛИСТИНГА",
+           "note": note, "close_ts": t, "price": price}
+    pnl = exit_stage.position_pnl(state, price)
+    with pstore.atomic():
+        pstore.record_event(pos["id"], "bn_monitor", price, note, close_ts=t)
+        pstore.enqueue("exit", pos["id"], t, {
+            "position": state, "last_price": price, "last_ts": t, "hwm": hwm, "pnl": pnl,
+            "pnl_at_signal": pnl, "held_days": max(0, int((t - pos["entry_ts"]) // 86400)),
+            "signals": [sig], "executed": [], "triggered": triggered | {"bn_monitor"},
+            "trail_armed": armed, "src": src})
+    return sig
+
+
 def _watch_position(cfg: Config, http: HttpClient, pstore: PositionStore, pos: dict, *,
                     now: float, demo: str, funding: dict, market: dict | None,
-                    onchain_map: dict) -> dict:
+                    onchain_map: dict, tags: dict | None = None, tag_tol: float = 0.2) -> dict:
     """Одна позиция: новые закрытия по порядку -> сигналы, paper-исполнение, снапшоты."""
     series = closes.load(http, pos, demo, now)
     ct, px, vol = series["close_ts"], series["prices"], series["volumes"]
@@ -583,6 +637,11 @@ def _watch_position(cfg: Config, http: HttpClient, pstore: PositionStore, pos: d
             break
 
     cur = pstore.get(pid) or state
+    sig = _bn_signal(pstore, pos, cur, tags, tag_tol, ct[-1], px[-1], triggered, series["src"],
+                     hwm, armed_ts is not None)
+    if sig:
+        all_signals.append(sig)
+        triggered = triggered | {"bn_monitor"}
     last_close = px[-1]
     pnl = exit_stage.position_pnl(cur, last_close)
     since_entry = [p for t, p in zip(ct, px) if t > pos["entry_ts"]]

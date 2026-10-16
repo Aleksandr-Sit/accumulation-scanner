@@ -709,13 +709,14 @@ _SIG_HEAD = {
     "trailing": ("🚨", "зафиксировать остаток"),
     "market_hot": ("🔥", "рынок перегрет — рассмотреть фиксацию"),
     "peak_zone": ("ℹ️", "зона распределения — рассмотреть фиксацию"),
+    "bn_monitor": ("⛔", "метка Monitoring Binance — риск делистинга"),
 }
 _URG = {"high": 3, "medium": 2, "low": 1}
 
 
 def _sell_qty(s: dict, pos: dict, cfg) -> float | None:
     """Сколько продать по сигналу (как paper-исполнитель): весь остаток или долю лестницы."""
-    if s["type"] in ("invalidation", "trailing"):
+    if s["type"] in ("invalidation", "trailing", "bn_monitor"):
         return pos.get("qty")
     if s["type"].startswith("ladder_"):
         try:
@@ -751,7 +752,7 @@ def format_exit_card(row: dict, cfg, *, test: bool = False) -> tuple[str, bool]:
         lines.append(f"• {_esc(s['note'])}")
         q = _sell_qty(s, p, cfg)
         if q and not paper:
-            whole = s["type"] in ("invalidation", "trailing")
+            whole = s["type"] in ("invalidation", "trailing", "bn_monitor")
             lines.append(f"  Продать: {'весь остаток ' if whole else ''}{q:.6g} {sym}"
                          + (f" ≈ ${q * price:.2f}" if price else ""))
     for ex in row.get("executed") or []:
@@ -922,6 +923,9 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
     if dm:
         lines += dm + [""]
 
+    bn = state.get("bn_tags") or {}
+    if bn.get("status") in ("none", "partial", "stale"):
+        lines.append(_esc(bn_tags_line(bn)))
     foot = []
     if scan.get("elapsed_min") is not None:
         foot.append(f"скан {scan['elapsed_min']:.0f} мин")
@@ -933,12 +937,30 @@ def format_brief(state: dict, cfg, *, now: float | None = None, test: bool = Fal
         foot.append("on-chain недоступен")
     if ((state.get("guard") or {}).get("key") or {}).get("level") == "ok":
         foot.append("ключ Bybit ✓")
+    if bn.get("status") == "ok":
+        foot.append(bn_tags_line(bn))
     if foot:
         lines.append("<i>" + _esc(" · ".join(foot)) + "</i>")
     note = track_q_note(state.get("track_q"), cfg)
     if note:                              # служебная пометка о данных — отдельной строкой
         lines.append(_esc(note))
     return "\n".join(lines).strip()
+
+
+def bn_tags_line(v: dict) -> str:
+    """Метки Monitoring Binance одной строкой (sources/binance_tags.line): число тикеров под
+    меткой и дата обновления; «⚠ … не загружены» / «⚠ … от DD.MM» — когда данных нет или
+    они старые."""
+    from ..sources.binance_tags import ddmm
+    st = v.get("status")
+    if st in (None, "none"):
+        return "⚠ метки Binance не загружены — исполнитель покупает без проверки метки"
+    n = f"под меткой Monitoring Binance {v.get('count', 0)}"
+    if st == "ok":
+        return f"{n} (обновлено {ddmm(v['updated_ts'])})"
+    if st == "partial":
+        return f"⚠ метки Binance загружены не полностью — {n} по известному"
+    return f"⚠ метки Binance от {ddmm(v['updated_ts'])} — {n} по последнему известному"
 
 
 def guard_lines(g: dict) -> list[str]:
@@ -969,7 +991,8 @@ def _signal_text(stype: str, cfg) -> str:
         i = int(stype.split("_")[1])
         lad = cfg["stage8_exit"]["ladder"]
         return f"фикс {lad[i][1] * 100:.0f}%" if i < len(lad) else stype
-    return {"invalidation": "стоп", "trailing": "трейл", "delist": "делистинг"}.get(stype, stype)
+    return {"invalidation": "стоп", "trailing": "трейл", "delist": "делистинг",
+            "bn_monitor": "метка Binance"}.get(stype, stype)
 
 
 def executor_brief_lines(ex: dict | None, cfg) -> list[str]:
@@ -1063,7 +1086,7 @@ def demo_brief_lines(dm: dict | None, cfg) -> list[str]:
 
 
 _WHY_SHORT = {"bottom": "нижняя четверть", "quota": "квота неликвида", "hot": "перегрев",
-              "nodata": "нет данных рынка"}
+              "nodata": "нет данных рынка", "bn_monitor": "метка Binance"}
 
 
 FLOW_NOTE = ("Альты, BTC и корзина куплены теми же суммами в те же дни, что исполнения книги, "
@@ -1214,6 +1237,10 @@ def format_weekly(stats: dict, cfg) -> str:
     if src:
         lines.append("")
         lines += src
+    if stats.get("bn_tags"):              # метки Binance — строкой под «🩺 Источники»
+        if not src:
+            lines.append("")
+        lines.append("🏷 " + _esc(bn_tags_line(stats["bn_tags"])))
 
     # Одноразовая итоговая сводка на N-й неделе — с кумулятивом и call-to-decide.
     if stats.get("milestone"):

@@ -46,6 +46,7 @@ SOURCE_NAMES = {
     "api.gopluslabs.io": "GoPlus", "api.honeypot.is": "honeypot.is",
     "api.alternative.me": "F&G", "api.dexscreener.com": "DexScreener",
     "api.coinmarketcap.com": "CoinMarketCap",
+    "www.binance.com": "Binance CMS", "api.binance.com": "Binance",
 }
 
 

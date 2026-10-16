@@ -54,14 +54,23 @@
   4. перегрев: горит ≥ hot_min_lit флагов market_regime.hot_flags («близко» не в счёт; без OI,
      R 2023-26: медиана −21% против +10% в холодном рынке) — новых лестниц нет; данных рынка нет или они старше
      market_max_age_days — тоже нет (вслепую не покупаем).
-Фильтры действуют только на новые входы: открытые позиции, их лимитки и выходы не трогаются.
-Нет данных оборота — фильтры 1–2 не отсекают («нет данных оборота» в логе, метки пустые).
+  5. метка Monitoring Binance (кандидат на делистинг; замер Q12 16.10.2026, backtest/
+     monitoring_tag_study.py: с 07.2023 166 монет, 76% потом делистнуты, за год 71%, цена через
+     год −57%, к альтам −76%; решение владельца 16.10.2026; источник — sources/binance_tags.py) —
+     новых лестниц нет ни в R, ни в H (в тень bn_monitor); открытая позиция R/H и тени —
+     весь остаток по первому дневному закрытию Bybit после дня метки (день метки + 1), лимитки
+     снимаются. Тёзка: цена Binance против Bybit дальше price_tol — метку не применяем; цены нет —
+     метка по тикеру. Меток в базе нет вовсе — не блокирует (fail-open, «⚠ метки Binance не
+     загружены» в сводке); устарели — блок по последнему известному.
+Фильтры 1, 2, 4 действуют только на новые входы: открытые позиции, их лимитки и выходы не
+трогаются (метка 5 — и на выходе). Нет данных оборота — фильтры 1–2 не отсекают.
 Порядок проверок: повтор/уже в книге/кулдаун (по книгам) → сверка тикера → Bybit (нет пары,
-ST, не Trading) → цена (и сверка с ценой скана) и план лестницы → фильтры 1 и 4 → лимит
-монет, USDT, risk_check (по книгам) → квота (2, по книгам).
-Отсеянные фильтрами 1, 2 и 4 уходят в теневую книгу (shadow=1): та же лестница и те же выходы
-R/H, парно, но без мест, денег и risk_check основной; до shadow_max_coins открытых монет, ордера
-с префиксом shd-. Обычные отказы (лимит монет, нет на Bybit, ST, другая монета) в тень не идут.
+ST, не Trading) → цена (и сверка с ценой скана) и план лестницы → фильтры 1, 4 и метка 5 →
+лимит монет, USDT, risk_check (по книгам) → квота (2, по книгам).
+Отсеянные фильтрами 1, 2, 4 и меткой 5 уходят в теневую книгу (shadow=1): та же лестница и те же
+выходы R/H, парно, но без мест, денег и risk_check основной; до shadow_max_coins открытых монет,
+ордера с префиксом shd-. Тень bn_monitor метку на выходе не применяет (книга «правила нет»).
+Обычные отказы (лимит монет, нет на Bybit, ST, другая монета) в тень не идут.
 Метки на входе в каждой позиции: место по обороту, число пар, доля, оборот, горящие флаги.
 """
 from __future__ import annotations
@@ -82,7 +91,8 @@ DAY = 86400
 HOUR = 3600
 LINK_MAX = 36                     # предел orderLinkId Bybit V5
 FULL_EXIT = ("invalidation", "trailing")
-SIGNAL_LABEL = {"invalidation": "стоп", "trailing": "трейл", "delist": "делистинг"}
+SIGNAL_LABEL = {"invalidation": "стоп", "trailing": "трейл", "delist": "делистинг",
+                "bn_monitor": "метка Binance"}
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True, "steps": 5, "budget_usdt": 50.0, "min_order_usdt": 10.0,
@@ -94,12 +104,16 @@ DEFAULTS: dict[str, Any] = {
     "vol_bottom_share": 0.75, "illiquid_share": 0.39, "illiquid_max_slots": 5,
     "hot_block": True, "hot_min_lit": 1, "market_max_age_days": 3,
     "shadow": True, "shadow_max_coins": 30,
+    # метка Monitoring Binance (Q12, решение владельца 16.10.2026; sources/binance_tags.py)
+    "binance_monitor": {"block_entry": True, "exit": True, "watch_alert": True,
+                        "max_age_days": 3, "price_tol": 0.2},
     "books": {"R": {"label": "правила", "emoji": "📏", "exits": "rules", "stop_pct": 25},
               "H": {"label": "держать", "emoji": "✋", "exits": "stop_only", "stop_pct": 25}},
 }
 # Почему монета в тени (dry_positions.shadow_why, через запятую).
 WHY_LABEL = {"bottom": "нижняя четверть по обороту", "quota": "квота неликвида",
-             "hot": "перегрев рынка", "nodata": "нет свежих данных рынка"}
+             "hot": "перегрев рынка", "nodata": "нет свежих данных рынка",
+             "bn_monitor": "метка Monitoring Binance"}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS dry_positions (
@@ -126,7 +140,7 @@ CREATE TABLE IF NOT EXISTS dry_positions (
     first_fill_ts REAL,
     closed_ts     REAL,
     shadow        INTEGER DEFAULT 0,    -- 1 — теневая книга: отсеяно фильтрами, мест и денег нет
-    shadow_why    TEXT DEFAULT '',      -- почему в тени: bottom,quota,hot,nodata (WHY_LABEL)
+    shadow_why    TEXT DEFAULT '',      -- почему в тени: bottom,quota,hot,nodata,bn_monitor
     vol_rank      INTEGER,              -- метки на входе: место по 30-дн. обороту Bybit
     vol_pairs     INTEGER,              --   среди скольких USDT-пар
     vol_share     REAL,                 --   место / число пар (NULL — нет данных оборота)
@@ -185,6 +199,7 @@ def settings(cfg) -> dict[str, Any]:
     s["books"] = {k: {**DEFAULTS["books"].get(k, {}), **v}
                   for k, v in (s.get("books") or DEFAULTS["books"]).items()
                   if not str(k).startswith("_")}
+    s["binance_monitor"] = {**DEFAULTS["binance_monitor"], **(s.get("binance_monitor") or {})}
     return s
 
 
@@ -220,7 +235,8 @@ def link_id(book: str, pid: int, tail: str, shadow: bool = False) -> str:
 def signal_tail(stype: str) -> str:
     if stype.startswith("ladder_"):
         return f"S-L{stype.split('_')[1]}"
-    return "S-" + {"invalidation": "INV", "trailing": "TR"}.get(stype, stype[:8].upper())
+    return "S-" + {"invalidation": "INV", "trailing": "TR", "bn_monitor": "BNM"}.get(
+        stype, stype[:8].upper())
 
 
 def utc_day(ts: float) -> int:
@@ -369,6 +385,8 @@ def why_text(keys: list[str] | str, labels: dict) -> str:
         elif k == "hot" and labels.get("hot_flags"):
             txt += " (" + ", ".join(FLAG_LABELS.get(f, f)
                                     for f in labels["hot_flags"].split(",")) + ")"
+        elif k == "bn_monitor" and labels.get("bn_since"):
+            txt += f" с {ddmm(labels['bn_since'])}"
         out.append(txt)
     return "; ".join(out)
 
@@ -381,18 +399,67 @@ def illiquid_used(con, s: dict, book: str) -> int:
                        (book, s["illiquid_share"])).fetchone()[0]
 
 
-def card_notes(cfg, c, ranks: dict | None, ctx: dict | None, now: float | None = None) -> list[str]:
-    """Строки карточки scan --notify: что исполнитель сделает с монетой (те же market_gate и
-    entry_gates, что в open_card). Только для Bybit spot: DEX-монету и тёзку под тикером
-    исполнитель не купит и так. Квоты здесь нет — она зависит от книги на момент execute."""
+# ---------------------------------------------------------------- метка Monitoring Binance
+# Замер Q12 (backtest/monitoring_tag_study.py, 16.10.2026): с 07.2023 метку получили 166 монет,
+# 76% потом делистнуты (71% — за год), цена через год −57% (−76% к альтам). Решение владельца
+# 16.10.2026: под меткой не покупать (в тень bn_monitor), открытое — продать по первому дневному
+# закрытию Bybit после дня метки. Источник и тёзки — sources/binance_tags.py.
+
+def db_tags(cfg, s: dict, now: float, db_path: str | None = None, ro: bool = False) -> dict | None:
+    """Состояние меток из базы, без сети (сбой чтения — None: правило молчит, fail-open)."""
+    from .sources import binance_tags as bt
+    try:
+        return bt.view(db_path or cfg["output"]["db_path"], now,
+                       s["binance_monitor"].get("max_age_days", 3), ro=ro)
+    except (sqlite3.Error, OSError):
+        return None
+
+
+def bn_entry(s: dict, tags: dict | None, sym: str, price: float | None) -> dict | None:
+    """Метка на входе: None — метки нет, правило выключено или меток нет вовсе (fail-open);
+    иначе binance_tags.check + block: True — не покупать (тикер под меткой, цена Binance
+    совпала или сравнить не с чем — fail-closed), False — явный тёзка по цене (note)."""
+    bm = s["binance_monitor"]
+    if not bm.get("block_entry", True) or not tags:
+        return None
+    from .sources import binance_tags as bt
+    chk = bt.check(tags, sym, price, bm.get("price_tol", 0.2))
+    return {**chk, "block": chk["same"]} if chk else None
+
+
+def bn_exit(s: dict, tags: dict | None, p: dict, ref_price: float | None) -> dict | None:
+    """Метка на выходе открытой позиции (основной и теневой): None — продавать не по чему.
+    Тень с причиной bn_monitor — книга «правила нет»: метку не применяет, иначе продалась бы
+    на следующем закрытии и ничего бы не мерила."""
+    bm = s["binance_monitor"]
+    if not bm.get("exit", True) or not tags:
+        return None
+    if p.get("shadow") and "bn_monitor" in (p.get("shadow_why") or "").split(","):
+        return None
+    from .sources import binance_tags as bt
+    return bt.check(tags, p["symbol"], ref_price, bm.get("price_tol", 0.2))
+
+
+def card_notes(cfg, c, ranks: dict | None, ctx: dict | None, now: float | None = None,
+               tags: dict | None = None) -> list[str]:
+    """Строки карточки scan --notify: что исполнитель сделает с монетой (те же market_gate,
+    entry_gates и метка Binance, что в open_card). Только для Bybit spot: DEX-монету и тёзку под
+    тикером исполнитель не купит и так. Квоты здесь нет — она зависит от книги на момент
+    execute. tags — binance_tags.view (None — из базы, без сети); тёзку сверяет цена скана."""
     s = settings(cfg)
     flags = getattr(c, "flags", None) or []
     if (not s.get("enabled", True) or getattr(c, "rf_venue", "") != "Bybit spot"
             or "bybit_ticker_mismatch" in flags or "bybit_unverified" in flags):
         return []
-    heat = market_gate(cfg, s, ctx, now if now is not None else time.time())
+    now = now if now is not None else time.time()
+    heat = market_gate(cfg, s, ctx, now)
     g = entry_gates(s, c.symbol, ranks, heat)
     out = []
+    if tags is None and s["binance_monitor"].get("block_entry", True):
+        tags = db_tags(cfg, s, now, ro=True)
+    tg = bn_entry(s, tags, c.symbol, getattr(c, "price_usd", None))
+    if tg and tg["block"]:
+        out.append(f"⛔ метка Monitoring Binance с {ddmm(tg['since'])} — исполнитель не покупает")
     if "bottom" in g["why"]:
         out.append(f"⚠ нижняя четверть по обороту — исполнитель не покупает "
                    f"({g['vol']['rank']}-е место из {g['vol']['n']} пар Bybit)")
@@ -519,16 +586,18 @@ def _insert_position(con, book: str, card: dict, pair: str, now: float, status: 
 
 
 def open_card(cfg, con, market, s: dict, card: dict, now: float, *,
-              ranks: dict | None = None, heat: dict | None = None) -> list[str]:
+              ranks: dict | None = None, heat: dict | None = None,
+              tags: dict | None = None) -> list[str]:
     """Лестница по карточке в каждую книгу отдельно (книги независимы, как в бэктесте: отказ
     одной по лимиту/риску/кулдауну не снимает вход другой); общие отказы (тикер, Bybit, план) —
     всем книгам с причиной в журнале; отсеянное фильтрами 1, 2, 4 — в теневые книги. ranks —
     места по обороту (liquidity), heat — market_gate; heat не передан — данных рынка нет.
     Одна транзакция на пару: строки всех книг пишутся вместе, сбой любой — откат всей пары
     (иначе повтор увидел бы «уже обработана», и вторая книга монету не получила бы).
-    Нет данных Bybit (сбой ответа) — DataGap: строк нет, карточка ждёт следующего прогона."""
+    Нет данных Bybit (сбой ответа) — DataGap: строк нет, карточка ждёт следующего прогона.
+    tags — метки Monitoring Binance (binance_tags.view): под меткой — в тень bn_monitor."""
     try:
-        lines = _open_card(cfg, con, market, s, card, now, ranks, heat)
+        lines = _open_card(cfg, con, market, s, card, now, ranks, heat, tags)
         con.commit()
         return lines
     except BaseException:
@@ -537,7 +606,7 @@ def open_card(cfg, con, market, s: dict, card: dict, now: float, *,
 
 
 def _open_card(cfg, con, market, s: dict, card: dict, now: float,
-               ranks: dict | None, heat: dict | None) -> list[str]:
+               ranks: dict | None, heat: dict | None, tags: dict | None = None) -> list[str]:
     sym = card["symbol"]
     pair = f"{sym}USDT"
     day = utc_day(card["ts"])
@@ -678,7 +747,15 @@ def _open_card(cfg, con, market, s: dict, card: dict, now: float,
         place(True, ",".join(keys), bks)
         return out + [f"{sym}: НЕ покупаю — {text} → в тень {'/'.join(bks)}: {ladder}"]
 
-    if g["why"]:                          # фильтры 1 и 4: свойства монеты и рынка
+    # метка Monitoring Binance — после тёзки, Bybit/ST и цены: тикер под меткой — в тень
+    # (fail-closed), явный тёзка по цене Binance — не блокирует, но пишется в лог
+    tg = bn_entry(s, tags, sym, price)
+    if tg and tg["block"]:
+        lab["bn_since"] = tg["since"]
+        g = {**g, "why": g["why"] + ["bn_monitor"]}
+    elif tg:
+        out.append(f"{sym}: ⚠ {tg['note']}")
+    if g["why"]:                          # фильтры 1, 4 и метка Binance: монета и рынок
         return to_shadow(g["why"])
     # Лимит монет, USDT и risk_check — по каждой книге отдельно; риск — по вложенному: резерв
     # новой лестницы не больше бюджета (ступени, округлённые вверх до минимума, дают $50.16).
@@ -822,11 +899,15 @@ def _cancel_buys(con, pid: int, why: str) -> int:
     return cur.rowcount
 
 
-def process_position(cfg, con, market, s: dict, pos: dict, now: float) -> list[str]:
+def process_position(cfg, con, market, s: dict, pos: dict, now: float, *,
+                     tags: dict | None = None) -> list[str]:
     """Исполнения лимиток по часовым свечам и выходы по дневным свечам с прошлого раза.
     Сбой данных Bybit — DataGap до любых изменений: ошибка дневных свечей, ошибка или дыра
     часовых при стоящих лимитках (иначе лимитки, сквозь которые прошла цена, сняли бы
-    неисполненными, а стоп посчитался бы без них). Дневных свечей нет и пары нет — делистинг."""
+    неисполненными, а стоп посчитался бы без них). Дневных свечей нет и пары нет — делистинг.
+    Метка Monitoring Binance (tags, bn_exit) — весь остаток по закрытию первого дня после дня
+    метки (день метки + 1, как в замере Q12), после тейка и стопа того же дня; лимитки снимаются;
+    тёзка (цена Binance против закрытия Bybit) — не продаём, строка в лог."""
     p = dict(pos)
     pair, book = p["pair"], p["book"]
     tag = f"тень {book}" if p.get("shadow") else book       # подпись в логе
@@ -889,6 +970,10 @@ def process_position(cfg, con, market, s: dict, pos: dict, now: float) -> list[s
         if n:
             lines.append(f"{tag} {p['symbol']}: снял бы неисполненные лимитки ({n})")
 
+    bx = bn_exit(s, tags, p, d_c[-1])
+    if bx and not bx["same"]:
+        lines.append(f"{tag} {p['symbol']}: {bx['note']}")
+        bx = None
     e = cfg["stage8_exit"]
     ecfg = Config({"stage8_exit": {**e, "invalidation_below_base_low_pct": bk.get("stop_pct", 25)}})
     arm = e["trailing_arm_after_gain_pct"] / 100.0
@@ -962,6 +1047,21 @@ def process_position(cfg, con, market, s: dict, pos: dict, now: float) -> list[s
                 close_pos(label + ("; пыль, не продать" if r["dust"] else ""), ts)
                 closed = True
                 break
+        if not closed and bx and day >= bx["since"] + DAY:
+            # метка Binance: продать весь остаток по закрытию дня после метки (или позже —
+            # первого обработанного), рыночным; пыль — как у стопа
+            label = SIGNAL_LABEL["bn_monitor"]
+            r = _sell(con, p, "bn_monitor", p["qty"], close, ts,
+                      f"метка Monitoring Binance с {ddmm(bx['since'])} — продажа по закрытию "
+                      f"{ddmm(day)}")
+            triggered.add("bn_monitor")
+            if r is not None:
+                lines.append(f"{tag} {p['symbol']}: " + (
+                    f"{label} с {ddmm(bx['since'])}, но остаток — пыль, не продать"
+                    if r["dust"] else f"продал бы {r['q']:.6g} по закрытию {close:.6g} "
+                                      f"({label} с {ddmm(bx['since'])}) → ${r['got']:.2f}"))
+            close_pos(label + ("; пыль, не продать" if r and r["dust"] else ""), ts)
+            closed = True
         _save(con, p)
         if closed:
             break
@@ -1019,7 +1119,8 @@ def _vol_ranks(market, now: float) -> dict:
 
 def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None,
             wallet_usdt: float | None = None, wallet_note: str = "",
-            mctx: dict | None = None, halt_base=None) -> tuple[int, list[str]]:
+            mctx: dict | None = None, halt_base=None,
+            tags: dict | None = None) -> tuple[int, list[str]]:
     """Шаг ежедневного прогона -> (код выхода, строки лога). Сбой одной позиции не валит
     остальные, но код станет 1 (сводка дня: «⚠ пробный исполнитель упал»); нет данных Bybit —
     код EXIT_NODATA (4, если ничего не упало) и «⚠ нет данных Bybit: PAIR (причина)», позиция
@@ -1028,7 +1129,9 @@ def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None
     Места по обороту (market.vol_ranks) считаются, только если сегодня есть карточки.
     Стоп-кран (scanner/control.py, data/HALT; halt_base — каталог для тестов) — исполнитель
     не делает ничего: ни новых лестниц, ни исполнений и продаж по открытым; база не меняется.
-    После `run.py resume` открытые досчитываются со своего места (fills_until, last_day)."""
+    После `run.py resume` открытые досчитываются со своего места (fills_until, last_day).
+    tags — метки Monitoring Binance (run.py execute: binance_tags.ensure, раз в UTC-день с
+    сетью); None — из базы без сети и без цены Binance (тёзок не различить — метка по тикеру)."""
     s = settings(cfg)
     if not s.get("enabled", True):
         return 0, ["executor.enabled = false — пропуск"]
@@ -1042,6 +1145,12 @@ def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None
     lines: list[str] = []
     code = 0
     gaps: set[str] = set()
+    bm = s["binance_monitor"]
+    bm_on = bm.get("block_entry", True) or bm.get("exit", True)
+    if not bm_on:
+        tags = None
+    elif tags is None:
+        tags = db_tags(cfg, s, now, db_path)
 
     def gap(pair: str, e: DataGap) -> None:
         """Нет данных Bybit: код EXIT_NODATA (падение — 1 — важнее) и одна строка на пару
@@ -1054,7 +1163,7 @@ def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None
     try:
         for pos in _rows(con, "SELECT * FROM dry_positions WHERE status='open' ORDER BY id"):
             try:
-                lines += process_position(cfg, con, market, s, pos, now)
+                lines += process_position(cfg, con, market, s, pos, now, tags=tags)
             except DataGap as e:            # позиция не тронута; причина — в сводку дня
                 con.rollback()
                 con.execute("UPDATE dry_positions SET data_err=? WHERE id=?", (str(e), pos["id"]))
@@ -1088,7 +1197,8 @@ def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None
             cards.sort(key=order)
             for card in cards:
                 try:
-                    got = open_card(cfg, con, market, s, card, now, ranks=ranks, heat=heat)
+                    got = open_card(cfg, con, market, s, card, now, ranks=ranks, heat=heat,
+                                    tags=tags)
                 except DataGap as e:        # карточка ждёт следующего прогона, строк нет
                     gap(f"{card['symbol']}USDT", e)
                     got = []
@@ -1101,6 +1211,9 @@ def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None
                     need += s["budget_usdt"]
         else:
             lines.append("сегодня карточек не было — новых лестниц нет")
+        from .sources import binance_tags as bt
+        lines.append(bt.line(tags) if bm_on else
+                     "метка Monitoring Binance: правило выключено (executor.binance_monitor)")
         if wallet_usdt is not None:
             enough = "хватило бы" if wallet_usdt >= need else "НЕ хватило бы"
             lines.append(f"реальный счёт: свободно {wallet_usdt:.2f} USDT; сегодняшние лестницы "

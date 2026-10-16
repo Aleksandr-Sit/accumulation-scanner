@@ -73,8 +73,9 @@ def cmd_scan(args) -> int:
         papers = _papers_opened_since(cfg, t_start)
         http = _make_http(cfg)
         ranks = _card_ranks(cfg, http) if picks else {}
+        tags = bn_tags(cfg, http) if picks else None
         for c in picks:
-            notes = _exec_notes(cfg, c, ranks, summary.get("market_ctx") or {})
+            notes = _exec_notes(cfg, c, ranks, summary.get("market_ctx") or {}, tags)
             card = deliver.coin_card(cfg, http, c, paper=papers.get(c.symbol.upper()),
                                      exec_notes=notes)
             ok = deliver.send_card(cfg, card)
@@ -104,11 +105,31 @@ def _card_ranks(cfg, http, network: bool = True) -> dict:
     return r
 
 
-def _exec_notes(cfg, c, ranks: dict, mctx: dict) -> list[str]:
-    """Строки карточки «что сделает пробный исполнитель» (executor.card_notes); сбой — без них."""
+def bn_tags(cfg, http) -> dict | None:
+    """Метки Monitoring Binance (scanner/sources/binance_tags.py): раз в UTC-день из сети (кто
+    первым — scan --notify, watch, execute), иначе из базы. Все выключатели executor.
+    binance_monitor выключены или сбой — None (исполнитель возьмёт базу, карточка — тоже)."""
     try:
         from scanner import executor
-        return executor.card_notes(cfg, c, ranks, mctx)
+        from scanner.sources import binance_tags
+        bm = executor.settings(cfg)["binance_monitor"]
+        if not any(bm.get(k, True) for k in ("block_entry", "exit", "watch_alert")):
+            return None
+        v = binance_tags.ensure(cfg["output"]["db_path"], http,
+                                max_age_days=bm.get("max_age_days", 3))
+        print(f"[binance_tags] {binance_tags.line(v)}")
+        return v
+    except Exception as e:  # noqa: BLE001 — метки не должны ронять шаг
+        print(f"[binance_tags] метки не получены: {type(e).__name__}: {e}")
+        return None
+
+
+def _exec_notes(cfg, c, ranks: dict, mctx: dict, tags: dict | None = None) -> list[str]:
+    """Строки карточки «что сделает пробный исполнитель» (executor.card_notes); сбой — без них.
+    tags None — метки Binance из базы, без сети."""
+    try:
+        from scanner import executor
+        return executor.card_notes(cfg, c, ranks, mctx, tags=tags)
     except Exception as e:  # noqa: BLE001
         print(f"[telegram] строки исполнителя для {c.symbol} пропущены: {type(e).__name__}: {e}")
         return []
@@ -752,6 +773,9 @@ def _report_weekly(args, cfg, pstore, now: float) -> int:
         stats["executor_shadow"] = executor.weekly_shadow(cfg)
     except Exception as e:  # noqa: BLE001
         print(f"[report] блок пробного исполнителя пропущен: {type(e).__name__}: {e}")
+    # Метки Monitoring Binance: сколько под меткой и от какого числа (одной строкой).
+    from scanner.notify.deliver import bn_tags_state
+    stats["bn_tags"] = bn_tags_state(cfg, now)
     # Здоровье источников за неделю (scanner/health.py): сбои, 429/404, опоздание закрытий.
     try:
         from scanner import health
@@ -943,9 +967,12 @@ def cmd_execute(args) -> int:
             st.close()
     except Exception as e:  # noqa: BLE001
         print(f"[execute] контекст рынка не обновлён ({type(e).__name__}: {e}) — беру из БД")
+    # Метка Monitoring Binance: обновление раз в UTC-день (сбой — последнее известное из базы).
+    tags = bn_tags(cfg, http)
     try:
         code, lines = executor.run_dry(cfg, executor.BybitMarket(http, db),
-                                       wallet_usdt=wallet, wallet_note=note, mctx=mctx)
+                                       wallet_usdt=wallet, wallet_note=note, mctx=mctx,
+                                       tags=tags)
     except Exception as e:  # noqa: BLE001 — код 1 и текст в лог, сводка дня покажет
         code, lines = 1, [f"FAIL: {type(e).__name__}: {e}"]
     for line in lines:
