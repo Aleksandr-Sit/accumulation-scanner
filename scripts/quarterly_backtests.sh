@@ -11,6 +11,9 @@
 #      (снимки CMC — .cache/cmc_hist, новые месяцы докачает сам), size_band_study (снимки
 #      CMC на 3000 мест — .cache/cmc_hist_deep, первый раз ~5 мин), cmc_rank_gate_study (те же
 #      снимки, ~6 мин), top20_ex_eth_study, rotation_study
+#      supply_age_gate_study (Q11, свой кэш снимков с предложением, ~8 мин + первая загрузка ~5 мин),
+#      monitoring_tag_study (Q12, анонсы CMS Binance, ~4 мин), coin_funding_study (P12, история
+#      фандинга fapi Binance: первая загрузка ~1 ч, дальше ~5 мин)
 #      (снимки CMC с 2015 — тот же кэш), regime_exit_study,
 #      market_regime_study, hold_stop_study, score_quintiles — лог каждого в logs/;
 #   4. сравнивает новые *_results.json с теми, что лежат в репозитории
@@ -117,7 +120,7 @@ EOF
 log "  клон $(git -C "$work/repo" rev-parse --short HEAD), база скопирована ($(du -h "$work/repo/scanner.db" | cut -f1))"
 
 # ---- 3. исследования
-studies="${only:-ladder_dca_study junk_filter_study portfolio_vs_market top20_basket_study size_band_study cmc_rank_gate_study top20_ex_eth_study rotation_study regime_exit_study market_regime_study hold_stop_study score_quintiles}"
+studies="${only:-ladder_dca_study junk_filter_study portfolio_vs_market top20_basket_study size_band_study cmc_rank_gate_study supply_age_gate_study monitoring_tag_study coin_funding_study top20_ex_eth_study rotation_study regime_exit_study market_regime_study hold_stop_study score_quintiles}"
 fail=0
 log "--- 3. исследования: $studies"
 for s in $studies; do

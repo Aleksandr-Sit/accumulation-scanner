@@ -424,14 +424,18 @@ def synth_rules(px: float) -> tuple[float, float]:
 def simulate_exec(seg: dict, e: int, sell: dict, *, budget: float = 50.0, steps: int = 5,
                   stop_buf: float = INVAL_BUF, horizon: int | None = 365,
                   rules: dict | None = None, valid: int = BUY_VALID,
-                  min_amt: float = MIN_ORDER) -> dict | None:
+                  min_amt: float = MIN_ORDER, extra_exit=None) -> dict | None:
     """Лестница «steps ступеней до пола» с выходами sell (R — levels+trail, H — levels=[]),
     правила rules (ключи EXEC_RULES). horizon None — без горизонта, как прод: позиция,
     открытая в конце данных, оценивается по последнему закрытию за вычетом комиссии выхода
     (how «открыта»). None — исполнитель отказал бы (цена входа уже ниже стопа).
     Сверх simulate: flows — исполнения для бенчмарка по денежным потокам (как
     executor.fill_flows: день, Buy|Sell, $, доля монет), cash — движения свободного USDT
-    книги (резерв лестницы на входе, возврат снятых лимиток, выручка)."""
+    книги (резерв лестницы на входе, возврат снятых лимиток, выручка).
+    extra_exit(d, gain) -> доля купленного к продаже по закрытию дня d (рыночно, TAKER;
+    ≥ 1 — весь остаток, how «доп. выход»; 0 — ничего) — проверяется после стопа и трейла;
+    gain — закрытие к средней цене. Продажа снимает лимитки, как тейк. None — как раньше
+    (coin_funding_study, выход по фандингу)."""
     r = {**EXEC_OFF, **(rules or {})}
     if sell.get("paired"):
         raise ValueError("simulate_exec: парные продажи исполнитель не делает")
@@ -598,6 +602,17 @@ def simulate_exec(seg: dict, e: int, sell: dict, *, budget: float = 50.0, steps:
                 sell_qty(held, c[d], TAKER, d)
                 exit_day, how = d, "трейл"
                 break
+        if extra_exit is not None and held > 0 and bought_qty > 0:
+            fx = extra_exit(d, c[d] / (cost / bought_qty) - 1)
+            if fx >= 1:
+                sell_qty(held, c[d], TAKER, d)
+                exit_day, how = d, "доп. выход"
+                break
+            if fx > 0:
+                sell_qty(min(fx * bought_qty, held), c[d], TAKER, d)
+                if buys_open:
+                    buys_open = False
+                    cancel_day = d
         if bought_qty > 0 and sold_out():
             exit_day, how = d, "продано"
             break
