@@ -15,7 +15,8 @@
 #      monitoring_tag_study (Q12, анонсы CMS Binance, ~4 мин), coin_funding_study (P12, история
 #      фандинга fapi Binance: первая загрузка ~1 ч, дальше ~5 мин), momentum_order_study (Q13,
 #      ~7 мин), sector_cap_study (Q14, ~5 мин), core_satellite_study (Q15, ~4 мин),
-#      narrative_sector_study (Q16, ~6 мин), bounce_gate_study (Q17, ~8 мин)
+#      narrative_sector_study (Q16, ~6 мин), bounce_gate_study (Q17, ~8 мин),
+#      bounce_fine_study (Q17 устойчивость, ~5 мин)
 #      (снимки CMC с 2015 — тот же кэш), regime_exit_study,
 #      market_regime_study, hold_stop_study, score_quintiles — лог каждого в logs/;
 #   4. сравнивает новые *_results.json с теми, что лежат в репозитории
@@ -122,7 +123,7 @@ EOF
 log "  клон $(git -C "$work/repo" rev-parse --short HEAD), база скопирована ($(du -h "$work/repo/scanner.db" | cut -f1))"
 
 # ---- 3. исследования
-studies="${only:-ladder_dca_study junk_filter_study portfolio_vs_market top20_basket_study size_band_study cmc_rank_gate_study supply_age_gate_study monitoring_tag_study coin_funding_study momentum_order_study sector_cap_study core_satellite_study narrative_sector_study bounce_gate_study top20_ex_eth_study rotation_study regime_exit_study market_regime_study hold_stop_study score_quintiles}"
+studies="${only:-ladder_dca_study junk_filter_study portfolio_vs_market top20_basket_study size_band_study cmc_rank_gate_study supply_age_gate_study monitoring_tag_study coin_funding_study momentum_order_study sector_cap_study core_satellite_study narrative_sector_study bounce_gate_study bounce_fine_study top20_ex_eth_study rotation_study regime_exit_study market_regime_study hold_stop_study score_quintiles}"
 fail=0
 log "--- 3. исследования: $studies"
 for s in $studies; do
