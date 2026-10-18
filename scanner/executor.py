@@ -170,7 +170,9 @@ CREATE TABLE IF NOT EXISTS dry_orders (
     created_ts  REAL NOT NULL,
     filled_ts   REAL,
     fee_usdt    REAL DEFAULT 0,
-    note        TEXT DEFAULT ''
+    note        TEXT DEFAULT '',
+    run_ts      REAL                    -- время прогона (часы сервера), исполнившего ордер:
+                                        -- «за сутки» сводки дня; filled_ts — время рынка
 );
 CREATE INDEX IF NOT EXISTS idx_dry_orders_pos ON dry_orders(position_id, side, status);
 """
@@ -211,6 +213,13 @@ def connect(db_path: str) -> sqlite3.Connection:
     for name, typ in _MIGRATIONS:
         if name not in cols:
             con.execute(f"ALTER TABLE dry_positions ADD COLUMN {name} {typ}")
+    ocols = {r[1] for r in con.execute("PRAGMA table_info(dry_orders)")}
+    if "run_ts" not in ocols:
+        # старые исполненные: время рынка вместо времени прогона — они уже были в сводках;
+        # без заполнения первый прогон после миграции пометил бы всю историю своим временем
+        con.execute("ALTER TABLE dry_orders ADD COLUMN run_ts REAL")
+        con.execute("UPDATE dry_orders SET run_ts=COALESCE(filled_ts, created_ts) "
+                    "WHERE status='filled'")
     con.commit()
     return con
 
@@ -1230,9 +1239,20 @@ def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None
             lines.append("тень (мест и денег не занимает): " + "; ".join(
                 f"{b} открыто {x['open']}, вложено ${x['spent']:.2f}, P&L {x['pnl']:+.2f}"
                 for b, x in sh.items()))
+        stamp_run(con, now)
     finally:
         con.close()
     return code, lines
+
+
+def stamp_run(con, now: float) -> None:
+    """Конец прогона: исполненным в нём ордерам — время прогона (run_ts). Время ордера в
+    dry_orders рыночное (часовая свеча, дневное закрытие), по нему «за сутки» сводки повторяло
+    продажу по закрытию вчерашнего дня в двух сводках. Прогон упал раньше — исполненные
+    (закоммиченные) получат время следующего прогона и попадут в его сводку, не теряются."""
+    con.execute("UPDATE dry_orders SET run_ts=? WHERE run_ts IS NULL AND status='filled'",
+                (now,))
+    con.commit()
 
 
 # ---------------------------------------------------------------- сводки (без сети)
@@ -1252,7 +1272,8 @@ def book_summary(con, book: str, shadow: bool = False,
 def brief_state(cfg, now: float | None = None) -> dict | None:
     """Для сводки дня: книги (основные и теневые) и действия за сегодня (UTC-день: прогон
     в 06:00 UTC от местной полуночи не зависит); отказы — с причиной, отсеянное фильтрами —
-    отдельным списком «в тени»; nodata — открытые пары без данных Bybit на прошлом прогоне.
+    отдельным списком «в тени»; nodata — открытые пары без данных Bybit на прошлом прогоне;
+    fills/sells — исполненное прогонами этого UTC-дня (dry_orders.run_ts, stamp_run).
     Таблиц нет — None (строки не будет)."""
     from .benchmark import connect_ro
     now = now if now is not None else time.time()
@@ -1292,14 +1313,23 @@ def brief_state(cfg, now: float | None = None) -> dict | None:
                                 "status!='rejected' AND created_ts>=? ORDER BY id", (t0,)):
                 if all(r["symbol"] != x[0] for x in shadowed):
                     shadowed.append((r["symbol"], why_text(r["shadow_why"], r)))
+        # «за сутки» — исполненное прогонами этого UTC-дня (run_ts, часы сервера): каждое
+        # действие — ровно в одной сводке, той, что после сделавшего его прогона; повтор
+        # сводки в тот же день — те же действия; пропущенный день — исполнит и покажет
+        # следующий прогон. БД без миграции (только чтение) — по-старому, время рынка за 24 ч.
+        ocols = {r[1] for r in con.execute("PRAGMA table_info(dry_orders)")}
+        if "run_ts" in ocols:
+            when, since = "o.run_ts", t0
+        else:
+            when, since = "COALESCE(o.filled_ts, o.created_ts)", t0 - DAY
         fills = con.execute(f"SELECT COUNT(*) FROM dry_orders o JOIN dry_positions p ON "
                             f"p.id=o.position_id WHERE o.side='Buy' AND o.kind='Limit' AND "
-                            f"o.status='filled' AND o.filled_ts>=? AND {psh}=0",
-                            (t0 - DAY,)).fetchone()[0]
+                            f"o.status='filled' AND {when}>=? AND {psh}=0",
+                            (since,)).fetchone()[0]
         sells = [(r[0], r[1], r[2]) for r in con.execute(
             f"SELECT o.book, p.symbol, o.signal FROM dry_orders o JOIN dry_positions p "
             f"ON p.id=o.position_id WHERE o.side='Sell' AND o.status='filled' AND "
-            f"o.created_ts>=? AND {psh}=0 ORDER BY o.created_ts", (t0 - DAY,))]
+            f"{when}>=? AND {psh}=0 ORDER BY o.created_ts", (since,))]
     finally:
         con.close()
     return {"books": books, "shadow": shadow, "opened": opened, "rejected": rejected,

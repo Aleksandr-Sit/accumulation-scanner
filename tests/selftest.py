@@ -3860,6 +3860,10 @@ def test_executor_filters(cfg, failures: list[str]) -> None:
         con.execute("INSERT INTO dry_positions(book, pair, symbol, card_day, status, created_ts, "
                     "qty, bought_qty, spent_usdt, last_price) VALUES "
                     "('R','XUSDT','X',?,'open',?,10,10,10,1)", (d0, now0))
+        con.execute("INSERT INTO dry_orders(link_id, position_id, book, pair, side, kind, signal, "
+                    "status, created_ts, filled_ts) VALUES ('dry-R1-S-BNM',1,'R','XUSDT','Sell',"
+                    "'Market','bn_monitor','filled',?,?), ('dry-R1-B2',1,'R','XUSDT','Buy',"
+                    "'Limit','','new',?,NULL)", (d0, d0, d0 - D))
         con.commit()
         con.close()
         bs_old = ex.brief_state(c, now=now0)
@@ -3867,7 +3871,14 @@ def test_executor_filters(cfg, failures: list[str]) -> None:
         con = ex.connect(c["output"]["db_path"])
         cols = {r[1] for r in con.execute("PRAGMA table_info(dry_positions)")}
         row = dict(con.execute("SELECT * FROM dry_positions").fetchone())
+        o_run = {r[0]: r[1] for r in con.execute("SELECT link_id, run_ts FROM dry_orders")}
         con.close()
+        bs_mig = ex.brief_state(c, now=now0)
+    _check("миграция dry_orders.run_ts: исполненным — их время (filled_ts), неисполненным — "
+           "NULL; сводка до миграции — по старому окну 24 ч, после — та же продажа",
+           o_run == {"dry-R1-S-BNM": d0, "dry-R1-B2": None}
+           and bs_old["sells"] == [("R", "X", "bn_monitor")]
+           and bs_mig["sells"] == [("R", "X", "bn_monitor")], failures)
     _check("сводка по БД до миграции: позиция основная, тени нет, не падает",
            bs_old["books"]["R"]["open"] == 1 and bs_old["shadow"]["R"]["open"] == 0
            and bs_old["shadowed"] == [] and wk_old == [], failures)
@@ -6368,6 +6379,71 @@ def test_binance_monitor(cfg, failures: list[str]) -> None:
     _check("оба выключателя — правило молчит: «правило выключено» в логе, продаж нет",
            any("правило выключено" in x for x in x4["lines"])
            and all(p["status"] == "open" for p in x4["ps"]), failures)
+
+    # --- (4б) «за сутки» сводки дня — каждое действие ровно в одной сводке (баг 17–18.10:
+    # продажа BICO по метке видна и 17.10, и 18.10 — у пробного по рыночному времени
+    # закрытия, у демо — окно 24 ч, а прогон 18.10 начался на 2 мин раньше 17.10)
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        m = _FakeMarket(now0)
+        X = d0 + 2 * D                                   # 03.10
+        for sym in ("AAA", "BBB"):
+            pair(m, sym)
+            m.days[f"{sym}USDT"] = hist + [(d0 + k * D, 1.0) for k in range(0, 10)]
+            card(c, sym)
+        m.ranks = {"ok": True, "day": ex.utc_day(now0), "n": 8, "note": "",
+                   "by_sym": {"AAA": {"rank": 1, "n": 8, "share": 1 / 8, "usd": 1e7},
+                              "BBB": {"rank": 2, "n": 8, "share": 2 / 8, "usd": 1e6}}}
+        m.hours["AAAUSDT"] = [(X - D + 15 * H, 0.01)]    # лимитки AAA — в часах дня D−1
+        m.hours["BBBUSDT"] = [(X + D + 15 * H, 0.01)]    # BBB — после прогона X+1
+        fxo = _FakeDemo({"AAAUSDT": 1.0, "BBBUSDT": 1.0}, {})
+
+        def go(t: float, tags_: dict) -> None:
+            m.now = t
+            ex.run_dry(c, m, now=t, mctx=cold, tags=tv(tags_))
+
+        def dmo(t: float) -> None:
+            dm.run_demo(c, fxo, now=t, sleep=lambda s: None)
+
+        def bsx(t: float) -> dict:
+            st_ = deliver.brief_state(c, now=t, exec_exit=0)
+            return {"fills": st_["executor"]["fills"], "sells": st_["executor"]["sells"],
+                    "dsells": [(b, s_) for b, s_, _r in (st_.get("demo") or {}).get("sells", [])]}
+        go(now0, {})
+        dmo(now0 + 60)
+        go(X + 6 * H + 1200, {})                          # прогон X 06:20
+        dmo(X + 6 * H + 1260)
+        b_x = bsx(X + 6 * H + 1500)
+        go(X + D + 6 * H + 1080, {"AAA": X - D})          # X+1 06:18 — раньше по часам
+        dmo(X + D + 6 * H + 1301)                         # демо 06:21:41
+        b_x1 = bsx(X + D + 6 * H + 1500)
+        dmo(X + 2 * D + 6 * H + 1116)                     # X+2: демо 06:18:36, пробный не прошёл
+        b_x2 = bsx(X + 2 * D + 6 * H + 1200)
+        go(X + 3 * D + 6 * H + 1200, {"AAA": X - D})      # X+3: пробный после пропуска
+        b_x3 = bsx(X + 3 * D + 6 * H + 1500)
+        b_x3b = bsx(X + 3 * D + 18 * H)                   # повтор сводки вечером того же дня
+        lim = {s_: len(q(c, "SELECT 1 FROM dry_orders o JOIN dry_positions p ON "
+                            "p.id=o.position_id WHERE p.symbol=? AND p.shadow=0 AND o.side='Buy' "
+                            "AND o.kind='Limit' AND o.status='filled'", (s_,)))
+               for s_ in ("AAA", "BBB")}
+        bnm = q(c, "SELECT filled_ts, run_ts FROM dry_orders WHERE signal='bn_monitor'")
+    aaa_s = [("R", "AAA", "bn_monitor"), ("H", "AAA", "bn_monitor")]
+    _check("за сутки: лимитки AAA, исполненные в часах дня D−1, — в сводке D один раз",
+           lim["AAA"] > 0 and b_x["fills"] == lim["AAA"] and b_x1["fills"] == 0, failures)
+    _check("за сутки: продажа по закрытию (метка Binance, время рынка 00:00) — в сводке своего "
+           "прогона, в сводке следующего дня нет, хотя прогон начался раньше по часам",
+           sorted(b_x1["sells"]) == sorted(aaa_s) and b_x["sells"] == []
+           and b_x2["sells"] == [] and b_x3["sells"] == []
+           and len(bnm) == 2 and all(o["filled_ts"] == X + D and o["run_ts"] == X + D + 6 * H
+                                     + 1080 for o in bnm), failures)
+    _check("за сутки (демо): продажа прогона 06:21:41 — в его сводке; прогон следующего дня в "
+           "06:18:36 её не повторяет",
+           sorted(b_x1["dsells"]) == [("H", "AAA"), ("R", "AAA")] and b_x2["dsells"] == []
+           and b_x["dsells"] == [], failures)
+    _check("за сутки: пропущенный день — лимитки BBB (часы X+1) не теряются, видны в сводке "
+           "следующего прогона; повтор сводки в тот же день — те же действия",
+           lim["BBB"] > 0 and b_x2["fills"] == 0 and b_x3["fills"] == lim["BBB"]
+           and b_x3b == b_x3, failures)
 
     # --- (5) карточка scan --notify
     def cn(sym: str, tags_, c_=cfg, price=1.0) -> list[str]:

@@ -638,7 +638,8 @@ def summary(con, cfg) -> dict[str, dict]:
 
 
 def brief_state(cfg, now: float | None = None) -> dict | None:
-    """Для сводки дня (без сети): итог прогона демо сегодня, книги, действия за сутки, пропуски.
+    """Для сводки дня (без сети): итог прогона демо сегодня, книги, действия прогонов этого
+    UTC-дня («за сутки»), пропуски.
     Таблиц нет или демо ни разу не запускалось — None (блока нет)."""
     from .benchmark import connect_ro
     now = now if now is not None else time.time()
@@ -653,7 +654,12 @@ def brief_state(cfg, now: float | None = None) -> dict | None:
         run = con.execute("SELECT * FROM demo_runs ORDER BY ts DESC LIMIT 1").fetchone()
         if run is None:
             return None
-        t0 = now - DAY
+        # «за сутки» — с начала UTC-дня по времени прогона (created_ts/filled_ts демо — часы
+        # сервера в начале прогона, = demo_runs.ts): окно «24 ч назад» захватывало вчерашний
+        # прогон, когда сегодняшний начался на пару минут раньше. Каждое действие — в сводке
+        # своего дня; повтор сводки в тот же день — те же; пропуск дня — их сделает и покажет
+        # следующий прогон.
+        t0 = utc_day(now)
         books = summary(con, cfg)
         placed = con.execute("SELECT COUNT(DISTINCT dry_id) FROM demo_orders WHERE role='B1' "
                              "AND created_ts>=? AND status NOT IN ('rejected','error')",
