@@ -59,9 +59,10 @@ EXIT_SUSPECT = 4                     # копия сделана, но стро�
                                      # копии не удаляются, в Telegram она не уходит
 # Таблицы-журналы: код из них не удаляет (единственный DELETE — position_snapshots), строк
 # меньше бывает только у пустой или подменённой базы. candidates и candidate_metrics (объём
-# базы) не сверяются: их прореживание не должно замораживать ротацию.
+# базы) не сверяются: их прореживание не должно замораживать ротацию. pick_log — журнал
+# кандидатов книги W (scan --notify), тоже только дописывается.
 GUARD_TABLES = ("runs", "alert_log", "positions", "position_events", "market_daily",
-                "dry_positions", "dry_orders", "exchange_fills")
+                "dry_positions", "dry_orders", "exchange_fills", "pick_log")
 
 
 class BackupError(RuntimeError):

@@ -153,8 +153,10 @@ def parse_updates(updates: list[dict], owner_chat: str,
     return own, foreign, last
 
 
-def status_text(db_path: str, base: Path | None = None, now: float | None = None) -> str:
-    """Коротко для /status: стоп-кран, последний прогон, позиции, книги исполнителя."""
+def status_text(db_path: str, base: Path | None = None, now: float | None = None,
+                hide_books: tuple = ()) -> str:
+    """Коротко для /status: стоп-кран, последний прогон, позиции, книги исполнителя.
+    hide_books — книги, которых нет в строках (выключенная книга W: executor.hidden_books)."""
     now = now or time.time()
     h = halted(base)
     lines = [halt_line(h) if h else "✅ исполнитель работает (стоп-крана нет)"]
@@ -182,6 +184,8 @@ def status_text(db_path: str, base: Path | None = None, now: float | None = None
                         "SELECT book, COUNT(*), SUM(spent_usdt) FROM dry_positions "
                         "WHERE status = 'open' AND COALESCE(shadow, 0) = 0 GROUP BY book "
                         "ORDER BY book DESC"):
+                    if book in hide_books:
+                        continue
                     lines.append(f"пробная книга {book}: открыто {n}, вложено ${spent or 0:.2f}")
         finally:
             con.close()
@@ -225,7 +229,8 @@ def poll(cfg, *, base: Path | None = None, now: float | None = None, fetch=None,
             send(halt_line(info) + "\nСнять: python3 run.py resume (на сервере)")
             log.append(f"/stop → {info['reason']}")
         elif c["cmd"] == "/status":
-            send(status_text(db_path, base, now))
+            from scanner.executor import hidden_books
+            send(status_text(db_path, base, now, hidden_books(cfg)))
             log.append("/status")
         elif c["cmd"] in ("/start", "/help"):
             send(HELP)

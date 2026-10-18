@@ -8,8 +8,9 @@
 
 Решения принимает пробный исполнитель (шаг execute идёт раньше): отбор карточек, фильтры и
 тень, книги R/H, лимиты, кулдаун, стоп, трейл, делистинг. Демо их не пересчитывает, а повторяет:
-  • вход — позиция основной книги пробного (не тень), открытая не раньше demo.since и не позже
-    open_late_days назад: те же ступени — 1 рынком на ту же сумму USDT, 2–5 лимитками GTC по тем
+  • вход — позиция основной книги пробного (R/H из executor.books: не тень и не книга W «R у
+    лоу» — она только бумажная), открытая не раньше demo.since и не позже open_late_days назад:
+    те же ступени — 1 рынком на ту же сумму USDT, 2–5 лимитками GTC по тем
     же ценам и количествам (orderLinkId dmo-<книга><id пробной позиции>-B<n>);
   • тейк (книга с exits «rules», R) — лимитки на продажу ЗАРАНЕЕ на бирже, как тейк лимиткой в
     бэктесте: цель +50/+150% от СВОЕЙ средней (вверх к tick), доля — от своего купленного
@@ -40,7 +41,7 @@ from calendar import timegm
 from typing import Any, Callable
 
 from . import bybit
-from .executor import DAY, connect as dry_connect, ddmm, pnl_usdt, sell_qty, utc_day
+from .executor import DAY, connect as dry_connect, ddmm, mirror_books, pnl_usdt, sell_qty, utc_day
 from .executor import settings as dry_settings
 from .ladder import MARKET_FEE, fmt_step, round_step
 
@@ -591,8 +592,13 @@ def run_demo(cfg, client, *, db_path: str | None = None, now: float | None = Non
                         "VALUES (?,?,?,?,?)", (now, 1, kc["level"], kline, "ордеров нет"))
             con.commit()
             return 1, lines + ["ордеров нет — сначала ключ"]
-        dps = _rows(con, "SELECT * FROM dry_positions WHERE COALESCE(shadow,0)=0 AND "
-                         "status!='rejected' AND created_ts>=? ORDER BY id", (since_ts(s),))
+        # только книги executor.books (R/H): книга W (executor.wait_low) — бумага, на демо не
+        # идёт (mirror_books); тень — тоже нет
+        bks = mirror_books(cfg)
+        dps = _rows(con, f"SELECT * FROM dry_positions WHERE COALESCE(shadow,0)=0 AND "
+                         f"status!='rejected' AND created_ts>=? AND book IN "
+                         f"({','.join('?' * len(bks))}) ORDER BY id",
+                    (since_ts(s), *bks)) if bks else []
         for dp in dps:
             try:
                 lines += process(con, client, cfg, s, dp, now, sleep)

@@ -999,14 +999,16 @@ def executor_brief_lines(ex: dict | None, cfg) -> list[str]:
     """Блок сводки дня «🤖 Пробный исполнитель» (scanner/executor.brief_state): что поставил бы
     сегодня, что отсеяли фильтры (в тени) и почему, отказы, исполнения и продажи основной книги
     за сутки, P&L книг и тени; «⚠ нет данных Bybit» — позиции, не тронутые из-за сбоя данных.
-    Пусто — блока нет."""
+    Книга W (ex["wait"]) — своими строками в конце: открыто, вложено, P&L, её действия за сутки
+    и «ждут возврата к лоу» (кандидаты дня, не прошедшие гейт). Пусто — блока нет."""
     if not ex:
         return []
     books = ex.get("books") or {}
     shadow = ex.get("shadow") or {}
     active_sh = any(b.get("open") or b.get("closed") for b in shadow.values())
     active = active_sh or any(b.get("open") or b.get("closed") for b in books.values())
-    if not (active or ex.get("opened") or ex.get("rejected") or ex.get("shadowed")):
+    wait = wait_brief_lines(ex.get("wait"), cfg)
+    if not (active or ex.get("opened") or ex.get("rejected") or ex.get("shadowed") or wait):
         return []
     out = ["🤖 <b>Пробный исполнитель</b> <i>(ордера не отправлялись)</i>"]
     for pair, why in ex.get("nodata") or []:
@@ -1032,6 +1034,41 @@ def executor_brief_lines(ex: dict | None, cfg) -> list[str]:
     if active_sh:
         out.append("👥 тень: " + " · ".join(f"{b.get('emoji', '•')} {b['open']} поз., "
                                            f"{fmt_usd(b['pnl'])}" for b in shadow.values()))
+    return out + wait
+
+
+def wait_brief_lines(w: dict | None, cfg) -> list[str]:
+    """Строки книги W «R у лоу» в блоке исполнителя сводки дня (executor.brief_state, ключ
+    wait): строка книги (открыто, вложено, P&L), её действия прогонов этого UTC-дня и «ждут
+    возврата к лоу» — кандидаты дня, не прошедшие гейт, с ростом от лоу базы. Книга выключена
+    или ей нечего сказать — пусто."""
+    if not w:
+        return []
+    news = (w.get("opened") or w.get("waiting") or w.get("fills") or w.get("sells")
+            or w.get("fail") or w.get("nodata"))
+    if not (w.get("open") or w.get("closed") or news):
+        return []
+    key = _esc(w.get("key", "W"))
+    out = [f"⚠ книга {key} упала: {_esc(w['fail'])[:300]}"] if w.get("fail") else []
+    out += [f"⚠ {key}: нет данных Bybit: {_esc(p)} ({_esc(e)}) — позиция ждёт данных"
+            for p, e in w.get("nodata") or []]
+    out.append(f"{w.get('emoji', '•')} {_esc(w.get('label', ''))} ({key}): открыто {w['open']}, "
+               f"вложено ${w['spent']:.2f}, P&L {fmt_usd(w['pnl'])}")
+    acts = []
+    if w.get("opened"):
+        acts.append("поставил бы лестницу: " + ", ".join(_esc(s) for s in w["opened"]))
+    if w.get("fills"):
+        acts.append(f"исполнилось лимиток {w['fills']}")
+    if w.get("sells"):
+        acts.append("продажи: " + ", ".join(f"{_esc(s)} {_signal_text(t, cfg)}"
+                                            for _b, s, t in w["sells"]))
+    if acts:
+        out.append(f"{key} за сутки: " + "; ".join(acts))
+    if w.get("waiting"):
+        out.append(f"{key} ждут возврата к лоу (закрытие ≤ лоу базы "
+                   f"+{(w.get('max_bounce') or 0) * 100:g}%): {len(w['waiting'])} ("
+                   + ", ".join(_esc(s) + (f" {_signed(b * 100)}" if isinstance(b, (int, float))
+                                          else "") for s, b in w["waiting"]) + ")")
     return out
 
 
@@ -1109,9 +1146,10 @@ def _exec_book_line(b: dict) -> str:
 
 
 def executor_weekly_block(books: list[dict], shadow: list[dict] | None = None) -> list[str]:
-    """«🤖 Пробный исполнитель» недельной сводки: книги R/H против альтов и контрольной корзины
-    на тех же окнах (scanner/executor.weekly_books), ниже — теневые книги (weekly_shadow):
-    отсеянное фильтрами, против альтов и по причинам. Позиций нет нигде — пусто."""
+    """«🤖 Пробный исполнитель» недельной сводки: книги R/H (и W «R у лоу», если у неё есть
+    позиции — с пояснением в подписи) против альтов и контрольной корзины на тех же окнах
+    (scanner/executor.weekly_books), ниже — теневые книги (weekly_shadow): отсеянное фильтрами,
+    против альтов и по причинам. Позиций нет нигде — пусто."""
     books = [b for b in books or [] if b.get("positions")]
     shadow = [b for b in shadow or [] if b.get("positions")]
     if not (books or shadow):
@@ -1128,7 +1166,13 @@ def executor_weekly_block(books: list[dict], shadow: list[dict] | None = None) -
                     f"{_WHY_SHORT.get(k, _esc(k))} {d['n']} поз. "
                     + (_signed(d['pnl'] / d['cost'] * 100) if d.get("cost") else "—")
                     for k, d in by))
-    out.append("<i>Обе книги входят одинаково, разница — только выходы. " + FLOW_NOTE + "</i>")
+    w = next((b for b in books if b.get("wait")), None)
+    wnote = (f" {w.get('emoji', '•')} {_esc(w.get('label', ''))} ({_esc(w.get('key', 'W'))}) — "
+             f"выходы R, но вход, только когда закрытие не выше лоу базы "
+             f"+{(w.get('max_bounce') or 0) * 100:g}% (замер Q17)." if w else "")
+    out.append(("<i>R и H входят одинаково, разница — только выходы." if w else
+                "<i>Обе книги входят одинаково, разница — только выходы.")
+               + wnote + " " + FLOW_NOTE + "</i>")
     if shadow:
         both = any(sum(d["n"] for d in (b.get("by_why") or {}).values()) > b["positions"]
                    for b in shadow)
@@ -1361,7 +1405,8 @@ def format_monthly(stats: dict, cfg=None) -> str:
         lines.append("🤖 Пробный исполнитель: позиций ещё не было.")
     acts = act.get("books") or {}
     if acts:
-        names = {b.get("key"): b.get("label") for b in stats.get("books") or []}
+        names = {**(act.get("labels") or {}),
+                 **{b.get("key"): b.get("label") for b in stats.get("books") or []}}
         parts = [f"{_esc(names.get(k) or k)} — новых {a['opened']}, закрыто {a['closed']}, "
                  f"продаж {a['sells']}" for k, a in acts.items()]
         shd = max((a.get("shadow_opened", 0) for a in acts.values()), default=0)

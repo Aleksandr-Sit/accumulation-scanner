@@ -6545,6 +6545,682 @@ def test_binance_monitor(cfg, failures: list[str]) -> None:
            "🏷 под меткой Monitoring Binance 3 (обновлено 16.10)" in wk, failures)
 
 
+def test_executor_wait(cfg, failures: list[str]) -> None:
+    print("Книга W «R у лоу» (Q17): кандидаты до заглушки, гейт от лоу базы, серия, выходы R, "
+          "изоляция от R/H/тени/демо, выключатель:")
+    import copy
+    import io
+    import json as _json
+    import sqlite3
+    import sys as _sys
+    import tempfile
+    import time as _time
+    import types
+    from pathlib import Path as _P
+    import run as run_cli
+    from scanner import demo as dm
+    from scanner import executor as ex
+    from scanner import pipeline
+    from scanner.config import Config
+    from scanner.db import Store
+    from scanner.notify import deliver
+    from scanner.notify import telegram as tg
+    D, H = ex.DAY, ex.HOUR
+    d0 = 1790812800                        # 2026-10-01 00:00 UTC
+    t1 = d0 + 6 * H + 1800                 # прогоны execute в 06:30 UTC, скан — в 06:00
+    T = [t1 + k * D for k in range(8)]     # T[k] — прогон k-го дня
+    inst = {"symbol": "", "status": "Trading", "st": False, "tick": 0.01, "qty_step": 0.1,
+            "min_qty": 0.1, "min_amt": 5.0}
+    # закрытия по 1.0, за 10 дней до d0 — 0.95: лоу базы 0.95, гейт — закрытие ≤ 0.9975
+    base = [(d0 - k * D, 0.95 if k == 10 else 1.0) for k in range(40, 1, -1)]
+    flat = [(d0 + k * D, 1.0) for k in range(1, 8)]
+    cold = {"day": d0 + 10 * D, "hot": {"lit": [], "near": [], "avail": 8}}
+    hot = {"day": d0, "hot": {"lit": ["mvrv_eth"], "near": [], "avail": 8}}
+    W = cfg["executor"]["wait_low"]
+    W_OFF = {**W, "enabled": False}
+
+    def mk(tmp: str, **exe) -> Config:
+        d = copy.deepcopy(cfg._d)
+        d["output"] = {**d.get("output", {}), "db_path": str(_P(tmp) / "t.db"),
+                       "watchlist_json": str(_P(tmp) / "wl.json")}
+        d["executor"] = {**d.get("executor", {}), **exe}
+        d["demo"] = {**d.get("demo", {}), "since": "2026-09-01", "settle_s": 0}
+        (_P(tmp) / "wl.json").write_text("[]", encoding="utf-8")
+        Store(d["output"]["db_path"]).close()
+        return Config(d)
+
+    def x(c: Config, s: str, args=()) -> None:
+        con = sqlite3.connect(c["output"]["db_path"])
+        con.execute(s, args)
+        con.commit()
+        con.close()
+
+    def q(c: Config, s: str, args=()) -> list[dict]:
+        con = sqlite3.connect(c["output"]["db_path"])
+        con.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in con.execute(s, args).fetchall()]
+        finally:
+            con.close()
+
+    def pick(c: Config, sym: str, ts: float, muted: int = 1) -> None:
+        """Монета прошла отбор карточки до заглушки — как пишет scan --notify (pick_log)."""
+        _wl_add(c, sym)
+        x(c, "INSERT INTO pick_log(symbol, ts, score, muted) VALUES (?,?,72,?)", (sym, ts, muted))
+
+    def card(c: Config, sym: str, ts: float) -> None:
+        _wl_add(c, sym)
+        x(c, "INSERT INTO alert_log(symbol, ts, score) VALUES (?,?,72)", (sym, ts))
+
+    def pair(m, sym: str, last=(), hours=(), days=None, price: float | None = 1.0) -> None:
+        p = f"{sym}USDT"
+        m.inst[p] = {**inst, "symbol": p}
+        m.price[p] = price
+        m.days[p] = list(days) if days is not None else base + list(last)
+        m.hours[p] = list(hours)
+
+    def run(c: Config, m, now: float, ctx=cold, **kw):
+        m.now = now
+        return ex.run_dry(c, m, now=now, mctx=ctx, **kw)
+
+    def seed(c: Config, sym: str, book: str = "W", **cols) -> None:
+        row = {"book": book, "pair": f"{sym}USDT", "symbol": sym, "card_day": d0 - D,
+               "status": "open", "created_ts": t1 - D, "qty": 10.0, "bought_qty": 10.0,
+               "spent_usdt": 10.0, "min_amt": 5.0, "last_price": 1.0, **cols}
+        con = ex.connect(c["output"]["db_path"])
+        con.execute(f"INSERT INTO dry_positions({', '.join(row)}) VALUES "
+                    f"({', '.join('?' * len(row))})", tuple(row.values()))
+        con.commit()
+        con.close()
+
+    def rh(c: Config) -> tuple:
+        """Строки R/H (с тенью) без id — сравнение баз с включённой и выключенной W."""
+        ps = q(c, "SELECT * FROM dry_positions WHERE book IN ('R','H') ORDER BY id")
+        os_ = q(c, "SELECT * FROM dry_orders WHERE book IN ('R','H') ORDER BY link_id")
+        return ([{k: v for k, v in p.items() if k != "id"} for p in ps],
+                [{k: v for k, v in o.items() if k != "position_id"} for o in os_])
+
+    def not_w(lines: list[str]) -> list[str]:
+        """Лог без строк книги W (и «  метки» под её «поставил бы»)."""
+        out, skip = [], False
+        for ln in lines:
+            if ln.startswith(("W ", "W:", "книга W", "⚠ книга W", "⚠ W:")):
+                skip = True
+                continue
+            if not (skip and ln.startswith("  ")):
+                out.append(ln)
+                skip = False
+        return out
+
+    def rk(places: dict, n: int) -> dict:
+        return {"ok": True, "day": ex.utc_day(t1), "n": n, "note": "",
+                "by_sym": {s: {"rank": r, "n": n, "share": r / n, "usd": 1e6 / r}
+                           for s, r in places.items()}}
+    BRIEF_RH = ("books", "shadow", "opened", "rejected", "shadowed", "fills", "sells", "nodata")
+
+    # --- настройки: W — правила R; код книги проверяется; без секции — выключена
+    s0 = ex.settings(cfg)
+    s_bad = ex.settings(Config({"executor": {"wait_low": {"enabled": True, "book": "R"}}}))
+    s_num = ex.settings(Config({"executor": {"wait_low": {"enabled": True, "book": "W1"}}}))
+    _check("настройки: W включена в config.json, параметры книги W = R (exits rules, стоп 25%), "
+           "на демо — только R/H",
+           s0["wait_low"]["enabled"] and s0["wait_low"]["book"] == "W"
+           and s0["wait_low"]["max_bounce"] == 0.05
+           and {k: ex.book_params(s0, "W")[k] for k in ("exits", "stop_pct")}
+           == {k: s0["books"]["R"][k] for k in ("exits", "stop_pct")}
+           and ex.mirror_books(cfg) == ["R", "H"], failures)
+    _check("настройки: код W занят книгой R или не буквы — W выключена с причиной; секции нет — "
+           "выключена",
+           not s_bad["wait_low"]["enabled"] and s_bad["wait_low"]["book"] == ""
+           and "«R»" in s_bad["wait_low"]["error"] and not s_num["wait_low"]["enabled"]
+           and not ex.settings(Config({}))["wait_low"]["enabled"], failures)
+
+    # --- основной сценарий: одна и та же история в двух базах — W включена и выключена
+    def scenario(c: Config, demo_at: int | None = None) -> dict:
+        m = _FakeMarket(t1)
+        pair(m, "AAA", [(d0 - D, 1.026), (d0, 0.9785)] + flat)         # +8%, затем +3%
+        pair(m, "BBB", [(d0 - D, 1.026), (d0, 0.96)] + flat)           # +8%, затем +1%
+        # CCC и DDD — у лоу (+2.1%) уже в день карточки: R/H и W входят вместе
+        pair(m, "CCC", [(d0 - D, 0.97), (d0, 1.0), (d0 + D, 1.5), (d0 + 2 * D, 2.6),
+                        (d0 + 3 * D, 1.7)] + flat[3:], [(d0 + 8 * H, 0.929)])
+        pair(m, "DDD", [(d0 - D, 0.97), (d0, 0.80), (d0 + D, 0.70), (d0 + 2 * D, 0.70)]
+             + flat[2:], [(d0 + 7 * H, 0.92), (d0 + D + 5 * H, 0.69)])
+        out: dict = {"m": m, "runs": [], "brief": [], "rh": [], "demo": None}
+        for i, sym in enumerate(("AAA", "BBB", "CCC", "DDD")):
+            card(c, sym, t1 - 1800 + i)            # первая карточка серии: R/H и W
+            pick(c, sym, t1 - 1800 + i, muted=0)
+        for k in range(6):
+            if k in (1, 2):
+                pick(c, "AAA", T[k] - 1800)        # повтор AAA заглушён: карточки нет, W видит
+            out["runs"].append(run(c, m, T[k]))
+            out["brief"].append(ex.brief_state(c, now=T[k]))
+            out["rh"].append(rh(c))
+            if k == demo_at:
+                fx = _FakeDemo({f"{s}USDT": 1.0 for s in ("AAA", "BBB", "CCC", "DDD")})
+                out["demo"] = (dm.run_demo(c, fx, now=T[k] + 60, sleep=lambda s_: None), fx,
+                               q(c, "SELECT * FROM demo_positions ORDER BY dry_id"),
+                               q(c, "SELECT * FROM demo_orders ORDER BY link_id"))
+        return out
+
+    with tempfile.TemporaryDirectory() as tmp_on, tempfile.TemporaryDirectory() as tmp_off:
+        c = mk(tmp_on)
+        c_ref = mk(tmp_off, wait_low=W_OFF)
+        on = scenario(c, demo_at=1)
+        ref = scenario(c_ref, demo_at=1)
+        wrow = {(p["symbol"], p["card_day"]): p
+                for p in q(c, "SELECT * FROM dry_positions WHERE book='W'")}
+        w_ord = q(c, "SELECT * FROM dry_orders WHERE book='W' ORDER BY link_id")
+        alerts_t2 = q(c, "SELECT COUNT(*) n FROM alert_log WHERE ts>=?", (T[1] - D,))[0]["n"]
+        n_ref_w = q(c_ref, "SELECT COUNT(*) n FROM dry_positions WHERE book='W'")[0]["n"]
+
+        def sells(c_: Config, book: str, sym: str) -> list[tuple]:
+            return [(o["signal"], o["kind"], o["price"], o["qty"], o["usd"], o["fee_usdt"],
+                     o["status"], o["filled_ts"]) for o in q(
+                c_, "SELECT o.* FROM dry_orders o JOIN dry_positions p ON p.id=o.position_id "
+                    "WHERE p.book=? AND p.symbol=? AND o.side='Sell' ORDER BY o.created_ts, "
+                    "o.link_id", (book, sym))]
+        pos = {(p["book"], p["symbol"]): p for p in q(c, "SELECT * FROM dry_positions WHERE "
+                                                         "status!='rejected'")}
+        sl = {(b, sy): sells(c, b, sy) for b in "RHW" for sy in ("CCC", "DDD")}
+        exl = [tg.executor_brief_lines(b, c) for b in on["brief"]]
+        # недельная/месячная по той же базе (рынок — для сравнения по потокам)
+        for c_ in (c, c_ref):
+            st_ = Store(c_["output"]["db_path"])
+            st_.upsert_market({d0 + k * D: {"total_mcap": 1000 + 10 * k, "btc_dominance": 50,
+                                            "stables_usd": 100} for k in range(-2, 8)})
+            st_.close()
+            for k in range(-1, 8):                 # прогоны скана с капами — корзина
+                x(c_, "INSERT INTO runs(id, ts) VALUES (?,?)", (k + 2, d0 + k * D + 6 * H))
+                for sym, cap in (("BAS1", 100 + 10 * k), ("BAS2", 200)):
+                    x(c_, "INSERT INTO candidates(run_id, symbol, coin_id, chain, address, stage, "
+                          "market_cap) VALUES (?,?,?,'','','watchlist',?)",
+                      (k + 2, sym, sym.lower(), cap))
+        wb, wb_ref = ex.weekly_books(c), ex.weekly_books(c_ref)
+        act = ex.period_activity(c, d0 - D, d0 + 10 * D)
+        act_ref = ex.period_activity(c_ref, d0 - D, d0 + 10 * D)
+        # выключатель после работы: позиции W замирают, после включения — досчитываются
+        c_off = Config({**c._d, "executor": {**c._d["executor"], "wait_low": W_OFF}})
+        w_before = q(c, "SELECT * FROM dry_positions WHERE book='W' ORDER BY id")
+        code_off, lines_off = run(c_off, on["m"], T[6])
+        w_frozen = q(c, "SELECT * FROM dry_positions WHERE book='W' ORDER BY id")
+        bs_off = ex.brief_state(c_off, now=T[6])
+        run(c, on["m"], T[7])
+        aaa_w = q(c, "SELECT * FROM dry_positions WHERE book='W' AND symbol='AAA' AND "
+                     "status='open'")
+    w0 = wrow.get(("AAA", d0)) or {}
+    w1 = wrow.get(("AAA", d0 + D)) or {}
+    _check("(а) серия: AAA на +8.0% от лоу базы — W не входит, отказ «ждёт возврата к лоу», "
+           "bounce 0.08",
+           w0.get("status") == "rejected" and w0.get("reason", "").startswith(ex.WAIT_REASON)
+           and abs((w0.get("bounce") or 0) - 0.08) < 1e-9
+           and any(ln.startswith("W AAA: ждёт возврата к лоу: закрытие 1.026 на +8.0% выше лоу "
+                                 "базы 0.95, нужно ≤ +5%") for ln in on["runs"][0][1]), failures)
+    _check("(а) серия продолжается: на следующий день AAA у лоу (+3.0%) — W ставит лестницу 5 "
+           "ступеней (dry-W…), ступень 1 рынком, лоу базы 0.95, стоп R",
+           w1.get("status") in ("open", "closed") and abs((w1.get("bounce") or 0) - 0.03) < 1e-9
+           and w1.get("base_low") == 0.95 and w1.get("stop_pct") == s0["books"]["R"]["stop_pct"]
+           and [o["step"] for o in w_ord if o["position_id"] == w1.get("id")] == [1, 2, 3, 4, 5]
+           and all(o["link_id"].startswith(f"dry-W{o['position_id']}-") and len(o["link_id"]) <= 36
+                   for o in w_ord)
+           and any(ln.startswith("W AAA: поставил бы — 5 ступ.") and "от лоу +3.0% ≤ +5%" in ln
+                   for ln in on["runs"][1][1]), failures)
+    _check("(в) заглушённая повторная карточка — кандидат W: в alert_log за сутки AAA нет, W "
+           "вошла; R/H по AAA второй лестницы не ставят",
+           alerts_t2 == 0 and w1.get("card_day") == d0 + D
+           and len([p for p in pos if p[1] == "AAA" and p[0] in "RH"]) == 2, failures)
+    _check("(а) одна позиция на монету: AAA снова в отборе — «уже в книге», второй строки нет",
+           ("AAA", d0 + 2 * D) not in wrow
+           and any(ln.startswith("W AAA: уже в книге с 02.10") for ln in on["runs"][2][1]),
+           failures)
+    _check("(б) серия прервалась: BBB на второй день не прошла отбор — W не входит, хотя цена "
+           "вернулась к лоу (+1%); у BBB только отказ первого дня",
+           [k for k in wrow if k[0] == "BBB"] == [("BBB", d0)]
+           and wrow[("BBB", d0)]["status"] == "rejected" and ("W", "BBB") not in pos, failures)
+    _check("(е) выходы W = правила R: CCC — +50% и +150% лимитками, трейл; DDD — стоп; продажи, "
+           "деньги и P&L W совпадают с R",
+           sl[("W", "CCC")] == sl[("R", "CCC")]
+           and [s[0] for s in sl[("W", "CCC")]] == ["ladder_0", "ladder_1", "trailing"]
+           and sl[("W", "DDD")] == sl[("R", "DDD")]
+           and [s[0] for s in sl[("W", "DDD")]] == ["invalidation"]
+           and all(pos[("W", sy)][k] == pos[("R", sy)][k] for sy in ("CCC", "DDD")
+                   for k in ("status", "reason", "spent_usdt", "proceeds_usdt", "qty",
+                             "bought_qty"))
+           and pos[("W", "CCC")]["reason"] == "трейл" and pos[("W", "DDD")]["reason"] == "стоп"
+           and sl[("H", "CCC")] == [], failures)
+    _check("(г) R/H и тень не меняются: строки и ордера R/H после каждого прогона — те же, что "
+           "в базе с выключенной W",
+           all(a == b for a, b in zip(on["rh"], ref["rh"])) and len(on["rh"]) == 6
+           and len(on["rh"][0][0]) == 8, failures)
+    _check("(г) лог R/H тот же: без строк W — слово в слово как при выключенной W; коды те же",
+           all(not_w(a[1]) == b[1] and a[0] == b[0] for a, b in zip(on["runs"], ref["runs"]))
+           and any(ln.startswith("книга W «R у лоу»") for ln in on["runs"][0][1]), failures)
+    _check("(г) сводка дня: R/H — книги, «поставил бы», отказы, тень, исполнения и продажи за "
+           "сутки — те же, что без W",
+           all({k: a[k] for k in BRIEF_RH} == {k: b[k] for k in BRIEF_RH}
+               for a, b in zip(on["brief"], ref["brief"])), failures)
+    (dcode, dlines), fx, dpos, dord = on["demo"]
+    (rcode, _), fx_ref, dpos_ref, dord_ref = ref["demo"]
+    _check("(г) демо-счёт: позиции W (AAA, CCC, DDD) не зеркалятся — ни строки, ни ордера dmo-W; "
+           "ордера R/H те же, что без W",
+           dcode == rcode == 0 and {p["book"] for p in dpos} == {"R", "H"}
+           and not any(cr["link"].startswith("dmo-W") for cr in fx.creates)
+           and len(fx.creates) == len(fx_ref.creates) > 0
+           and [(o["link_id"], o["status"]) for o in dord]
+           == [(o["link_id"], o["status"]) for o in dord_ref]
+           and len(dpos) == len(dpos_ref), failures)
+    _check("(д) W выключена: кандидаты pick_log не читаются — строк W нет, в сводке ключа wait "
+           "нет, в недельной и месячной W нет",
+           n_ref_w == 0 and all(b["wait"] is None for b in ref["brief"])
+           and not any(ln.startswith(("W ", "книга W")) for r in ref["runs"] for ln in r[1])
+           and [b["key"] for b in wb_ref] == ["R", "H"] and "W" not in act_ref["books"], failures)
+    _check("(д) выключили после работы — позиции W замерли (не тронуты, в сводке нет); "
+           "включили — досчитаны со своего места",
+           code_off == 0 and w_frozen == w_before and bs_off["wait"] is None
+           and not any(ln.startswith(("W ", "книга W")) for ln in lines_off)
+           and len(aaa_w) == 1 and aaa_w[0]["last_day"] == d0 + 6 * D
+           and next(p for p in w_before if p["symbol"] == "AAA" and p["status"] == "open")
+           ["last_day"] == d0 + 4 * D, failures)
+    b0, b1, b2, b3 = on["brief"][0]["wait"], on["brief"][1]["wait"], on["brief"][2]["wait"], \
+        on["brief"][3]["wait"]
+    _check("сводка дня: W — «поставил бы» CCC/DDD, «ждут возврата к лоу» AAA/BBB с ростом от лоу; "
+           "R/H «поставил бы» — все четыре по карточкам",
+           b0["opened"] == ["CCC", "DDD"] and [s for s, _b in b0["waiting"]] == ["AAA", "BBB"]
+           and all(abs(b_ - 0.08) < 1e-9 for _s, b_ in b0["waiting"])
+           and sorted(on["brief"][0]["opened"]) == ["AAA", "BBB", "CCC", "DDD"]
+           and "⏳ R у лоу (W): открыто 2, вложено $20.00, P&L −$0.03" in exl[0]
+           and "W за сутки: поставил бы лестницу: CCC, DDD" in exl[0]
+           and "W ждут возврата к лоу (закрытие ≤ лоу базы +5%): 2 (AAA +8.0%, BBB +8.0%)"
+           in exl[0], failures)
+    _check("сводка дня: «за сутки» W — по прогонам дня (run_ts): вход AAA и лимитки во 2-й день, "
+           "+50% CCC в 3-й, стоп DDD и +150% CCC в 4-й; вчерашнее не повторяется",
+           b1["opened"] == ["AAA"] and b1["waiting"] == [] and b1["fills"] == 5
+           and "W за сутки: поставил бы лестницу: AAA; исполнилось лимиток 5" in exl[1]
+           and b2["sells"] == [("W", "CCC", "ladder_0")] and b2["fills"] == 0
+           and sorted(b3["sells"]) == [("W", "CCC", "ladder_1"), ("W", "DDD", "invalidation")]
+           and "W за сутки: продажи: CCC фикс 33%" in exl[2]
+           and on["brief"][1]["opened"] == [] and on["brief"][1]["fills"] == 10
+           and not any(s[0] == "W" for b in on["brief"] for s in b["sells"]), failures)
+    wr = next((b for b in wb if b["key"] == "W"), {})
+    w_ps = [p for (bk, _s), p in pos.items() if bk == "W"]
+    exp_w = sum(ex.pnl_usdt(p) for p in w_ps) / sum(p["spent_usdt"] for p in w_ps) * 100
+    blk = tg.executor_weekly_block(wb)
+    _check("недельная: W — после R/H тем же способом (потоки, корзина), R/H — те же, что без W; "
+           "подпись про вход у лоу",
+           [b["key"] for b in wb] == ["R", "H", "W"] and wr.get("wait") is True
+           and wr.get("n") == 3 and abs(wr.get("book_pct", 0) - exp_w) < 1e-9
+           and isinstance(wr.get("basket_pct"), float) and set(wr) - {"wait", "max_bounce"}
+           == set(wb[0]) and [b for b in wb if b["key"] != "W"] == wb_ref
+           and any(ln.startswith("⏳ R у лоу:") for ln in blk)
+           and any("R и H входят одинаково" in ln and "вход, только когда закрытие не выше лоу "
+                   "базы +5% (замер Q17)" in ln for ln in blk)
+           and any("Обе книги входят одинаково" in ln for ln in tg.executor_weekly_block(wb_ref)),
+           failures)
+    mtext = tg.format_monthly({"month": "октябрь 2026", "books": wb, "shadow": [],
+                               "activity": act, "errors": []})
+    _check("месячная: W — новых 3, закрыто 2, продаж 4; R/H, отказы пар и старт — те же, что без "
+           "W (ежедневные отказы W «ждёт возврата» не в счёт)",
+           act["books"]["W"] == {"opened": 3, "shadow_opened": 0, "closed": 2, "sells": 4}
+           and {k: v for k, v in act["books"].items() if k != "W"} == act_ref["books"]
+           and act["rejected"] == act_ref["rejected"] and act["first_ts"] == act_ref["first_ts"]
+           and act["labels"] == {"W": "R у лоу"}
+           and "R у лоу — новых 3, закрыто 2, продаж 4" in mtext, failures)
+
+    with tempfile.TemporaryDirectory() as tmp:          # W исполнилась раньше R/H
+        c = mk(tmp)
+        seed(c, "WEA", "W", first_fill_ts=d0 - 5 * D, created_ts=d0 - 5 * D)
+        seed(c, "REA", "R", first_fill_ts=d0 - 2 * D, created_ts=d0 - 2 * D)
+        act_f = ex.period_activity(c, d0 - 10 * D, d0)
+    _check("месячная: «Пробный исполнитель с DD.MM» — первое исполнение R/H, а не W",
+           act_f["first_ts"] == d0 - 2 * D and act_f["books"]["W"]["opened"] == 1, failures)
+
+    # --- строка W того же дня не делает карточку R/H «обработанной»
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        m = _FakeMarket(t1)
+        pair(m, "AAA", [(d0 - D, 1.026)])
+        pick(c, "AAA", t1 - 1800, muted=0)        # карточка не дошла, кандидат W — есть
+        run(c, m, t1)
+        card(c, "AAA", t1 + H)                    # карточка ушла позже в тот же день
+        _, lines_l = run(c, m, t1 + 2 * H)
+        ps_l = q(c, "SELECT book, status FROM dry_positions WHERE pair='AAAUSDT' ORDER BY book")
+    _check("(г) отказ W того же дня не блокирует R/H: карточка позже — лестницы R и H стоят",
+           [(p["book"], p["status"]) for p in ps_l]
+           == [("H", "open"), ("R", "open"), ("W", "rejected")]
+           and not any("уже обработана" in ln for ln in lines_l), failures)
+
+    # --- (ж) нет закрытий / цены / свежего закрытия — вход не делается, причина в логе
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        m = _FakeMarket(t1)
+        pair(m, "NOC", days=[])                            # закрытий Bybit нет
+        pair(m, "OLD", days=base[:-5])                     # последнее закрытие 24.09
+        pair(m, "NOP", [(d0 - D, 0.97)], price=None)       # цены нет
+        for i, sym in enumerate(("NOC", "OLD", "NOP")):
+            pick(c, sym, t1 - 1800 + i, muted=0)
+        code_n, lines_n = run(c, m, t1)
+        n_w = q(c, "SELECT COUNT(*) n FROM dry_positions")[0]["n"]
+    _check("(ж) нет закрытий или цены — W не входит (строк нет, повтор в следующий прогон), "
+           "причина в логе",
+           code_n == 0 and n_w == 0
+           and "W NOC: нет цены или истории закрытий Bybit — пропуск до следующего прогона (вход "
+               "не делается)" in lines_n
+           and "W NOP: нет цены или истории закрытий Bybit — пропуск до следующего прогона (вход "
+               "не делается)" in lines_n, failures)
+    _check("(ж) последнее закрытие старше 2 дн. — рост от лоу не посчитать, вход не делается",
+           "W OLD: последнее закрытие Bybit от 24.09 — старше 2 дн., рост от лоу базы не "
+           "посчитать — вход не делается" in lines_n, failures)
+
+    # --- (з) свои места, деньги, квота, кулдаун; фильтры R; порядок по обороту
+    def one(setup=None, ctx=cold, ranks=None, tags=None) -> dict:
+        """NEW у лоу (+2.1%) — карточка R/H и кандидат W; та же база с выключенной W — для
+        сравнения R/H и тени."""
+        res = {}
+        for key, wait in (("on", W), ("off", W_OFF)):
+            with tempfile.TemporaryDirectory() as tmp:
+                c_ = mk(tmp, wait_low=wait)
+                m_ = _FakeMarket(t1)
+                m_.ranks = ranks or {}
+                pair(m_, "NEW", [(d0 - D, 0.97)])
+                if setup:
+                    setup(c_, m_)
+                card(c_, "NEW", t1 - 1800)
+                pick(c_, "NEW", t1 - 1800, muted=0)
+                code_, lines_ = run(c_, m_, t1, ctx, tags=tags)
+                res[key] = {"code": code_, "lines": lines_, "rh": rh(c_),
+                            "ps": {(p["book"], p["shadow"]): p for p in q(
+                                c_, "SELECT * FROM dry_positions WHERE symbol='NEW'")},
+                            "wsh": q(c_, "SELECT COUNT(*) n FROM dry_positions WHERE book='W' "
+                                         "AND shadow=1")[0]["n"]}
+        res["on"]["same_rh"] = res["on"]["rh"] == res["off"]["rh"]
+        return res["on"]
+
+    def w_reason(r: dict) -> str:
+        p = r["ps"].get(("W", 0)) or {}
+        return p.get("reason", "") if p.get("status") == "rejected" else ""
+
+    def opened(r: dict, book: str) -> bool:
+        return (r["ps"].get((book, 0)) or {}).get("status") == "open"
+
+    def seed_n(n: int, book: str, **cols):
+        def f(c_, m_):
+            for i in range(n):
+                pair(m_, f"S{i}")
+                seed(c_, f"S{i}", book, **cols)
+        return f
+    cool_w = one(lambda c_, m_: seed(c_, "NEW", "W", status="closed", created_ts=t1 - 10 * D))
+    cool_r = one(lambda c_, m_: seed(c_, "NEW", "R", status="closed", created_ts=t1 - 10 * D))
+    full_w = one(seed_n(15, "W"))
+    full_r = one(seed_n(15, "R"))
+    cash_w = one(lambda c_, m_: (pair(m_, "BIG"), seed(c_, "BIG", "W", spent_usdt=1480.0)))
+    quota_w = one(seed_n(5, "W", vol_share=0.5), ranks=rk({"NEW": 45}, 100))
+    _check("(з) кулдаун свой: вход W по NEW 10 дн. назад — отказ W «кулдаун до …», R/H входят; "
+           "кулдаун R — W входит",
+           w_reason(cool_w).startswith("кулдаун до") and opened(cool_w, "R")
+           and opened(cool_w, "H") and opened(cool_r, "W")
+           and "кулдаун до" in cool_r["ps"][("R", 0)]["reason"] and opened(cool_r, "H"), failures)
+    _check("(з) свои 15 мест: W полна — отказ W «лимит 15 монет», R/H ставят; R полна — W ставит",
+           w_reason(full_w) == "лимит 15 монет" and opened(full_w, "R") and opened(full_w, "H")
+           and opened(full_r, "W") and opened(full_r, "H")
+           and full_r["ps"][("R", 0)]["status"] == "rejected", failures)
+    _check("(з) свой капитал: у W свободно $20 — отказ «нехватка USDT», R/H ставят",
+           w_reason(cash_w).startswith("нехватка USDT: свободно 20.00") and opened(cash_w, "R")
+           and opened(cash_w, "H"), failures)
+    _check("(з) своя квота неликвида: у W 5 из 5 мест вне топа — отказ W, у R квота свободна",
+           w_reason(quota_w).startswith("квота неликвида: вне топ-39% уже 5 из 5 мест")
+           and opened(quota_w, "R") and opened(quota_w, "H"), failures)
+    _check("(з) места, деньги, кулдауны W не трогают R/H: строки R/H те же, что без W",
+           all(r["same_rh"] and r["code"] == 0
+               for r in (cool_w, cool_r, full_w, full_r, cash_w, quota_w)), failures)
+    tags = {"status": "ok", "count": 1, "updated_ts": t1, "err": "", "note": "",
+            "tagged": {"NEW": {"since": d0 - 8 * D, "title": "… NEW …"}}, "price": lambda s: None}
+    f_low = one(ranks=rk({"NEW": 80}, 100))
+    f_hot = one(ctx=hot)
+    f_bn = one(tags=tags)
+    f_st = one(lambda c_, m_: m_.inst["NEWUSDT"].update(st=True))
+    _check("фильтры как у R: нижняя четверть, перегрев, метка Binance, ST — W не берёт (своей "
+           "тени нет), R/H — в тень как раньше",
+           w_reason(f_low) == "не беру — нижняя четверть по обороту (80-е место из 100)"
+           and w_reason(f_hot) == "не беру — перегрев рынка (MVRV ETH)"
+           and w_reason(f_bn) == "не беру — метка Monitoring Binance с 23.09"
+           and w_reason(f_st) == "Bybit: статус Trading, метка ST"
+           and all(r["wsh"] == 0 and r["same_rh"] for r in (f_low, f_hot, f_bn, f_st))
+           and all(r["ps"][("R", 1)]["status"] == "open" for r in (f_low, f_hot, f_bn)), failures)
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        m = _FakeMarket(t1)
+        m.ranks = rk({"ILL": 30, "LIQ": 5}, 100)
+        seed_n(14, "W")(c, m)
+        pair(m, "ILL", [(d0 - D, 0.97)])
+        pair(m, "LIQ", [(d0 - D, 0.97)])
+        pick(c, "ILL", t1 - 1800, muted=0)        # раньше по времени, но место хуже
+        pick(c, "LIQ", t1 - 1700, muted=0)
+        run(c, m, t1)
+        ord_w = {p["symbol"]: p for p in q(c, "SELECT * FROM dry_positions WHERE book='W' AND "
+                                              "symbol IN ('ILL','LIQ')")}
+    _check("порядок кандидатов W — по обороту, как у R: последнее место книги — LIQ (5-е), ILL "
+           "(30-е) — «лимит 15 монет»",
+           ord_w["LIQ"]["status"] == "open" and ord_w["ILL"]["reason"] == "лимит 15 монет",
+           failures)
+
+    # --- скан: кандидаты до заглушки — в pick_log (заглушённый повтор — muted=1); карточки,
+    # alert_log и mute — как раньше; W выключена — журнал не пишется
+    def scan(tmp: str, wait: dict) -> dict:
+        c_ = mk(tmp, wait_low=wait)
+        rows = [{"symbol": s, "zone": "ПРУЖИНА/ДНО", "score": sc, "confidence": 0.9, "track": "A",
+                 "rf_venue": v} for s, sc, v in (("AAA", 72.0, "Bybit spot"),
+                                                 ("BBB", 75.0, "Bybit spot"),
+                                                 ("LOWS", 60.0, "Bybit spot"),
+                                                 ("DEXC", 80.0, "DEX only"))]
+        _P(c_["output"]["watchlist_json"]).write_text(_json.dumps(rows), encoding="utf-8")
+        x(c_, "INSERT INTO alert_log(symbol, ts, score) VALUES ('AAA', ?, 72)",
+          (_time.time() - D,))                     # AAA была карточкой вчера — заглушена
+        sent: list = []
+        saved = (run_cli.load_config, run_cli.run_scan, pipeline._make_http, deliver.coin_card,
+                 deliver.send_card, run_cli._card_ranks, run_cli.bn_tags, run_cli._exec_notes,
+                 _sys.stdout)
+        run_cli.load_config = lambda p=None: c_
+        run_cli.run_scan = lambda cfg_, track="all", limit=None: {"market_ctx": {}}
+        pipeline._make_http = lambda cfg_: object()
+        deliver.coin_card = lambda cfg_, http, cand, paper=None, exec_notes=None: {"s": cand.symbol}
+        deliver.send_card = lambda cfg_, crd: sent.append(crd["s"]) or True
+        run_cli._card_ranks = lambda cfg_, http, network=True: {}
+        run_cli.bn_tags = lambda cfg_, http: None
+        run_cli._exec_notes = lambda *a, **k: []
+        _sys.stdout = io.StringIO()
+        try:
+            rc = run_cli.cmd_scan(types.SimpleNamespace(config=None, pages=None, track="all",
+                                                        limit=None, notify=True))
+        finally:
+            (run_cli.load_config, run_cli.run_scan, pipeline._make_http, deliver.coin_card,
+             deliver.send_card, run_cli._card_ranks, run_cli.bn_tags, run_cli._exec_notes,
+             _sys.stdout) = saved
+        return {"rc": rc, "sent": sent,
+                "alerts": [r["symbol"] for r in q(c_, "SELECT symbol FROM alert_log ORDER BY ts")],
+                "picks": [(r["symbol"], r["muted"]) for r in q(
+                    c_, "SELECT symbol, muted FROM pick_log ORDER BY rowid")]}
+    with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+        sc_on = scan(tmp_a, W)
+        sc_off = scan(tmp_b, W_OFF)
+    _check("(в) скан: заглушённая повторная AAA — без карточки, но в pick_log (muted=1) рядом с "
+           "BBB; ниже порога и DEX — нет; alert_log и карточки — как раньше",
+           sc_on["rc"] == 0 and sc_on["sent"] == ["BBB"] and sc_on["alerts"] == ["AAA", "BBB"]
+           and sc_on["picks"] == [("AAA", 1), ("BBB", 0)], failures)
+    _check("(д) скан при выключенной W: pick_log пуст, карточки и alert_log те же",
+           sc_off["picks"] == [] and sc_off["sent"] == sc_on["sent"]
+           and sc_off["alerts"] == sc_on["alerts"], failures)
+
+    # --- граница гейта: ровно +5% — вход (≤, как в бэктесте); сбой данных позиции W — в
+    # «нет данных Bybit» только при включённой W; блок сводки — и когда новости только у W
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        m = _FakeMarket(t1)
+        pair(m, "EDG", [(d0 - D, 0.9975)])                 # 0.95 × 1.05
+        pick(c, "EDG", t1 - 1800, muted=0)
+        run(c, m, t1)
+        edge = q(c, "SELECT status, bounce FROM dry_positions WHERE book='W'")
+        x(c, "UPDATE dry_positions SET data_err='дневные свечи: retCode 10016' WHERE book='W'")
+        c_off = Config({**c._d, "executor": {**c._d["executor"], "wait_low": W_OFF}})
+        bs_on, bs_offn = ex.brief_state(c, now=t1), ex.brief_state(c_off, now=t1)
+    _check("гейт: ровно +5% от лоу базы — вход (≤ max_bounce, как в бэктесте)",
+           len(edge) == 1 and edge[0]["status"] == "open"
+           and abs(edge[0]["bounce"] - 0.05) < 1e-9, failures)
+    _check("сводка: сбой данных позиции W — своей строкой W (не в «нет данных» R/H), только пока "
+           "W включена",
+           bs_on["nodata"] == [] and [p for p, _e in bs_on["wait"]["nodata"]] == ["EDGUSDT"]
+           and "⚠ W: нет данных Bybit: EDGUSDT (дневные свечи: retCode 10016) — позиция ждёт "
+               "данных" in tg.executor_brief_lines(bs_on, cfg)
+           and bs_offn["nodata"] == [] and bs_offn["wait"] is None, failures)
+
+    # --- сбой книги W не трогает R/H: итоги, stamp_run, код выхода; «⚠ книга W упала»
+    def boom(*a, **k):
+        raise RuntimeError("W сломалась")
+
+    def w_fail(patch: str) -> dict:
+        res = {}
+        for key, wait in (("on", W), ("off", W_OFF)):
+            with tempfile.TemporaryDirectory() as tmp:
+                c_ = mk(tmp, wait_low=wait)
+                m_ = _FakeMarket(t1)
+                pair(m_, "NEW", [(d0 - D, 0.97)], [(d0 + 7 * H, 0.92)])
+                card(c_, "NEW", t1 - 1800)
+                pick(c_, "NEW", t1 - 1800, muted=0)
+                run(c_, m_, t1)                          # R/H и W вошли в NEW
+                pick(c_, "NEW", T[1] - 1800)
+                orig = {"open_wait": ex.open_wait, "todays": ex.todays_cards,
+                        "proc": ex.process_position}
+                if patch == "cand":
+                    ex.open_wait = boom
+                elif patch == "list":
+                    ex.todays_cards = lambda cfg_, con_, now_, table="alert_log": (
+                        boom() if table == "pick_log" else orig["todays"](cfg_, con_, now_, table))
+                elif patch == "pos":
+                    ex.process_position = lambda cfg_, con_, mk_, s_, pos, now_, **k: (
+                        boom() if pos["book"] == "W" else orig["proc"](cfg_, con_, mk_, s_, pos,
+                                                                       now_, **k))
+                try:
+                    code_, lines_ = run(c_, m_, T[1])
+                finally:
+                    ex.open_wait, ex.todays_cards = orig["open_wait"], orig["todays"]
+                    ex.process_position = orig["proc"]
+                bs_ = ex.brief_state(c_, now=T[1])
+                run(c_, m_, T[1] + 60)                   # следующий прогон W — без сбоя
+                nxt = ex.brief_state(c_, now=T[1] + 60)
+                res[key] = {"code": code_, "lines": lines_, "rh": rh(c_), "bs": bs_,
+                            "stamped": q(c_, "SELECT COUNT(*) n FROM dry_orders WHERE book IN "
+                                             "('R','H') AND status='filled' AND run_ts=?",
+                                         (T[1],))[0]["n"],
+                            "exl": tg.executor_brief_lines(bs_, cfg),
+                            "fail_next": (nxt["wait"] or {}).get("fail"),
+                            "exec_fail": deliver.brief_state(c_, now=T[1], exec_exit=code_)["exec_fail"]}
+        res["on"]["same"] = (res["on"]["rh"] == res["off"]["rh"]
+                             and res["on"]["code"] == res["off"]["code"] == 0
+                             and not_w(res["on"]["lines"]) == res["off"]["lines"])
+        return res["on"]
+    f_cand, f_list, f_pos = w_fail("cand"), w_fail("list"), w_fail("pos")
+    _check("сбой W (кандидат, список кандидатов, позиция W): код 0, R/H, их итоги и stamp_run — "
+           "как без W; в логе «⚠ книга W упала …»",
+           all(r["same"] and r["stamped"] == 2 for r in (f_cand, f_list, f_pos))
+           and any(ln.startswith("⚠ книга W упала на NEW: RuntimeError: W сломалась")
+                   for ln in f_cand["lines"])
+           and any(ln == "⚠ книга W упала: RuntimeError: W сломалась" for ln in f_list["lines"])
+           and any(ln.startswith("⚠ книга W упала на NEW") for ln in f_pos["lines"])
+           and any(ln.startswith("книга R «правила»") for ln in f_list["lines"]), failures)
+    _check("сводка дня: сбой W — «⚠ книга W упала: …» в блоке исполнителя, не «исполнитель упал»",
+           "W сломалась" in f_list["bs"]["wait"]["fail"]
+           and any(ln.startswith("⚠ книга W упала: RuntimeError: W сломалась")
+                   for ln in f_list["exl"])
+           and not f_list["exec_fail"] and not f_cand["exec_fail"]
+           and f_list["fail_next"] == "" and f_cand["fail_next"] == "",
+           failures)
+    with tempfile.TemporaryDirectory() as tmp:          # нет данных Bybit у кандидата W
+        c = mk(tmp)
+        m = _FakeMarket(t1)
+        pair(m, "GAP", [(d0 - D, 0.97)])
+        m.err_daily.add("GAPUSDT")
+        pick(c, "GAP", t1 - 1800, muted=0)
+        pair(m, "PGP")                                    # открытая позиция W без свечей
+        m.err_daily.add("PGPUSDT")
+        seed(c, "PGP", "W")
+        code_g, lines_g = run(c, m, t1)
+        run(c, m, t1 + 60)                                # прогон W после сбоя — прошёл
+        fail_after = ex.brief_state(c, now=t1 + 60)["wait"]["fail"]
+    _check("нет данных Bybit у кандидата W — строка W, код не 4, общей «⚠ нет данных Bybit» нет; "
+           "следующий прогон W без сбоя — метки «упала» нет",
+           code_g == 0 and any(ln.startswith("⚠ W: нет данных Bybit: GAPUSDT (дневные свечи: "
+                                             "retCode 10016") for ln in lines_g)
+           and not any(ln.startswith("⚠ нет данных Bybit") for ln in lines_g)
+           and any(ln.startswith("⚠ W: нет данных Bybit: PGPUSDT") and ln.endswith("позиция "
+                   "ждёт данных") for ln in lines_g)
+           and fail_after == "", failures)
+
+    # --- гейт W: нужны все 30 закрытий (base30 Q17); у R — как было
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        m = _FakeMarket(t1)
+        pair(m, "YNG", days=[(d0 - k * D, 0.97 if k == 1 else 1.0) for k in range(29, 0, -1)])
+        card(c, "YNG", t1 - 1800)
+        pick(c, "YNG", t1 - 1800, muted=0)
+        _, lines_y = run(c, m, t1)
+        ps_y = {p["book"]: p["status"] for p in q(c, "SELECT book, status FROM dry_positions")}
+    _check("гейт W: 29 закрытий Bybit — «меньше 30 закрытий», вход W не делается; R/H ставят",
+           "W YNG: меньше 30 закрытий Bybit (29) — лоу базы не как в бэктесте, вход не делается"
+           in lines_y and ps_y == {"R": "open", "H": "open"}, failures)
+
+    # --- /status: W — только когда включена; бэкап: pick_log — журнал под сверкой строк
+    from scanner import backup as bk_
+    from scanner import control
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp)
+        PositionStore(c["output"]["db_path"]).close_db()     # таблицы позиций для /status
+        seed(c, "SST", "W")
+        seed(c, "SST", "R")
+        st_on = control.status_text(c["output"]["db_path"], _P(tmp), t1, ex.hidden_books(c))
+        c_off = Config({**c._d, "executor": {**c._d["executor"], "wait_low": W_OFF}})
+        st_off = control.status_text(c["output"]["db_path"], _P(tmp), t1, ex.hidden_books(c_off))
+    _check("/status: «пробная книга W» — только при включённой W; R — всегда",
+           "пробная книга W: открыто 1" in st_on and "пробная книга W" not in st_off
+           and "пробная книга R: открыто 1" in st_off and ex.hidden_books(c_off) == ("W",),
+           failures)
+    _check("бэкап: pick_log — в таблицах-журналах сверки строк (GUARD_TABLES)",
+           "pick_log" in bk_.GUARD_TABLES, failures)
+    mono = tg.format_monthly({"month": "октябрь 2026", "books": [], "shadow": [], "errors": [],
+                              "activity": {"books": {"R": {"opened": 0, "shadow_opened": 0,
+                                                           "closed": 0, "sells": 0},
+                                                     "W": {"opened": 1, "shadow_opened": 0,
+                                                           "closed": 0, "sells": 0}},
+                                           "rejected": 0, "first_ts": None,
+                                           "labels": {"W": "R у лоу"}}})
+    _check("месячная без недельных строк: R — подписью-ключом, как раньше; W — «R у лоу»",
+           "За месяц: R — новых 0, закрыто 0, продаж 0 · R у лоу — новых 1" in mono, failures)
+    only_w = {"books": {"R": {"open": 0, "closed": 0, "pnl": 0.0, "label": "правила",
+                              "emoji": "📏"}}, "shadow": {}, "opened": [], "rejected": [],
+              "shadowed": [], "fills": 0, "sells": [], "nodata": [],
+              "wait": {"key": "W", "label": "R у лоу", "emoji": "⏳", "max_bounce": 0.05,
+                       "open": 0, "closed": 0, "spent": 0.0, "pnl": 0.0, "opened": [],
+                       "waiting": [("LUNC", 0.081)], "fills": 0, "sells": []}}
+    exw = tg.executor_brief_lines(only_w, cfg)
+    _check("сводка: новости только у W (ждёт LUNC) — блок есть: строка книги и «ждут возврата»; "
+           "у W ничего — блока нет",
+           exw[:1] == ["🤖 <b>Пробный исполнитель</b> <i>(ордера не отправлялись)</i>"]
+           and "⏳ R у лоу (W): открыто 0, вложено $0.00, P&L +$0.00" in exw
+           and "W ждут возврата к лоу (закрытие ≤ лоу базы +5%): 1 (LUNC +8.1%)" in exw
+           and tg.executor_brief_lines({**only_w, "wait": {**only_w["wait"], "waiting": []}},
+                                       cfg) == [], failures)
+
+    # --- код W занят книгой R: W выключена, строка в логе, R/H — как обычно
+    with tempfile.TemporaryDirectory() as tmp:
+        c = mk(tmp, wait_low={**W, "book": "R"})
+        m = _FakeMarket(t1)
+        pair(m, "NEW", [(d0 - D, 0.97)])
+        card(c, "NEW", t1 - 1800)
+        pick(c, "NEW", t1 - 1800, muted=0)
+        code_b, lines_b = run(c, m, t1)
+        books_b = sorted(p["book"] for p in q(c, "SELECT book FROM dry_positions"))
+    _check("код W «R» — книга выключена: «⚠ executor.wait_low.book «R» …», R/H ставят как обычно",
+           code_b == 0 and books_b == ["H", "R"]
+           and lines_b[0].startswith("⚠ executor.wait_low.book «R»"), failures)
+
+
 def main() -> int:
     cfg = load_config()
     failures: list[str] = []
@@ -6623,6 +7299,8 @@ def main() -> int:
     test_demo(cfg, failures)
     print()
     test_binance_monitor(cfg, failures)
+    print()
+    test_executor_wait(cfg, failures)
     print()
     test_github_levels(cfg, failures)
     print()

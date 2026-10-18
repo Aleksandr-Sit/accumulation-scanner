@@ -75,6 +75,16 @@ CREATE TABLE IF NOT EXISTS alert_log (
     score  REAL
 );
 CREATE INDEX IF NOT EXISTS idx_alert_sym ON alert_log(symbol, ts);
+-- Кандидаты карточек ДО заглушки повторов (scan --notify): книга W пробного исполнителя
+-- (executor.wait_low) — серия сигналов монеты идёт, пока она каждый день проходит отбор карточки.
+-- alert_log (что реально ушло карточкой, по нему mute и книги R/H) не меняется.
+CREATE TABLE IF NOT EXISTS pick_log (
+    symbol TEXT,
+    ts     REAL,
+    score  REAL,
+    muted  INTEGER DEFAULT 0          -- 1 — карточку заглушил повтор (alert_mute_days)
+);
+CREATE INDEX IF NOT EXISTS idx_pick_ts ON pick_log(ts);
 CREATE TABLE IF NOT EXISTS market_daily (
     day           INTEGER PRIMARY KEY,   -- unix-секунды 00:00 UTC
     total_mcap    REAL,                  -- вся капа (CMC; при сбое — CoinGecko × поправка)
@@ -205,6 +215,16 @@ class Store:
         self.conn.execute("INSERT INTO alert_log(symbol, ts, score) VALUES (?,?,?)",
                           (symbol, time.time(), score))
         self.conn.commit()
+
+    def record_picks(self, rows: Iterable[tuple[str, float, bool]]) -> int:
+        """Кандидаты карточек до заглушки [(symbol, score, muted)] -> pick_log одной транзакцией
+        (время — одно на прогон). Возвращает число строк."""
+        now = time.time()
+        data = [(sym, now, score, int(bool(muted))) for sym, score, muted in rows]
+        self.conn.executemany("INSERT INTO pick_log(symbol, ts, score, muted) VALUES (?,?,?,?)",
+                              data)
+        self.conn.commit()
+        return len(data)
 
     def save_metrics(self, run_id: int, candidates: Iterable[Candidate]) -> None:
         """Снапшот метрик watchlist-кандидатов — для трендов (живость/ликвидность

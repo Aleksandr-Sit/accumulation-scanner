@@ -72,6 +72,34 @@ ST, не Trading) → цена (и сверка с ценой скана) и п�
 ордера с префиксом shd-. Тень bn_monitor метку на выходе не применяет (книга «правила нет»).
 Обычные отказы (лимит монет, нет на Bybit, ST, другая монета) в тень не идут.
 Метки на входе в каждой позиции: место по обороту, число пар, доля, оборот, горящие флаги.
+
+Книга W «R у лоу» (executor.wait_low; замер Q17 18.10.2026, backtest/bounce_gate_study.py: R с
+гейтом «рост от лоу базы ≤ 5%» +$1809 / +$123 к альтам против +$1440 / −$278 у базы, во всех
+циклах; решение владельца 18.10.2026) — независимая бумажная книга с правилами R, но с отложенным
+входом: монета берётся, только когда последнее дневное закрытие Bybit не выше лоу базы × (1 +
+max_bounce). Механизм замера — тайминг внутри серии сигналов одной монеты (вход в среднем на 16 дн.
+позже и на 4.4% дешевле; серии, не вернувшиеся к лоу, пропускаются, их места и деньги — новым).
+  • кандидаты — монеты, прошедшие отбор карточки (select_picks) за последние 24 ч ДО заглушки
+    повторов: pick_log, пишет run.py scan --notify (alert_log и mute не меняются). Серия идёт,
+    пока монета каждый день проходит отбор; не прошла — серия прервана, вход не ждём (памяти
+    сверх серии нет); порядок внутри дня — по обороту, как у R;
+  • лоу базы — compute_base_low: минимум 30 последних закрытых дневных Bybit, последнее
+    включительно (= base30 бэктеста: min c[e−29..e], e — день сигнала); отличие — источник
+    закрытий (Bybit, а не Binance). Закрытий меньше 30 (в бэктесте их всегда 30), нет вовсе или
+    последнее старше 2 дн. — вход не делается (строка в лог, повтор в следующий прогон); bounce
+    пишется в позицию (dry_positions.bounce);
+  • те же проверки и фильтры, что у R (тикер, Bybit, ST, сверка цены, план, нижняя четверть,
+    перегрев, метка Binance, лимит монет, USDT, risk_check, квота неликвида) — по своей книге:
+    места, деньги, квота и кулдаун reentry_cooldown_days — свои, одна позиция на монету;
+    отсеянное фильтрами W просто не берёт (своей тени нет), не прошла гейт — отказ «ждёт
+    возврата к лоу» (сводка дня: «ждут возврата к лоу»). Лестница, исполнения и выходы — код R
+    (_entry_plan, _place, process_position с параметрами книги R: book_params);
+  • изоляция: строки W не входят в «уже обработана» R/H, в списки и цифры R/H/тени сводок
+    (исключаются по коду книги, даже выключенной); на демо-счёт W не зеркалится (mirror_books),
+    реального счёта и risk_check реальных ордеров не касается; сбой W — строка «⚠ книга W упала»
+    (wait_runs, сводка дня), код выхода и итоги R/H не трогает. enabled false — как до W: кандидаты
+    не пишутся и не читаются, позиции W замораживаются (после включения досчитываются со своего
+    места, как после resume).
 """
 from __future__ import annotations
 
@@ -109,7 +137,13 @@ DEFAULTS: dict[str, Any] = {
                         "max_age_days": 3, "price_tol": 0.2},
     "books": {"R": {"label": "правила", "emoji": "📏", "exits": "rules", "stop_pct": 25},
               "H": {"label": "держать", "emoji": "✋", "exits": "stop_only", "stop_pct": 25}},
+    # книга W «R у лоу» (Q17, решение владельца 18.10.2026): без секции в конфиге — выключена
+    "wait_low": {"enabled": False, "book": "W", "label": "R у лоу", "emoji": "⏳",
+                 "max_bounce": 0.05},
 }
+# Отказ книги W по гейту — с этого начинается причина (сводка дня: «ждут возврата к лоу»).
+WAIT_REASON = "ждёт возврата к лоу"
+BASE_DAYS = 30                    # закрытий в лоу базы; гейту W нужны все 30 (base30 Q17)
 # Почему монета в тени (dry_positions.shadow_why, через запятую).
 WHY_LABEL = {"bottom": "нижняя четверть по обороту", "quota": "квота неликвида",
              "hot": "перегрев рынка", "nodata": "нет свежих данных рынка",
@@ -118,7 +152,7 @@ WHY_LABEL = {"bottom": "нижняя четверть по обороту", "quo
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS dry_positions (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    book          TEXT NOT NULL,        -- R | H
+    book          TEXT NOT NULL,        -- R | H | W (wait_low)
     pair          TEXT NOT NULL,        -- LINKUSDT
     symbol        TEXT NOT NULL,
     coin_id       TEXT DEFAULT '',
@@ -152,6 +186,7 @@ CREATE TABLE IF NOT EXISTS dry_positions (
     tick          REAL,                 -- tickSize: цели тейка вверх к нему
     trail_armed_ts REAL,                -- защёлка трейла: закрытие ≥ +arm от средней (как watch)
     data_err      TEXT DEFAULT '',      -- сбой данных Bybit прошлого прогона (сводка дня)
+    bounce        REAL,                 -- книга W: рост от лоу базы на решении (закрытие / лоу − 1)
     UNIQUE(book, pair, card_day)
 );
 CREATE TABLE IF NOT EXISTS dry_orders (
@@ -175,6 +210,10 @@ CREATE TABLE IF NOT EXISTS dry_orders (
                                         -- «за сутки» сводки дня; filled_ts — время рынка
 );
 CREATE INDEX IF NOT EXISTS idx_dry_orders_pos ON dry_orders(position_id, side, status);
+CREATE TABLE IF NOT EXISTS wait_runs (
+    ts   REAL PRIMARY KEY,                  -- прогон execute с включённой книгой W
+    err  TEXT DEFAULT ''                    -- сбой W в нём ('' — прошла): «⚠ книга W упала»
+);
 """
 # Колонки dry_positions после ec02fc7 — миграция старых БД (как db._MIGRATIONS).
 _MIGRATIONS = [("shadow", "INTEGER DEFAULT 0"), ("shadow_why", "TEXT DEFAULT ''"),
@@ -183,7 +222,9 @@ _MIGRATIONS = [("shadow", "INTEGER DEFAULT 0"), ("shadow_why", "TEXT DEFAULT ''"
                ("hot_day", "INTEGER"),
                # блок C: шаг количества и цены, защёлка трейла, сбой данных
                ("qty_step", "REAL"), ("tick", "REAL"), ("trail_armed_ts", "REAL"),
-               ("data_err", "TEXT DEFAULT ''")]
+               ("data_err", "TEXT DEFAULT ''"),
+               # книга W (Q17): рост от лоу базы на решении; у R/H/тени — NULL
+               ("bounce", "REAL")]
 
 
 EXIT_NODATA = 4    # код run_dry: упасть не упал, но у части пар нет данных Bybit (ждут)
@@ -202,7 +243,43 @@ def settings(cfg) -> dict[str, Any]:
                   for k, v in (s.get("books") or DEFAULTS["books"]).items()
                   if not str(k).startswith("_")}
     s["binance_monitor"] = {**DEFAULTS["binance_monitor"], **(s.get("binance_monitor") or {})}
+    w = {k: v for k, v in {**DEFAULTS["wait_low"], **(s.get("wait_low") or {})}.items()
+         if not str(k).startswith("_")}
+    code = str(w.get("book") or "")
+    if not code.isalpha() or code in s["books"]:
+        # код W — буквы и не книга executor.books: иначе строки W смешались бы с R/H
+        # (orderLinkId dry-<книга><id>, «уже обработана», сводки) — книга выключается
+        w["error"] = (f"executor.wait_low.book «{code}» — нужен буквенный код, не занятый "
+                      f"executor.books ({'/'.join(s['books'])}): книга W выключена")
+        w["enabled"], code = False, ""
+    w["book"], w["enabled"] = code, bool(w.get("enabled"))
+    s["wait_low"] = w
     return s
+
+
+def book_params(s: dict, book: str) -> dict:
+    """Параметры книги для лестницы и выходов: R/H — executor.books; W (wait_low) — правила R
+    (exits, stop_pct) с подписью W, чтобы выходы W были ровно выходами R; чужой код — {}."""
+    if book in s["books"]:
+        return s["books"][book]
+    w = s["wait_low"]
+    if w["book"] and book == w["book"]:
+        return {**(s["books"].get("R") or DEFAULTS["books"]["R"]), "label": w["label"],
+                "emoji": w.get("emoji", "⏳")}
+    return {}
+
+
+def hidden_books(cfg) -> tuple:
+    """Книги, которые /status не показывает: книга W, пока она выключена."""
+    w = settings(cfg)["wait_low"]
+    return (w["book"],) if w["book"] and not w["enabled"] else ()
+
+
+def mirror_books(cfg) -> list[str]:
+    """Книги, которые демо-счёт повторяет на бирже: executor.books (R/H). Книга W (wait_low) —
+    только бумага: на демо и реальный счёт она не идёт."""
+    s = settings(cfg)
+    return [b for b in s["books"] if b != s["wait_low"]["book"]]
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -550,14 +627,15 @@ def ticker_issue(sym: str, wl: dict | None) -> str:
     return ""
 
 
-def todays_cards(cfg, con, now: float) -> list[dict]:
+def todays_cards(cfg, con, now: float, table: str = "alert_log") -> list[dict]:
     """Монеты, пришедшие карточкой за последние 24 ч (скан мог перейти полночь — окно не по
     местному дню; дубли отсекает ключ (пара, UTC-день карточки)): по одной на тикер и UTC-день.
-    coin_id, цена скана и сверка тикера (ticker_issue) — из watchlist.json."""
+    coin_id, цена скана и сверка тикера (ticker_issue) — из watchlist.json. table="pick_log" —
+    кандидаты книги W: прошедшие отбор карточки до заглушки повторов (run.py scan --notify)."""
     try:
-        rows = con.execute("SELECT symbol, ts, score FROM alert_log WHERE ts>=? ORDER BY ts",
+        rows = con.execute(f"SELECT symbol, ts, score FROM {table} WHERE ts>=? ORDER BY ts",
                            (now - DAY,)).fetchall()
-    except sqlite3.OperationalError:          # нет alert_log — скан ещё ни разу не шёл
+    except sqlite3.OperationalError:          # нет таблицы — скан ещё ни разу не шёл
         return []
     wl = load_wl(cfg)
     seen: dict[tuple, dict] = {}
@@ -584,14 +662,102 @@ def _insert_position(con, book: str, card: dict, pair: str, now: float, status: 
     cur = con.execute(
         "INSERT OR IGNORE INTO dry_positions(book, pair, symbol, coin_id, card_day, status, "
         "reason, created_ts, base_low, stop_pct, min_amt, shadow, shadow_why, vol_rank, "
-        "vol_pairs, vol_share, vol_usd, hot_n, hot_flags, hot_day, qty_step, tick) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "vol_pairs, vol_share, vol_usd, hot_n, hot_flags, hot_day, qty_step, tick, bounce) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (book, pair, card["symbol"], card.get("coin_id", ""), utc_day(card["ts"]), status,
          reason, now, kw.get("base_low"), kw.get("stop_pct"), kw.get("min_amt", 5.0),
          int(shadow), why, lab.get("vol_rank"), lab.get("vol_pairs"), lab.get("vol_share"),
          lab.get("vol_usd"), lab.get("hot_n"), lab.get("hot_flags") or "", lab.get("hot_day"),
-         kw.get("qty_step"), kw.get("tick")))
+         kw.get("qty_step"), kw.get("tick"), kw.get("bounce")))
     return int(cur.lastrowid) if cur.rowcount else None
+
+
+def _entry_plan(cfg, market, s: dict, card: dict) -> dict:
+    """Общие проверки входа по карточке (R/H и W), по порядку: тикер (fail-closed) → Bybit (нет
+    пары, ST, не Trading) → цена и дневные закрытия, лоу базы (30 закрытий) → сверка цены с
+    карточкой → план лестницы. -> {"reject": причина} — отказ; {"skip": строка} — нет цены или
+    истории закрытий (строк в журнал нет: повтор в следующий прогон); иначе {inst, price, daily,
+    closes, base_low, plan}. Сбой ответа Bybit — DataGap."""
+    pair = f"{card['symbol']}USDT"
+    # чужая монета под тикером — fail-closed: не сверено = не покупаем
+    issue = card.get("ticker_issue", "тикер не сверен: карточка без сверки watchlist")
+    if issue:
+        return {"reject": issue}
+    inst = market.instrument(pair)
+    if inst and inst.get("err"):
+        raise DataGap(f"инструмент: {inst['err']}")
+    if not inst:
+        return {"reject": f"{pair} нет на Bybit spot"}
+    if inst.get("status") != "Trading" or (s["skip_st"] and inst.get("st")):
+        return {"reject": f"Bybit: статус {inst.get('status')}"
+                          f"{', метка ST' if inst.get('st') else ''}"}
+    price = market.last_price(pair)
+    daily = market.daily(pair) or {}
+    if daily.get("err"):
+        raise DataGap(f"дневные свечи: {daily['err']}")
+    closes = daily.get("c") or []
+    base_low = compute_base_low(closes, 30)
+    if not price or not base_low:
+        return {"skip": "нет цены или истории закрытий Bybit — пропуск до следующего прогона"}
+    if same_coin(price, card.get("price_usd")) is False:
+        return {"reject": f"цена Bybit {price:.6g} не совпадает с карточкой "
+                          f"({card['price_usd']:.6g}) — похоже, другая монета"}
+    e = cfg["stage8_exit"]
+    plan = plan_ladder(price, base_low, s["budget_usdt"], steps=s["steps"],
+                       min_order=s["min_order_usdt"], tick=inst["tick"],
+                       qty_step=inst["qty_step"], exch_min_amt=inst["min_amt"],
+                       exch_min_qty=inst["min_qty"],
+                       floor_pct=e["invalidation_below_base_low_pct"], sell="prod",
+                       prod_levels=e["ladder"])
+    if not plan["ok"]:
+        return {"reject": plan["error"]}
+    return {"inst": inst, "price": price, "daily": daily, "closes": closes,
+            "base_low": base_low, "plan": plan}
+
+
+def _place(con, s: dict, card: dict, pair: str, now: float, bks: list[str], ep: dict,
+           lab: dict, *, shadow: bool = False, why: str = "",
+           bounce: float | None = None) -> None:
+    """Позиции в книги bks (основные или теневые) по плану _entry_plan, ордера лестницы,
+    ступень 1 — рынком по цене запуска. Без коммита: коммит — один на пару (open_card,
+    open_wait)."""
+    inst, plan = ep["inst"], ep["plan"]
+    for b in bks:
+        pid = _insert_position(con, b, card, pair, now, "open", shadow=shadow, why=why,
+                               labels=lab, base_low=ep["base_low"],
+                               stop_pct=book_params(s, b)["stop_pct"], min_amt=inst["min_amt"],
+                               qty_step=inst.get("qty_step"), tick=inst.get("tick"),
+                               bounce=bounce)
+        if pid is None:
+            continue
+        for o in plan["buys"]:
+            market_step = o["type"] == "рынок"
+            con.execute(
+                "INSERT OR IGNORE INTO dry_orders(link_id, position_id, book, pair, side, "
+                "kind, step, price, qty, usd, status, created_ts) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (link_id(b, pid, f"B{o['n']}", shadow), pid, b, pair, "Buy",
+                 "Market" if market_step else "Limit", o["n"], o["price"], o["qty"],
+                 o["usd"], "new", now))
+        mkt = con.execute("SELECT * FROM dry_orders WHERE position_id=? AND kind='Market' "
+                          "AND status='new'", (pid,)).fetchone()
+        if mkt:
+            _fill_buy(con, dict(mkt), ep["price"], MARKET_FEE, now)
+
+
+def _ladder_text(ep: dict) -> str:
+    plan = ep["plan"]
+    lims = ", ".join(f"{o['price']:.6g}" for o in plan["buys"][1:])
+    return (f"{len(plan['buys'])} ступ. на ${plan['spent']:.2f}: рынок ~{ep['price']:.6g}"
+            + (f", лимитки {lims}" if lims else "") + f"; лоу базы {ep['base_low']:.6g}")
+
+
+def _entry_notes(g: dict, heat: dict, plan: dict) -> list[str]:
+    """Строки лога под «поставил бы»: метки входа (оборот, рынок) и предупреждения плана."""
+    v = g["vol"]
+    return ["  метки: " + (f"оборот {v['rank']}-е место из {v['n']}" if v
+                           else "нет данных оборота") + f", рынок {heat['note']}"] \
+        + [f"  ⚠ {w}" for w in plan["warns"]]
 
 
 def open_card(cfg, con, market, s: dict, card: dict, now: float, *,
@@ -619,8 +785,9 @@ def _open_card(cfg, con, market, s: dict, card: dict, now: float,
     sym = card["symbol"]
     pair = f"{sym}USDT"
     day = utc_day(card["ts"])
-    done = con.execute("SELECT COUNT(*) FROM dry_positions WHERE pair=? AND card_day=?",
-                       (pair, day)).fetchone()[0]
+    # строки книги W (свой кандидат того же дня) карточку R/H «обработанной» не делают
+    done = con.execute("SELECT COUNT(*) FROM dry_positions WHERE pair=? AND card_day=? AND "
+                       "book!=?", (pair, day, s["wait_low"]["book"])).fetchone()[0]
     if done:
         return [f"{sym}: карточка уже обработана — повтор не дублирует"]
     # По книгам: держит ли пару сейчас; кулдаун — прошлый вход по паре моложе N дней (в
@@ -670,67 +837,19 @@ def _open_card(cfg, con, market, s: dict, card: dict, now: float,
         write_cool()
         return out + [f"{sym}: ОТКАЗ — {reason}"]
 
-    # чужая монета под тикером — fail-closed: не сверено = не покупаем
-    issue = card.get("ticker_issue", "тикер не сверен: карточка без сверки watchlist")
-    if issue:
-        return reject(issue)
-    inst = market.instrument(pair)
-    if inst and inst.get("err"):
-        raise DataGap(f"инструмент: {inst['err']}")
-    if not inst:
-        return reject(f"{pair} нет на Bybit spot")
-    if inst.get("status") != "Trading" or (s["skip_st"] and inst.get("st")):
-        return reject(f"Bybit: статус {inst.get('status')}{', метка ST' if inst.get('st') else ''}")
-    price = market.last_price(pair)
-    daily = market.daily(pair) or {}
-    if daily.get("err"):
-        raise DataGap(f"дневные свечи: {daily['err']}")
-    closes = daily.get("c") or []
-    base_low = compute_base_low(closes, 30)
-    if not price or not base_low:
-        return out + [f"{sym}: нет цены или истории закрытий Bybit — пропуск до следующего "
-                      f"прогона"]
-    if same_coin(price, card.get("price_usd")) is False:
-        return reject(f"цена Bybit {price:.6g} не совпадает с карточкой "
-                      f"({card['price_usd']:.6g}) — похоже, другая монета")
-    e = cfg["stage8_exit"]
-    plan = plan_ladder(price, base_low, s["budget_usdt"], steps=s["steps"],
-                       min_order=s["min_order_usdt"], tick=inst["tick"],
-                       qty_step=inst["qty_step"], exch_min_amt=inst["min_amt"],
-                       exch_min_qty=inst["min_qty"],
-                       floor_pct=e["invalidation_below_base_low_pct"], sell="prod",
-                       prod_levels=e["ladder"])
-    if not plan["ok"]:
-        return reject(plan["error"])
+    ep = _entry_plan(cfg, market, s, card)
+    if "reject" in ep:
+        return reject(ep["reject"])
+    if "skip" in ep:
+        return out + [f"{sym}: {ep['skip']}"]
+    price, plan = ep["price"], ep["plan"]
 
     def place(shadow: bool, why: str, bks: list[str]) -> None:
-        """Позиции в книги bks (основные или теневые), ордера лестницы, ступень 1 — рынком.
-        Без коммита: коммит — один на пару (open_card)."""
-        for b in bks:
-            pid = _insert_position(con, b, card, pair, now, "open", shadow=shadow, why=why,
-                                   labels=lab, base_low=base_low,
-                                   stop_pct=s["books"][b]["stop_pct"], min_amt=inst["min_amt"],
-                                   qty_step=inst.get("qty_step"), tick=inst.get("tick"))
-            if pid is None:
-                continue
-            for o in plan["buys"]:
-                market_step = o["type"] == "рынок"
-                con.execute(
-                    "INSERT OR IGNORE INTO dry_orders(link_id, position_id, book, pair, side, "
-                    "kind, step, price, qty, usd, status, created_ts) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (link_id(b, pid, f"B{o['n']}", shadow), pid, b, pair, "Buy",
-                     "Market" if market_step else "Limit", o["n"], o["price"], o["qty"],
-                     o["usd"], "new", now))
-            mkt = con.execute("SELECT * FROM dry_orders WHERE position_id=? AND kind='Market' "
-                              "AND status='new'", (pid,)).fetchone()
-            if mkt:
-                _fill_buy(con, dict(mkt), price, MARKET_FEE, now)
+        """Позиции в книги bks (основные или теневые) — _place; отказы «кулдаун» — с ними."""
+        _place(con, s, card, pair, now, bks, ep, lab, shadow=shadow, why=why)
         write_cool()
 
-    lims = ", ".join(f"{o['price']:.6g}" for o in plan["buys"][1:])
-    ladder = (f"{len(plan['buys'])} ступ. на ${plan['spent']:.2f}: рынок ~{price:.6g}"
-              + (f", лимитки {lims}" if lims else "") + f"; лоу базы {base_low:.6g}")
+    ladder = _ladder_text(ep)
 
     def to_shadow(keys: list[str], extra: str = "", bks: list[str] | None = None) -> list[str]:
         """Отсеяно фильтрами: в теневые книги (те же лестница и выходы, без мест и денег)."""
@@ -785,12 +904,104 @@ def _open_card(cfg, con, market, s: dict, card: dict, now: float,
     if not ok:
         return out
     place(False, "", ok)
-    v = g["vol"]
-    lines = [f"{sym}: поставил бы в книги {'/'.join(ok)} — {ladder}",
-             "  метки: " + (f"оборот {v['rank']}-е место из {v['n']}" if v
-                            else "нет данных оборота") + f", рынок {heat['note']}"]
-    lines += [f"  ⚠ {w}" for w in plan["warns"]]
-    return out + lines
+    return out + [f"{sym}: поставил бы в книги {'/'.join(ok)} — {ladder}"] \
+        + _entry_notes(g, heat, plan)
+
+
+def open_wait(cfg, con, market, s: dict, card: dict, now: float, *,
+              ranks: dict | None = None, heat: dict | None = None,
+              tags: dict | None = None) -> list[str]:
+    """Кандидат книги W (pick_log: монета прошла отбор карточки, заглушена она или нет): те же
+    проверки и фильтры, что у R, плюс гейт «не догонять» — закрытие не выше лоу базы × (1 +
+    max_bounce). Решение дня — строка (W, пара, день кандидата): вход, «ждёт возврата к лоу» или
+    отказ с причиной; отсеянное фильтрами — отказ (своей тени у W нет). Одна транзакция; нет
+    данных Bybit — DataGap: строк нет, кандидат ждёт следующего прогона."""
+    try:
+        lines = _open_wait(cfg, con, market, s, card, now, ranks, heat, tags)
+        con.commit()
+        return lines
+    except BaseException:
+        con.rollback()
+        raise
+
+
+def _open_wait(cfg, con, market, s: dict, card: dict, now: float,
+               ranks: dict | None, heat: dict | None, tags: dict | None) -> list[str]:
+    w = s["wait_low"]
+    b = w["book"]
+    sym = card["symbol"]
+    pair = f"{sym}USDT"
+    tag = f"{b} {sym}"
+    if con.execute("SELECT 1 FROM dry_positions WHERE book=? AND pair=? AND card_day=?",
+                   (b, pair, utc_day(card["ts"]))).fetchone():
+        return [f"{tag}: кандидат дня уже обработан — повтор не дублирует"]
+    # одна позиция на монету и кулдаун — по своей книге (как у R: от прошлого входа W по паре)
+    last = con.execute("SELECT status, created_ts FROM dry_positions WHERE pair=? AND book=? "
+                       "AND status!='rejected' AND COALESCE(shadow,0)=0 "
+                       "ORDER BY created_ts DESC LIMIT 1", (pair, b)).fetchone()
+    if last and last[0] == "open":
+        return [f"{tag}: уже в книге с {ddmm(last[1])} — вторую лестницу не ставлю"]
+    cd = s.get("reentry_cooldown_days", 90) * DAY
+    if last and now < last[1] + cd:
+        _insert_position(con, b, card, pair, now, "rejected", f"кулдаун до {ddmm(last[1] + cd)}")
+        return [f"{tag}: ОТКАЗ — кулдаун до {ddmm(last[1] + cd)} (вход был меньше "
+                f"{s.get('reentry_cooldown_days', 90):g} дн. назад)"]
+    heat = heat or market_gate(cfg, s, None, now)
+    g = entry_gates(s, sym, ranks, heat)
+    lab = g["labels"]
+    out: list[str] = []
+
+    def reject(reason: str, bounce: float | None = None) -> list[str]:
+        _insert_position(con, b, card, pair, now, "rejected", reason, labels=lab, bounce=bounce)
+        return out + [f"{tag}: ОТКАЗ — {reason}"]
+
+    ep = _entry_plan(cfg, market, s, card)
+    if "reject" in ep:
+        return reject(ep["reject"])
+    if "skip" in ep:
+        return [f"{tag}: {ep['skip']} (вход не делается)"]
+    d_ts = ep["daily"].get("ts") or []
+    if not d_ts or d_ts[-1] < utc_day(now) - 2 * DAY:
+        # гейт считается по последнему закрытию: устаревшее закрытие — не вход (как «стоят»
+        # дневные свечи у открытых позиций), строк нет — повтор в следующий прогон
+        return [f"{tag}: последнее закрытие Bybit "
+                + (f"от {ddmm(d_ts[-1])} — старше 2 дн." if d_ts else "без даты")
+                + ", рост от лоу базы не посчитать — вход не делается"]
+    if len(ep["closes"]) < BASE_DAYS:
+        # лоу базы W — по полным 30 закрытиям, как base30 бэктеста Q17 (у R — по тем, что есть)
+        return [f"{tag}: меньше {BASE_DAYS} закрытий Bybit ({len(ep['closes'])}) — лоу базы не "
+                f"как в бэктесте, вход не делается"]
+    # метка Monitoring Binance и фильтры 1, 4 — как у R; у W отсеянное просто не берётся
+    tg = bn_entry(s, tags, sym, ep["price"])
+    why = list(g["why"])
+    if tg and tg["block"]:
+        lab["bn_since"] = tg["since"]
+        why.append("bn_monitor")
+    elif tg:
+        out.append(f"{tag}: ⚠ {tg['note']}")
+    if why:
+        return reject("не беру — " + why_text(why, lab))
+    # гейт «не догонять» (Q17): рост последнего закрытия от лоу базы (bounce бэктеста)
+    close, base_low, mb = ep["closes"][-1], ep["base_low"], w["max_bounce"]
+    bounce = close / base_low - 1
+    if bounce > mb + 1e-12:
+        reason = (f"{WAIT_REASON}: закрытие {close:.6g} на {bounce * 100:+.1f}% выше лоу базы "
+                  f"{base_low:.6g}, нужно ≤ +{mb * 100:g}%")
+        _insert_position(con, b, card, pair, now, "rejected", reason, labels=lab, bounce=bounce)
+        return out + [f"{tag}: {reason}"]
+    plan = ep["plan"]
+    # лимит монет, USDT и risk_check — по книге W, риск по вложенному (как у R)
+    why_b = entry_checks(con, cfg, s, b, plan["spent"], min(plan["spent"], s["budget_usdt"]))
+    if why_b:
+        return reject(", ".join(why_b), bounce)
+    if g["illiquid"]:                        # квота неликвида — своя (места W на день входа)
+        used = illiquid_used(con, s, b)
+        if used >= s["illiquid_max_slots"]:
+            return reject(f"{WHY_LABEL['quota']}: вне топ-{s['illiquid_share'] * 100:.0f}% уже "
+                          f"{used} из {s['illiquid_max_slots']} мест", bounce)
+    _place(con, s, card, pair, now, [b], ep, lab, bounce=bounce)
+    return out + [f"{tag}: поставил бы — {_ladder_text(ep)}; от лоу {bounce * 100:+.1f}% ≤ "
+                  f"+{mb * 100:g}%"] + _entry_notes(g, heat, plan)
 
 
 # ---------------------------------------------------------------- исполнение и выходы
@@ -920,7 +1131,7 @@ def process_position(cfg, con, market, s: dict, pos: dict, now: float, *,
     p = dict(pos)
     pair, book = p["pair"], p["book"]
     tag = f"тень {book}" if p.get("shadow") else book       # подпись в логе
-    bk = s["books"].get(book) or {}
+    bk = book_params(s, book)                  # W — выходы и стоп книги R
     lines: list[str] = []
     daily = market.daily(pair) or {}
     d_ts, d_c = daily.get("ts") or [], daily.get("c") or []
@@ -1126,6 +1337,24 @@ def _vol_ranks(market, now: float) -> dict:
         return {"ok": False, "by_sym": {}, "note": f"нет данных оборота: {type(e).__name__}: {e}"}
 
 
+def _by_turnover(ranks: dict | None):
+    """Ключ порядка карточек дня (R/H и кандидатов W): ликвидные первыми — квота и лимит монет
+    достаются лучшему месту по обороту; без места — в конце, по времени."""
+    from .liquidity import lookup
+
+    def order(card: dict) -> tuple:
+        v = lookup(ranks, card["symbol"])
+        return (0, v["rank"], card["ts"]) if v else (1, 0, card["ts"])
+    return order
+
+
+def _ranks_line(s: dict, ranks: dict) -> str:
+    n = ranks.get("n") or 0
+    return (f"оборот: {n} пар Bybit, нижняя четверть — место > {s['vol_bottom_share'] * n:.0f}, "
+            f"вне топа — > {s['illiquid_share'] * n:.0f}" if ranks.get("ok") else
+            f"{ranks.get('note') or 'нет данных оборота'} — фильтры по обороту не отсекают")
+
+
 def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None,
             wallet_usdt: float | None = None, wallet_note: str = "",
             mctx: dict | None = None, halt_base=None,
@@ -1140,7 +1369,10 @@ def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None
     не делает ничего: ни новых лестниц, ни исполнений и продаж по открытым; база не меняется.
     После `run.py resume` открытые досчитываются со своего места (fills_until, last_day).
     tags — метки Monitoring Binance (run.py execute: binance_tags.ensure, раз в UTC-день с
-    сетью); None — из базы без сети и без цены Binance (тёзок не различить — метка по тикеру)."""
+    сетью); None — из базы без сети и без цены Binance (тёзок не различить — метка по тикеру).
+    Книга W (executor.wait_low) — после карточек R/H: кандидаты pick_log за 24 ч, тот же порядок
+    по обороту; места по обороту для неё считаются, только если кандидаты есть. Выключена —
+    кандидатов не читает, её открытые позиции не трогает (ждут включения)."""
     s = settings(cfg)
     if not s.get("enabled", True):
         return 0, ["executor.enabled = false — пропуск"]
@@ -1169,41 +1401,50 @@ def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None
         if pair not in gaps:
             gaps.add(pair)
             lines.append(f"⚠ нет данных Bybit: {pair} ({e})")
+    w = s["wait_low"]
+    w_on = w["enabled"]
+    w_errs: list[str] = []          # сбои книги W: строка «⚠ книга W упала», код выхода — не 1
+    if w.get("error"):
+        lines.append(f"⚠ {w['error']}")
     try:
         for pos in _rows(con, "SELECT * FROM dry_positions WHERE status='open' ORDER BY id"):
+            is_w = bool(w["book"]) and pos["book"] == w["book"]
+            if is_w and not w_on:
+                continue                   # книга W выключена — её позиции ждут включения
             try:
                 lines += process_position(cfg, con, market, s, pos, now, tags=tags)
             except DataGap as e:            # позиция не тронута; причина — в сводку дня
                 con.rollback()
                 con.execute("UPDATE dry_positions SET data_err=? WHERE id=?", (str(e), pos["id"]))
                 con.commit()
-                gap(pos["pair"], e)
+                if is_w:                    # своя строка W: общий «нет данных» и код — для R/H
+                    lines.append(f"⚠ {w['book']}: нет данных Bybit: {pos['pair']} ({e}) — "
+                                 f"позиция ждёт данных")
+                else:
+                    gap(pos["pair"], e)
             except Exception as e:  # noqa: BLE001 — одна позиция не валит остальные
+                if is_w:
+                    con.rollback()
+                    w_errs.append(f"{pos['symbol']}: {type(e).__name__}: {e}")
+                    lines.append(f"⚠ книга {w['book']} упала на {pos['symbol']}: "
+                                 f"{type(e).__name__}: {e}")
+                    continue
                 con.rollback()
                 code = 1
                 tag = f"тень {pos['book']}" if pos["shadow"] else pos["book"]
                 lines.append(f"⚠ {tag} {pos['symbol']}: {type(e).__name__}: {e}")
         cards = todays_cards(cfg, con, now)
         need = 0.0
+        heat = ranks = None
         if cards:
             heat = market_gate(cfg, s, mctx if mctx is not None else db_context(con, cfg), now)
             ranks = _vol_ranks(market, now)
-            n = ranks.get("n") or 0
             block = s.get("hot_block", True) and heat["status"] != "cold"
             lines.append(f"рынок: {heat['note']}"
                          + (" — новых лестниц нет, карточки уходят в тень" if block else ""))
-            lines.append(f"оборот: {n} пар Bybit, нижняя четверть — место > "
-                         f"{s['vol_bottom_share'] * n:.0f}, вне топа — > "
-                         f"{s['illiquid_share'] * n:.0f}" if ranks.get("ok") else
-                         f"{ranks.get('note') or 'нет данных оборота'} — фильтры по обороту "
-                         f"не отсекают")
+            lines.append(_ranks_line(s, ranks))
             # ликвидные первыми: квота и лимит монет достаются лучшему месту по обороту
-            from .liquidity import lookup
-
-            def order(card: dict) -> tuple:
-                v = lookup(ranks, card["symbol"])
-                return (0, v["rank"], card["ts"]) if v else (1, 0, card["ts"])
-            cards.sort(key=order)
+            cards.sort(key=_by_turnover(ranks))
             for card in cards:
                 try:
                     got = open_card(cfg, con, market, s, card, now, ranks=ranks, heat=heat,
@@ -1220,6 +1461,15 @@ def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None
                     need += s["budget_usdt"]
         else:
             lines.append("сегодня карточек не было — новых лестниц нет")
+        if w_on:
+            # книга W — после R/H: её решения не видны карточкам R/H (у каждой своя книга);
+            # сбой W не трогает итоги R/H, stamp_run и код выхода — строка и метка в wait_runs
+            try:
+                lines += _run_wait(cfg, con, market, s, now, mctx, ranks, heat, tags, w_errs)
+            except Exception as e:  # noqa: BLE001
+                con.rollback()
+                w_errs.append(f"{type(e).__name__}: {e}")
+                lines.append(f"⚠ книга {w['book']} упала: {type(e).__name__}: {e}")
         from .sources import binance_tags as bt
         lines.append(bt.line(tags) if bm_on else
                      "метка Monitoring Binance: правило выключено (executor.binance_monitor)")
@@ -1239,10 +1489,55 @@ def run_dry(cfg, market, *, db_path: str | None = None, now: float | None = None
             lines.append("тень (мест и денег не занимает): " + "; ".join(
                 f"{b} открыто {x['open']}, вложено ${x['spent']:.2f}, P&L {x['pnl']:+.2f}"
                 for b, x in sh.items()))
+        if w_on:
+            try:
+                st = book_summary(con, w["book"])
+                lines.append(f"книга {w['book']} «{w['label']}» (правила R, вход при закрытии ≤ "
+                             f"лоу базы +{w['max_bounce'] * 100:g}%): открыто {st['open']}, "
+                             f"вложено ${st['spent']:.2f}, P&L {st['pnl']:+.2f} USDT, свободно "
+                             f"{free_usdt(con, w['book'], s['capital_usdt']):.2f}")
+            except Exception as e:  # noqa: BLE001
+                w_errs.append(f"итог книги: {type(e).__name__}: {e}")
+                lines.append(f"⚠ книга {w['book']} упала: {type(e).__name__}: {e}")
         stamp_run(con, now)
+        if w_on:
+            try:                            # сводка дня: «⚠ книга W упала: …» (не «исполнитель»)
+                con.execute("INSERT OR REPLACE INTO wait_runs(ts, err) VALUES (?,?)",
+                            (now, "; ".join(w_errs)[:500]))
+                con.commit()
+            except sqlite3.Error as e:
+                lines.append(f"⚠ книга {w['book']}: итог прогона не записан: {e}")
     finally:
         con.close()
     return code, lines
+
+
+def _run_wait(cfg, con, market, s: dict, now: float, mctx: dict | None, ranks: dict | None,
+              heat: dict | None, tags: dict | None, errs: list[str]) -> list[str]:
+    """Кандидаты книги W за прогон -> строки лога. Сбой кандидата — строка и errs (код выхода
+    не меняется: W — эксперимент, R/H на нём не падают); нет данных Bybit — строка W, не общий
+    «нет данных Bybit» R/H; кандидат ждёт следующего прогона."""
+    w = s["wait_low"]
+    out: list[str] = []
+    waits = todays_cards(cfg, con, now, table="pick_log")
+    if waits and heat is None:              # карточек R/H не было — рынок и оборот для W
+        heat = market_gate(cfg, s, mctx if mctx is not None else db_context(con, cfg), now)
+        ranks = _vol_ranks(market, now)
+        out.append(f"{w['book']}: рынок {heat['note']}; {_ranks_line(s, ranks)}")
+    if not waits:
+        out.append(f"книга {w['book']}: кандидатов до заглушки за сутки нет — новых лестниц нет")
+    waits.sort(key=_by_turnover(ranks))
+    for card in waits:
+        try:
+            out += open_wait(cfg, con, market, s, card, now, ranks=ranks, heat=heat, tags=tags)
+        except DataGap as e:                # кандидат ждёт следующего прогона, строк нет
+            out.append(f"⚠ {w['book']}: нет данных Bybit: {card['symbol']}USDT ({e}) — кандидат "
+                       f"ждёт следующего прогона")
+        except Exception as e:  # noqa: BLE001
+            con.rollback()
+            errs.append(f"{card['symbol']}: {type(e).__name__}: {e}")
+            out.append(f"⚠ книга {w['book']} упала на {card['symbol']}: {type(e).__name__}: {e}")
+    return out
 
 
 def stamp_run(con, now: float) -> None:
@@ -1274,7 +1569,10 @@ def brief_state(cfg, now: float | None = None) -> dict | None:
     в 06:00 UTC от местной полуночи не зависит); отказы — с причиной, отсеянное фильтрами —
     отдельным списком «в тени»; nodata — открытые пары без данных Bybit на прошлом прогоне;
     fills/sells — исполненное прогонами этого UTC-дня (dry_orders.run_ts, stamp_run).
-    Таблиц нет — None (строки не будет)."""
+    Строки книги W в списки и цифры R/H/тени не входят (даже выключенной); W включена — свой
+    ключ wait: книга, «поставил бы», «ждут возврата к лоу» (символ, рост от лоу), исполнения и
+    продажи её прогонов этого UTC-дня, свои «нет данных Bybit» (nodata W) и сбой
+    последнего прогона W сегодня (fail, wait_runs). Таблиц нет — None."""
     from .benchmark import connect_ro
     now = now if now is not None else time.time()
     con = connect_ro(cfg["output"]["db_path"])
@@ -1289,12 +1587,13 @@ def brief_state(cfg, now: float | None = None) -> dict | None:
         psh = sh.replace("shadow", "p.shadow")
         t0 = utc_day(now)
         s = settings(cfg)
+        wb, w_on = s["wait_low"]["book"], s["wait_low"]["enabled"]
         cols = {r[1] for r in con.execute("PRAGMA table_info(dry_positions)")}
         nodata: list[tuple[str, str]] = []
         if "data_err" in cols:                  # БД только на чтение могла не пройти миграцию
             for pair, err in con.execute("SELECT pair, data_err FROM dry_positions WHERE "
-                                         "status='open' AND COALESCE(data_err,'')!='' "
-                                         "ORDER BY id"):
+                                         "status='open' AND COALESCE(data_err,'')!='' AND "
+                                         "book!=? ORDER BY id", (wb,)):
                 if all(pair != x[0] for x in nodata):
                     nodata.append((pair, err))
         books = {b: {**book_summary(con, b, False, sh), "label": bk["label"],
@@ -1303,10 +1602,10 @@ def brief_state(cfg, now: float | None = None) -> dict | None:
                       "emoji": bk.get("emoji", "•")} for b, bk in s["books"].items()}
         opened = [r[0] for r in con.execute(
             f"SELECT DISTINCT symbol FROM dry_positions WHERE status!='rejected' AND {sh}=0 "
-            f"AND created_ts>=?", (t0,))]
+            f"AND created_ts>=? AND book!=?", (t0, wb))]
         rejected = [(r[0], r[1]) for r in con.execute(
             "SELECT symbol, MIN(reason) FROM dry_positions WHERE status='rejected' AND "
-            "created_ts>=? GROUP BY symbol", (t0,))]
+            "created_ts>=? AND book!=? GROUP BY symbol", (t0, wb))]
         shadowed: list[tuple[str, str]] = []
         if sh != "0":
             for r in _rows(con, "SELECT * FROM dry_positions WHERE shadow=1 AND "
@@ -1322,18 +1621,51 @@ def brief_state(cfg, now: float | None = None) -> dict | None:
             when, since = "o.run_ts", t0
         else:
             when, since = "COALESCE(o.filled_ts, o.created_ts)", t0 - DAY
-        fills = con.execute(f"SELECT COUNT(*) FROM dry_orders o JOIN dry_positions p ON "
-                            f"p.id=o.position_id WHERE o.side='Buy' AND o.kind='Limit' AND "
-                            f"o.status='filled' AND {when}>=? AND {psh}=0",
-                            (since,)).fetchone()[0]
-        sells = [(r[0], r[1], r[2]) for r in con.execute(
-            f"SELECT o.book, p.symbol, o.signal FROM dry_orders o JOIN dry_positions p "
-            f"ON p.id=o.position_id WHERE o.side='Sell' AND o.status='filled' AND "
-            f"{when}>=? AND {psh}=0 ORDER BY o.created_ts", (since,))]
+
+        # исполнения и продажи прогонов дня: R/H — без строк W (cond o.book!=W), W — свои
+        def fills_of(cond: str, arg: str) -> int:
+            return con.execute(f"SELECT COUNT(*) FROM dry_orders o JOIN dry_positions p ON "
+                               f"p.id=o.position_id WHERE o.side='Buy' AND o.kind='Limit' AND "
+                               f"o.status='filled' AND {when}>=? AND {psh}=0 AND {cond}",
+                               (since, arg)).fetchone()[0]
+
+        def sells_of(cond: str, arg: str) -> list[tuple]:
+            return [(r[0], r[1], r[2]) for r in con.execute(
+                f"SELECT o.book, p.symbol, o.signal FROM dry_orders o JOIN dry_positions p "
+                f"ON p.id=o.position_id WHERE o.side='Sell' AND o.status='filled' AND "
+                f"{when}>=? AND {psh}=0 AND {cond} ORDER BY o.created_ts", (since, arg))]
+        fills, sells = fills_of("o.book!=?", wb), sells_of("o.book!=?", wb)
+        wait = None
+        if w_on:
+            bk = book_params(s, wb)
+            waiting: dict[str, float | None] = {}
+            bcol = "bounce" if "bounce" in cols else "NULL"
+            for sym, bounce in con.execute(
+                    f"SELECT symbol, {bcol} FROM dry_positions WHERE book=? AND "
+                    f"status='rejected' AND reason LIKE ? AND created_ts>=? ORDER BY id",
+                    (wb, WAIT_REASON + "%", t0)):
+                waiting[sym] = bounce                    # последнее решение дня по монете
+            w_nodata = [(r[0], r[1]) for r in con.execute(
+                "SELECT pair, data_err FROM dry_positions WHERE book=? AND status='open' AND "
+                "COALESCE(data_err,'')!='' ORDER BY id", (wb,))] if "data_err" in cols else []
+            fail = ""
+            if "wait_runs" in names:                     # последний прогон W сегодня упал?
+                r = con.execute("SELECT err FROM wait_runs WHERE ts>=? ORDER BY ts DESC LIMIT 1",
+                                (t0,)).fetchone()
+                fail = (r[0] or "") if r else ""
+            wait = {**book_summary(con, wb, False, sh), "key": wb, "label": bk["label"],
+                    "nodata": w_nodata, "fail": fail,
+                    "emoji": bk.get("emoji", "•"), "max_bounce": s["wait_low"]["max_bounce"],
+                    "opened": [r[0] for r in con.execute(
+                        "SELECT DISTINCT symbol FROM dry_positions WHERE book=? AND "
+                        "status!='rejected' AND created_ts>=?", (wb, t0))],
+                    "waiting": list(waiting.items()),
+                    "fills": fills_of("o.book=?", wb), "sells": sells_of("o.book=?", wb)}
     finally:
         con.close()
     return {"books": books, "shadow": shadow, "opened": opened, "rejected": rejected,
-            "shadowed": shadowed, "fills": fills, "sells": sells, "nodata": nodata}
+            "shadowed": shadowed, "fills": fills, "sells": sells, "nodata": nodata,
+            "wait": wait}
 
 
 def outcomes(con, book: str, shadow: bool = False,
@@ -1379,13 +1711,16 @@ def fill_flows(con, pid: int) -> list[dict]:
 def _weekly(cfg, shadow: bool) -> list[dict]:
     """Книги (основные или теневые) против альтов на тех же окнах: compare_outcomes + P&L в
     USDT по всем позициям (pnl_usd); у основных — контрольная корзина, у теневых — разбивка
-    по причинам (by_why: {ключ: {n, cost, pnl}}; позиция с двумя причинами — в обеих)."""
+    по причинам (by_why: {ключ: {n, cost, pnl}}; позиция с двумя причинами — в обеих). Книга W
+    (включена и есть позиции с исполнениями) — после R/H тем же способом, с пометкой wait."""
     from . import benchmark
     db = cfg["output"]["db_path"]
     con = benchmark.connect_ro(db)
     if con is None:
         return []
     con.row_factory = sqlite3.Row
+    s = settings(cfg)
+    wb = s["wait_low"]["book"] if s["wait_low"]["enabled"] and not shadow else ""
     try:
         names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "dry_positions" not in names:
@@ -1393,14 +1728,17 @@ def _weekly(cfg, shadow: bool) -> list[dict]:
         sh = _shadow_col(con)
         if shadow and sh == "0":
             return []
-        rows = {b: outcomes(con, b, shadow, sh) for b in settings(cfg)["books"]}
+        rows = {b: outcomes(con, b, shadow, sh) for b in s["books"]}
+        if wb:
+            w_rows = outcomes(con, wb, False, sh)
+            if w_rows:
+                rows[wb] = w_rows
     finally:
         con.close()
     if not any(rows.values()):
         return []
     mkt = benchmark.load_market(db)
     uni = None if shadow else benchmark.load_universe(db)
-    s = settings(cfg)
     out = []
     for b, rs in rows.items():
         res = benchmark.compare_outcomes(rs, mkt)
@@ -1413,21 +1751,27 @@ def _weekly(cfg, shadow: bool) -> list[dict]:
                 d["n"] += 1
                 d["cost"] += r["cost"]
                 d["pnl"] += r["pnl"]
-        bk = s["books"][b]
+        bk = book_params(s, b)
         out.append({"key": b, "label": bk["label"], "emoji": bk.get("emoji", "•"), **res,
-                    "pnl_usd": sum(r["pnl"] for r in rs), "by_why": by})
+                    "pnl_usd": sum(r["pnl"] for r in rs), "by_why": by,
+                    **({"wait": True, "max_bounce": s["wait_low"]["max_bounce"]}
+                       if b == wb else {})})
     return out
 
 
 def period_activity(cfg, t0: float, t1: float) -> dict | None:
     """Что книги сделали за [t0, t1) (месячная сводка): по книге {opened, closed, sells,
     shadow_opened}, отказы — общим числом пар (обе книги отказывают одинаково), first_ts —
-    первое исполнение за всё время. Таблиц нет — None."""
+    первое исполнение за всё время, labels — подпись книги W. Книга W (включена) — своей строкой
+    после R/H; её отказы («ждёт возврата к лоу» — каждый день серии) и исполнения в отказы и
+    first_ts R/H не входят. Таблиц нет — None."""
     from .benchmark import connect_ro
     con = connect_ro(cfg["output"]["db_path"])
     if con is None:
         return None
     con.row_factory = sqlite3.Row
+    s = settings(cfg)
+    wb = s["wait_low"]["book"]
     try:
         names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "dry_positions" not in names:
@@ -1435,7 +1779,7 @@ def period_activity(cfg, t0: float, t1: float) -> dict | None:
         sh = _shadow_col(con)
         psh = sh.replace("shadow", "p.shadow")
         books = {}
-        for b in settings(cfg)["books"]:
+        for b in list(s["books"]) + ([wb] if s["wait_low"]["enabled"] else []):
             def n(sql: str, args=()) -> int:
                 return con.execute(sql, (b, *args)).fetchone()[0]
             books[b] = {
@@ -1453,13 +1797,14 @@ def period_activity(cfg, t0: float, t1: float) -> dict | None:
                            f"o.status='filled' AND {psh}=0 AND o.filled_ts>=? AND "
                            f"o.filled_ts<?", (t0, t1))}
         rejected = con.execute("SELECT COUNT(DISTINCT pair) FROM dry_positions WHERE "
-                               "status='rejected' AND created_ts>=? AND created_ts<?",
-                               (t0, t1)).fetchone()[0]
+                               "status='rejected' AND created_ts>=? AND created_ts<? AND "
+                               "book!=?", (t0, t1, wb)).fetchone()[0]
         first = con.execute(f"SELECT MIN(first_fill_ts) FROM dry_positions WHERE "
-                            f"status!='rejected' AND {sh}=0").fetchone()[0]
+                            f"status!='rejected' AND {sh}=0 AND book!=?", (wb,)).fetchone()[0]
     finally:
         con.close()
-    return {"books": books, "rejected": rejected, "first_ts": first}
+    return {"books": books, "rejected": rejected, "first_ts": first,
+            "labels": {wb: book_params(s, wb)["label"]} if wb in books else {}}
 
 
 def weekly_books(cfg) -> list[dict]:

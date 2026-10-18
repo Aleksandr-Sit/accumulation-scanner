@@ -70,6 +70,7 @@ def cmd_scan(args) -> int:
         if len(fresh) < len(cands):
             print(f"[telegram] mute: {len(cands) - len(fresh)} повторных кандидатов пропущено")
         picks = telegram.select_picks(fresh, cfg)
+        _log_picks(cfg, st, cands, fresh)
         papers = _papers_opened_since(cfg, t_start)
         http = _make_http(cfg)
         ranks = _card_ranks(cfg, http) if picks else {}
@@ -88,6 +89,29 @@ def cmd_scan(args) -> int:
             print("[telegram] новых монет у дна нет — карточек нет (итог дня — run.py brief)")
         st.close()
     return 0
+
+
+def _log_picks(cfg, st, cands: list, fresh: list) -> int:
+    """Кандидаты карточек ДО заглушки повторов — select_picks по всему watchlist, как если бы
+    mute не было, — в pick_log: книга W пробного исполнителя (executor.wait_low, замер Q17)
+    ждёт возврата цены к лоу, пока монета каждый день проходит отбор карточки. muted — монету
+    заглушил повтор (её нет среди fresh). alert_log и mute не меняются; книга W выключена — не
+    пишем; сбой записи не роняет скан."""
+    try:
+        from scanner import executor
+        from scanner.notify import telegram
+        if not executor.settings(cfg)["wait_low"]["enabled"]:
+            return 0
+        live = {c.symbol for c in fresh}
+        pre = telegram.select_picks(cands, cfg)
+        n = st.record_picks([(c.symbol, c.score, c.symbol not in live) for c in pre])
+        muted = sum(1 for c in pre if c.symbol not in live)
+        print(f"[telegram] до заглушки: {n} кандидатов карточек (книга W)"
+              + (f", из них заглушено {muted}" if muted else ""))
+        return n
+    except Exception as e:  # noqa: BLE001 — журнал книги W не должен ронять скан
+        print(f"[telegram] кандидаты до заглушки не записаны: {type(e).__name__}: {e}")
+        return 0
 
 
 def _card_ranks(cfg, http, network: bool = True) -> dict:
@@ -932,7 +956,8 @@ def cmd_sync(args) -> int:
 
 def cmd_execute(args) -> int:
     """Пробный исполнитель (scanner/executor.py): лестницы по сегодняшним карточкам в книги
-    R «правила» и H «держать», исполнения по свечам Bybit, журнал «поставил бы». Ордеров нет.
+    R «правила» и H «держать» (и книга W «R у лоу» — кандидаты до заглушки, вход у лоу базы,
+    executor.wait_low), исполнения по свечам Bybit, журнал «поставил бы». Ордеров нет.
     Код 1 — сбой (сводка дня: «⚠ пробный исполнитель упал»), 2 — запуск без --dry-run."""
     if not args.dry_run:
         print("реальный режим не реализован (шаги 3–4 плана) — запускай с --dry-run")
@@ -1048,7 +1073,8 @@ def cmd_control(args) -> int:
     from scanner import control
     cfg = load_config(args.config)
     if args.status:
-        print(control.status_text(cfg["output"]["db_path"]))
+        from scanner.executor import hidden_books
+        print(control.status_text(cfg["output"]["db_path"], hide_books=hidden_books(cfg)))
         return 0
     code, log = control.poll(cfg)
     for line in log:
